@@ -1,0 +1,116 @@
+name: Bug report
+description: Report a problem with z4j-bare
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug in `z4j-bare`.
+
+        **Security bugs do NOT belong here.** If you believe you've
+        found a security issue (especially in `transport`, `dispatcher`,
+        or `orchestrator_detect`), please email `security@z4j.com` -
+        see [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: input
+    id: z4j-bare-version
+    attributes:
+      label: z4j-bare version
+      description: Output of `pip show z4j-bare | grep -E 'Name|Version'`
+      placeholder: z4j-bare 1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: 3.14.4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport in use
+      options:
+        - WebSocket
+        - HTTPS long-poll fallback
+        - Unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host environment
+      options:
+        - Docker (standalone)
+        - Kubernetes
+        - systemd
+        - supervisord
+        - Bare process (no orchestrator)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Affected module
+      options:
+        - runtime / install
+        - transport (websocket / longpoll)
+        - buffer (SQLite)
+        - dispatcher
+        - heartbeat
+        - orchestrator_detect
+        - safety
+        - CLI / __main__
+        - Unsure / multiple
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A standalone script is ideal.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full traceback if applicable. Please redact tokens and URLs.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Agent logs
+      description: Buffer / reconnect / heartbeat logs if relevant. Please redact secrets.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: This is NOT a security issue (those go to security@z4j.com)
+          required: true
