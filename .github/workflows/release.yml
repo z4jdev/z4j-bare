@@ -58,7 +58,7 @@ jobs:
           uv tool run twine check dist/*
 
       - name: Create GitHub Release with artefacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
