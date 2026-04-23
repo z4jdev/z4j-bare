@@ -71,6 +71,7 @@ def install_agent(
     token: str | None = None,
     project_id: str | None = None,
     hmac_secret: str | None = None,
+    agent_name: str | None = None,
     schedulers: list[SchedulerAdapter] | None = None,
     environment: str | None = None,
     tags: dict[str, str] | None = None,
@@ -127,6 +128,7 @@ def install_agent(
         token=token,
         project_id=project_id,
         hmac_secret=hmac_secret,
+        agent_name=agent_name,
         environment=environment,
         tags=tags,
         dev_mode=dev_mode,
@@ -184,6 +186,7 @@ def _resolve(  # noqa: PLR0912  (a flat field-by-field resolver is clearer)
     max_payload_bytes: int | None,
     redaction_extra_key_patterns: list[str] | None,
     redaction_extra_value_patterns: list[str] | None,
+    agent_name: str | None = None,
 ) -> dict[str, Any]:
     """Merge explicit kwargs with ``Z4J_*`` env vars."""
     env = os.environ
@@ -230,6 +233,12 @@ def _resolve(  # noqa: PLR0912  (a flat field-by-field resolver is clearer)
     }
     if resolved_hmac:
         out["hmac_secret"] = resolved_hmac
+
+    resolved_agent_name = (
+        agent_name if agent_name is not None else env.get("Z4J_AGENT_NAME")
+    )
+    if resolved_agent_name:
+        out["agent_name"] = resolved_agent_name
 
     if environment is not None:
         out["environment"] = environment

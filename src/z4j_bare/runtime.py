@@ -799,6 +799,7 @@ class AgentRuntime:
             schedulers=list(self.schedulers),
             capabilities=capabilities,
             hmac_secret=hmac_secret,
+            agent_name=self.config.agent_name,
             dev_mode=self.config.dev_mode,
         )
 

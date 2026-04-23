@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from urllib.parse import urlparse
 
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -74,6 +75,7 @@ class WebSocketTransport:
         "schedulers",
         "capabilities",
         "agent_version",
+        "agent_name",
         "max_frame_size",
         "_token",
         "_hmac_secret",
@@ -99,6 +101,7 @@ class WebSocketTransport:
         capabilities: dict[str, list[str]],
         hmac_secret: bytes,
         agent_version: str = CORE_VERSION,
+        agent_name: str | None = None,
         max_frame_size: int = 1_048_576,
         dev_mode: bool = False,
     ) -> None:
@@ -115,6 +118,7 @@ class WebSocketTransport:
         self.schedulers = list(schedulers)
         self.capabilities = dict(capabilities)
         self.agent_version = agent_version
+        self.agent_name = agent_name
         self.max_frame_size = max_frame_size
         self._dev_mode = dev_mode
 
@@ -163,26 +167,50 @@ class WebSocketTransport:
             AuthenticationError: The brain rejected the token (HTTP 401).
             ProtocolError: The brain refused the protocol version.
             ConnectionError: Any transport-level failure.
-            ValueError: Plain-``ws://`` (non-TLS) was requested in
-                non-dev mode. The bearer token would travel in
-                cleartext; we refuse.
+            ValueError: Plain-``ws://`` (non-TLS) was requested to a
+                non-loopback host in non-dev mode. The bearer token
+                would travel in cleartext over a real network; we
+                refuse. Loopback hosts (``localhost``/``127.0.0.1``/
+                ``::1``) are exempt from this check.
         """
         if self._closed:
             raise RuntimeError("WebSocketTransport is closed")
 
         url = self.ws_url
         # Security (audit H6): refuse plain ``ws://`` unless the
-        # operator explicitly opted into ``dev_mode``. The bearer
-        # token goes in the ``Authorization`` header of the initial
-        # HTTP upgrade; a MITM on a non-TLS link harvests it in
-        # cleartext, and combined with C2 (today's agent→brain
-        # traffic is unsigned) that is total agent impersonation.
+        # operator explicitly opted into ``dev_mode`` OR the brain
+        # is on a loopback address. The bearer token goes in the
+        # ``Authorization`` header of the initial HTTP upgrade; a
+        # MITM on a non-TLS link harvests it in cleartext, and
+        # combined with C2 (today's agent→brain traffic is unsigned)
+        # that is total agent impersonation. Loopback connections
+        # never traverse a network so MITM is not possible - we
+        # allow ``ws://`` to ``localhost``/``127.0.0.1``/``::1``
+        # without ceremony so the first-time-installer flow ``just
+        # works`` against ``z4j serve`` running on the same machine.
         if url.startswith("ws://") and not self._dev_mode:
-            raise ValueError(
-                f"refusing plain ws:// connection to {url}. Set "
-                f"brain_url to https:// or pass dev_mode=True "
-                f"explicitly if this is a local test.",
-            )
+            host = (urlparse(url).hostname or "").lower()
+            loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+            if host in loopback_hosts:
+                logger.info(
+                    "z4j agent: allowing plain ws:// to loopback host %r "
+                    "(no MITM risk on loopback)",
+                    host,
+                )
+            else:
+                raise ValueError(
+                    f"refusing plain ws:// connection to {url}. The "
+                    f"bearer token would travel in cleartext over the "
+                    f"network. Fix one of:\n"
+                    f"  1. Set Z4J_BRAIN_URL=https://... (recommended)\n"
+                    f"  2. Set Z4J_DEV_MODE=true in your environment\n"
+                    f"     (works for the framework adapters: z4j-django,\n"
+                    f"     z4j-flask, z4j-fastapi - the bearer token is\n"
+                    f"     still vulnerable, only do this for trusted\n"
+                    f"     networks)\n"
+                    f"  3. Use a loopback hostname (localhost, 127.0.0.1,\n"
+                    f"     ::1) - allowed by default, no flag needed",
+                )
         headers = [("Authorization", f"Bearer {self._token}")]
 
         logger.info("z4j agent connecting to %s (project=%s)", url, self.project_id)
@@ -209,7 +237,13 @@ class WebSocketTransport:
         except OSError as exc:
             raise ConnectionError(f"network error: {exc}") from exc
 
-        # Send the hello frame.
+        # Send the hello frame. ``host.name`` carries the optional
+        # operator-supplied label (``Z4J_AGENT_NAME`` / settings.Z4J
+        # ``agent_name``) so multiple workers sharing one token can be
+        # told apart in the dashboard.
+        host: dict[str, str] = {}
+        if self.agent_name:
+            host["name"] = self.agent_name
         hello = HelloFrame(
             id=self._new_frame_id("hello"),
             payload=HelloPayload(
@@ -219,7 +253,7 @@ class WebSocketTransport:
                 engines=self.engines,
                 schedulers=self.schedulers,
                 capabilities=self.capabilities,
-                host={},
+                host=host,
             ),
         )
 
