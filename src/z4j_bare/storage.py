@@ -157,8 +157,61 @@ def default_buffer_path() -> Path:
     return ensure_buffer_root_writable() / f"buffer-{os.getpid()}.sqlite"
 
 
+def clamp_buffer_path(candidate: Path) -> Path:
+    """Resolve + validate a buffer-path candidate against the allowed roots.
+
+    Allowed roots:
+
+    - ``~/.z4j`` (preferred default)
+    - ``$TMPDIR/z4j-{uid}`` (fallback for service users with an
+      unwritable HOME - see :func:`fallback_buffer_root` for why).
+
+    Relative paths are interpreted under the FIRST allowed root
+    (``~/.z4j``) for backward compatibility. Absolute paths outside
+    every allowed root are rejected. The file itself does not have to
+    exist yet - :class:`BufferStore` creates it.
+
+    This helper used to live privately in :mod:`z4j_bare.install` so
+    only the bare ``install_agent`` entry point ran the clamp -
+    Django / Flask / FastAPI adapters passed the operator-supplied
+    path straight to :class:`Config`, bypassing the
+    ``~/.z4j`` / ``$TMPDIR/z4j-{uid}`` root restriction (audit
+    2026-04-24 Low-2). Promoted to the public storage surface so
+    every framework adapter can apply the same policy.
+
+    Raises:
+        ValueError: Resolved path is not under any allowed root. The
+            exception message names the allowed roots and the
+            rejected candidate - callers wrap it in a package-local
+            ``ConfigError`` to surface at startup.
+    """
+    roots = buffer_roots()
+    primary = roots[0]
+    primary.mkdir(parents=True, exist_ok=True)
+
+    candidate = Path(candidate)
+    if not candidate.is_absolute():
+        candidate = primary / candidate
+    resolved = candidate.resolve(strict=False)
+
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+
+    roots_repr = ", ".join(str(r) for r in roots)
+    raise ValueError(
+        f"Z4J_BUFFER_PATH must be inside one of: {roots_repr} "
+        f"(got {candidate}, resolved to {resolved}). Refusing "
+        f"to open a SQLite file outside the allowed roots.",
+    )
+
+
 __all__ = [
     "buffer_roots",
+    "clamp_buffer_path",
     "default_buffer_path",
     "ensure_buffer_root_writable",
     "fallback_buffer_root",
