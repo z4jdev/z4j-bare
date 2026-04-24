@@ -21,55 +21,27 @@ from z4j_core.protocols import FrameworkAdapter, QueueEngineAdapter, SchedulerAd
 from z4j_bare._process_singleton import try_register
 from z4j_bare.framework import BareFrameworkAdapter
 from z4j_bare.runtime import AgentRuntime
-from z4j_bare.storage import buffer_roots
+from z4j_bare.storage import clamp_buffer_path as _clamp_public
 
 if TYPE_CHECKING:
     pass
 
 
 def _clamp_buffer_path(candidate: Path) -> Path:
-    """Resolve + validate a buffer-path candidate against the allowed roots.
+    """Adapt :func:`z4j_bare.storage.clamp_buffer_path` to raise :class:`ConfigError`.
 
-    Allowed roots:
-
-    - ``~/.z4j`` (preferred default)
-    - ``$TMPDIR/z4j-{uid}`` (fallback for service users with an
-      unwritable HOME - see ``z4j_bare.storage`` for why)
-
-    Rejects (via :class:`ConfigError`):
-
-    - Symlinks whose target escapes every allowed root.
-    - Parent-traversal (``..``) that escapes once resolved.
-    - Any path that, after ``resolve(strict=False)``, is not a
-      descendant of any allowed root.
-
-    Relative paths are interpreted under the FIRST allowed root
-    (``~/.z4j``) for backward compatibility. Absolute paths outside
-    every root are rejected. The file itself does not have to exist
-    yet - :class:`BufferStore` creates it.
+    The public helper lives in :mod:`z4j_bare.storage` and raises
+    ``ValueError`` so it has no package-local error class dependency.
+    Callers of ``install_agent`` expect :class:`ConfigError` for every
+    configuration failure, so we rewrap here. The helper was promoted
+    from private in audit 2026-04-24 Low-2 - the Django / Flask /
+    FastAPI adapters bypass ``install_agent`` and now call the public
+    helper directly.
     """
-    roots = buffer_roots()
-    primary = roots[0]
-    primary.mkdir(parents=True, exist_ok=True)
-
-    candidate = Path(candidate)
-    if not candidate.is_absolute():
-        candidate = primary / candidate
-    resolved = candidate.resolve(strict=False)
-
-    for root in roots:
-        try:
-            resolved.relative_to(root)
-        except ValueError:
-            continue
-        return resolved
-
-    roots_repr = ", ".join(str(r) for r in roots)
-    raise ConfigError(
-        f"Z4J_BUFFER_PATH must be inside one of: {roots_repr} "
-        f"(got {candidate}, resolved to {resolved}). Refusing "
-        f"to open a SQLite file outside the allowed roots.",
-    )
+    try:
+        return _clamp_public(candidate)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
 
 
 def install_agent(
@@ -80,6 +52,8 @@ def install_agent(
     project_id: str | None = None,
     hmac_secret: str | None = None,
     agent_name: str | None = None,
+    agent_id: str | None = None,
+    transport: str | None = None,
     framework: type[FrameworkAdapter] | FrameworkAdapter | None = None,
     schedulers: list[SchedulerAdapter] | None = None,
     environment: str | None = None,
@@ -138,6 +112,8 @@ def install_agent(
         project_id=project_id,
         hmac_secret=hmac_secret,
         agent_name=agent_name,
+        agent_id=agent_id,
+        transport=transport,
         environment=environment,
         tags=tags,
         dev_mode=dev_mode,
@@ -214,6 +190,8 @@ def _resolve(  # noqa: PLR0912  (a flat field-by-field resolver is clearer)
     redaction_extra_key_patterns: list[str] | None,
     redaction_extra_value_patterns: list[str] | None,
     agent_name: str | None = None,
+    agent_id: str | None = None,
+    transport: str | None = None,
 ) -> dict[str, Any]:
     """Merge explicit kwargs with ``Z4J_*`` env vars."""
     env = os.environ
@@ -266,6 +244,25 @@ def _resolve(  # noqa: PLR0912  (a flat field-by-field resolver is clearer)
     )
     if resolved_agent_name:
         out["agent_name"] = resolved_agent_name
+
+    # Transport selection + long-poll agent_id. Until audit Medium-2
+    # (2026-04-24) these two fields were never resolved in bare, so
+    # the long-poll transport silently coerced a missing agent_id to
+    # a fresh uuid4() inside ``_safe_uuid`` and every frame failed
+    # HMAC verification. Config now rejects this at construction
+    # time; here we feed env -> Config so operators can set them
+    # without code changes.
+    resolved_transport = (
+        transport if transport is not None else env.get("Z4J_TRANSPORT")
+    )
+    if resolved_transport:
+        out["transport"] = resolved_transport
+
+    resolved_agent_id = (
+        agent_id if agent_id is not None else env.get("Z4J_AGENT_ID")
+    )
+    if resolved_agent_id:
+        out["agent_id"] = resolved_agent_id
 
     if environment is not None:
         out["environment"] = environment
