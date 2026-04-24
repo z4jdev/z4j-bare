@@ -21,47 +21,55 @@ from z4j_core.protocols import FrameworkAdapter, QueueEngineAdapter, SchedulerAd
 from z4j_bare._process_singleton import try_register
 from z4j_bare.framework import BareFrameworkAdapter
 from z4j_bare.runtime import AgentRuntime
+from z4j_bare.storage import buffer_roots
 
 if TYPE_CHECKING:
     pass
 
 
-#: Directory under which every buffer-path variant must live. Fixed
-#: per-user root so an attacker who flips ``Z4J_BUFFER_PATH`` can't
-#: make the agent write SQLite into ``/etc/...`` or a Windows
-#: system directory. Operators who need a custom location should
-#: change ``HOME`` itself (container convention).
-_BUFFER_ROOT: Path = (Path.home() / ".z4j").resolve()
-
-
 def _clamp_buffer_path(candidate: Path) -> Path:
-    """Resolve + validate a buffer-path candidate against :data:`_BUFFER_ROOT`.
+    """Resolve + validate a buffer-path candidate against the allowed roots.
+
+    Allowed roots:
+
+    - ``~/.z4j`` (preferred default)
+    - ``$TMPDIR/z4j-{uid}`` (fallback for service users with an
+      unwritable HOME - see ``z4j_bare.storage`` for why)
 
     Rejects (via :class:`ConfigError`):
 
-    - Symlinks whose target escapes the root.
-    - Parent-traversal (``..``) that escapes the root once resolved.
+    - Symlinks whose target escapes every allowed root.
+    - Parent-traversal (``..``) that escapes once resolved.
     - Any path that, after ``resolve(strict=False)``, is not a
-      descendant of :data:`_BUFFER_ROOT`.
+      descendant of any allowed root.
 
-    Relative paths are interpreted under the root. Absolute paths
-    outside the root are rejected outright. The file itself does
-    not have to exist yet - :class:`BufferStore` creates it.
+    Relative paths are interpreted under the FIRST allowed root
+    (``~/.z4j``) for backward compatibility. Absolute paths outside
+    every root are rejected. The file itself does not have to exist
+    yet - :class:`BufferStore` creates it.
     """
-    _BUFFER_ROOT.mkdir(parents=True, exist_ok=True)
+    roots = buffer_roots()
+    primary = roots[0]
+    primary.mkdir(parents=True, exist_ok=True)
+
     candidate = Path(candidate)
     if not candidate.is_absolute():
-        candidate = _BUFFER_ROOT / candidate
+        candidate = primary / candidate
     resolved = candidate.resolve(strict=False)
-    try:
-        resolved.relative_to(_BUFFER_ROOT)
-    except ValueError as exc:
-        raise ConfigError(
-            f"Z4J_BUFFER_PATH must be inside {_BUFFER_ROOT} "
-            f"(got {candidate}, resolved to {resolved}). Refusing "
-            f"to open a SQLite file outside the allowed root.",
-        ) from exc
-    return resolved
+
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+
+    roots_repr = ", ".join(str(r) for r in roots)
+    raise ConfigError(
+        f"Z4J_BUFFER_PATH must be inside one of: {roots_repr} "
+        f"(got {candidate}, resolved to {resolved}). Refusing "
+        f"to open a SQLite file outside the allowed roots.",
+    )
 
 
 def install_agent(

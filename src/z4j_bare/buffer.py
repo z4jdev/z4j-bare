@@ -26,11 +26,19 @@ to keep z4j-bare's dependency footprint minimal.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from z4j_core.errors import BufferStorageError
+
+from z4j_bare.storage import (
+    ensure_buffer_root_writable,
+    is_writable_dir,
+)
 
 logger = logging.getLogger("z4j.agent.buffer")
 
@@ -112,12 +120,19 @@ class BufferStore:
         max_entries: int = 100_000,
         max_bytes: int = 256 * 1024 * 1024,
     ) -> None:
+        # Resolve the actual on-disk path. Most callers pass the
+        # default from Config.buffer_path; if that path's parent is
+        # not writable (service user with unwritable HOME, e.g.
+        # gunicorn under www-data) we silently relocate to the per-uid
+        # tmp fallback. The original filename is preserved so that
+        # ``buffer-{pid}.sqlite`` continues to namespace per-process.
+        path = self._resolve_writable_path(path)
+
         self._path = path
         self._max_entries = max_entries
         self._max_bytes = max_bytes
         self._lock = threading.Lock()
 
-        path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
             str(path),
             isolation_level=None,  # autocommit
@@ -143,6 +158,64 @@ class BufferStore:
         # BufferStore lifetime. A persistent drift bug would otherwise
         # spam the logs every heartbeat.
         self._drift_warned = False
+
+    @property
+    def path(self) -> Path:
+        """The on-disk path the buffer is using.
+
+        May differ from the path passed to ``__init__`` if the
+        original was unwritable and the resolver relocated the file
+        to the per-uid tmp fallback.
+        """
+        return self._path
+
+    @staticmethod
+    def _resolve_writable_path(requested: Path) -> Path:
+        """Pick an actually-writable path, falling back if needed.
+
+        Tries the requested parent directory first; if mkdir or write
+        fails, relocates the file (preserving its filename) under the
+        per-uid tmp fallback root. Raises
+        :class:`BufferStorageError` if no fallback works either.
+
+        We deliberately do NOT trust the requested path even when the
+        operator set it explicitly: the same env-var override that
+        bites correct setups also bites typo'd ones. Falling back is
+        always safer than crashing the host process at boot.
+        """
+        parent = requested.parent
+        if is_writable_dir(parent):
+            return requested
+
+        # The default location wasn't usable. Relocate the file under
+        # the resolved fallback root and keep going.
+        try:
+            fallback_root = ensure_buffer_root_writable()
+        except OSError as exc:
+            raise BufferStorageError(
+                f"z4j buffer: cannot find any writable directory for "
+                f"{requested.name}. Tried {parent} and the per-uid "
+                f"tmp fallback. Set Z4J_BUFFER_PATH to a writable "
+                f"directory.",
+                details={
+                    "requested": str(requested),
+                    "uid": str(os.getuid()) if hasattr(os, "getuid") else "n/a",
+                },
+            ) from exc
+
+        if fallback_root == parent:
+            # Resolver picked the same dir we just probed - shouldn't
+            # happen, but guard against an infinite-decision loop.
+            return requested
+
+        relocated = fallback_root / requested.name
+        logger.warning(
+            "z4j buffer: requested %s but the parent dir is not "
+            "writable; using %s instead.",
+            requested,
+            relocated,
+        )
+        return relocated
 
     # ------------------------------------------------------------------
     # Writes
