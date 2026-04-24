@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.0.5"
+version = "1.0.6"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,7 +22,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "z4j-core>=1.0.3",
+    "z4j-core>=1.0.4",
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]

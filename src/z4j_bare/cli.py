@@ -140,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args)
     if args.subcommand == "version":
         return _cmd_version()
+    if args.subcommand == "doctor":
+        return _cmd_doctor(args)
 
     parser.print_help()
     return 2
@@ -189,6 +191,37 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("version", help="Print the agent version and exit")
+
+    doc_parser = sub.add_parser(
+        "doctor",
+        help="Check connectivity to the brain and report what's wrong",
+    )
+    doc_parser.add_argument(
+        "--brain-url",
+        help="Brain URL (or set Z4J_BRAIN_URL)",
+    )
+    doc_parser.add_argument(
+        "--token",
+        help="Agent bearer token (or set Z4J_TOKEN)",
+    )
+    doc_parser.add_argument(
+        "--project-id",
+        help="Project slug (or set Z4J_PROJECT_ID)",
+    )
+    doc_parser.add_argument(
+        "--hmac-secret",
+        help="Shared HMAC secret (or set Z4J_HMAC_SECRET)",
+    )
+    doc_parser.add_argument(
+        "--no-websocket",
+        action="store_true",
+        help="Skip the WebSocket upgrade probe",
+    )
+    doc_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of text",
+    )
     return parser
 
 
@@ -308,6 +341,107 @@ def _wait_for_shutdown(runtime: AgentRuntime) -> None:
 
     logger.info("z4j agent stopping...")
     runtime.stop(timeout=10.0)
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Run connectivity probes and report what's wrong.
+
+    Builds a minimal :class:`Config` from CLI args + ``Z4J_*`` env
+    vars (no engine adapter, no framework adapter) and walks the
+    probe ladder from :mod:`z4j_bare.diagnostics`. Output mirrors
+    the framework adapters' doctor commands so operators see
+    consistent results regardless of which entry point they use.
+    """
+    import json
+    import os as _os
+
+    from z4j_core.models import Config
+    from z4j_core.errors import ConfigError
+
+    from z4j_bare import diagnostics
+
+    brain_url = args.brain_url or _os.environ.get("Z4J_BRAIN_URL")
+    token = args.token or _os.environ.get("Z4J_TOKEN")
+    project_id = args.project_id or _os.environ.get("Z4J_PROJECT_ID")
+    hmac_secret = args.hmac_secret or _os.environ.get("Z4J_HMAC_SECRET")
+
+    missing = [
+        name for name, val in (
+            ("brain_url", brain_url),
+            ("token", token),
+            ("project_id", project_id),
+        ) if not val
+    ]
+    if missing:
+        msg = (
+            f"z4j-doctor: missing required config: {', '.join(missing)}. "
+            f"Pass --{missing[0].replace('_', '-')} or set Z4J_{missing[0].upper()}."
+        )
+        if args.json:
+            print(json.dumps({"ok": False, "stage": "config", "error": msg}, indent=2))
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    try:
+        config_kwargs: dict[str, Any] = {
+            "brain_url": brain_url,
+            "token": token,
+            "project_id": project_id,
+        }
+        if hmac_secret:
+            config_kwargs["hmac_secret"] = hmac_secret
+        config = Config(**config_kwargs)
+    except (ConfigError, ValueError) as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "stage": "config", "error": str(exc)}, indent=2))
+        else:
+            print(f"z4j-doctor: invalid config: {exc}", file=sys.stderr)
+        return 1
+
+    results = []
+    results.append(diagnostics.probe_buffer_path(config.buffer_path))
+    if results[-1].ok:
+        for probe in (
+            diagnostics.probe_dns,
+            diagnostics.probe_tcp,
+            diagnostics.probe_tls,
+        ):
+            r = probe(str(config.brain_url))
+            results.append(r)
+            if not r.ok:
+                break
+        else:
+            if not args.no_websocket:
+                results.append(diagnostics.probe_websocket(config))
+
+    if args.json:
+        payload = {
+            "ok": all(r.ok for r in results),
+            "config": {
+                "brain_url": str(config.brain_url),
+                "project_id": config.project_id,
+                "buffer_path": str(config.buffer_path),
+                "transport": config.transport,
+            },
+            "probes": [
+                {"name": r.name, "ok": r.ok, "message": r.message, "details": r.details}
+                for r in results
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print("z4j-doctor (bare)")
+        print("=================")
+        print(f"  brain_url:   {config.brain_url}")
+        print(f"  project_id:  {config.project_id}")
+        print(f"  buffer_path: {config.buffer_path}")
+        print(f"  transport:   {config.transport}")
+        print()
+        for r in results:
+            tag = "[OK]  " if r.ok else "[FAIL]"
+            print(f"  {tag} {r.name:12s} {r.message}")
+    return 0 if all(r.ok for r in results) else 1
 
 
 __all__ = ["main"]

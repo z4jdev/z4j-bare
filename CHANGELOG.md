@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-04-24
+
+### Added
+
+- **Smart buffer-path fallback.** New `z4j_bare.storage` module owns the policy: try `~/.z4j` first, fall back to `$TMPDIR/z4j-{uid}` (mode 0700) when HOME is unwritable. `BufferStore.__init__` now relocates the buffer file (preserving the filename) instead of crashing with `PermissionError`. Fixes the gunicorn-under-www-data class of failure where the agent silently failed to start because `Path.home()` resolved to `/var/www`. Logs a WARNING when the fallback is selected so operators see the decision in their service log.
+- **`z4j_bare.diagnostics` module** with reusable probes for `z4j-doctor` style commands: `probe_buffer_path()`, `probe_dns()`, `probe_tcp()`, `probe_tls()`, `probe_websocket()`, plus a `run_all(config)` orchestrator. Probes return structured `ProbeResult` records, never raise. Used by z4j-django's `manage.py z4j_doctor`, z4j-flask's `flask z4j-doctor`, and z4j-fastapi's CLI doctor command.
+
+### Changed
+
+- `_clamp_buffer_path` in `install.py` now accepts paths under either of the two allowed roots (primary HOME-based or fallback tmp-based) instead of only the HOME root. The security boundary is preserved - operator-set `Z4J_BUFFER_PATH` values still must live under one of the user-private roots.
+- Bumped minimum `z4j-core` to `>=1.0.4` for the new `BufferStorageError` exception class.
+
+### Fixed
+
+- Agent no longer fails to start under low-privilege service users (gunicorn/www-data, uvicorn under DynamicUser, etc.). Was a regression visible since v1.0.0 but only surfaced in deployments where `Path.home()` resolved to a directory the running user could not write to.
+
 ## [1.0.5] - 2026-04-24
 
 ### Added
