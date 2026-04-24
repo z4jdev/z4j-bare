@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-04-24
+
+### Added
+
+- **`install_agent(framework=...)` kwarg.** Accepts a `FrameworkAdapter` instance or a class. When a class is passed, it's instantiated with the resolved `Config`. Defaults to `BareFrameworkAdapter` (preserves existing behavior). Lets engine bootstrappers (e.g. z4j-celery's `worker_bootstrap`) pass through the right framework so the agent's hello frame reports `framework: django` / `flask` / `fastapi` instead of always `bare`. Without this kwarg, every agent installed via `install_agent` reported `framework: bare` in the dashboard regardless of the host stack - a real misattribution since v1.0.0.
+
 ## [1.0.4] - 2026-04-24
 
 ### Added

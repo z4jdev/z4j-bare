@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from z4j_core.errors import ConfigError
 from z4j_core.models import Config
-from z4j_core.protocols import QueueEngineAdapter, SchedulerAdapter
+from z4j_core.protocols import FrameworkAdapter, QueueEngineAdapter, SchedulerAdapter
 
 from z4j_bare._process_singleton import try_register
 from z4j_bare.framework import BareFrameworkAdapter
@@ -72,6 +72,7 @@ def install_agent(
     project_id: str | None = None,
     hmac_secret: str | None = None,
     agent_name: str | None = None,
+    framework: type[FrameworkAdapter] | FrameworkAdapter | None = None,
     schedulers: list[SchedulerAdapter] | None = None,
     environment: str | None = None,
     tags: dict[str, str] | None = None,
@@ -145,10 +146,28 @@ def install_agent(
     except Exception as exc:  # noqa: BLE001
         raise ConfigError(f"invalid z4j agent configuration: {exc}") from exc
 
-    framework = BareFrameworkAdapter(config)
+    # Resolve the framework adapter:
+    #   - explicit instance: use as-is
+    #   - explicit class: instantiate with the resolved Config
+    #   - None: fall back to BareFrameworkAdapter (the historical default)
+    # The class-not-instance shape is the typical caller pattern: e.g.
+    # z4j-celery's worker_bootstrap probes for an installed framework
+    # adapter (Django/Flask/FastAPI/bare) and passes the class so this
+    # function can construct it with the same Config the runtime uses.
+    # Without this kwarg, install_agent always reported framework="bare"
+    # in the hello frame even when running inside a Django+Celery worker
+    # process - the dashboard's Framework column would show "bare"
+    # instead of the operator's actual stack.
+    if framework is None:
+        framework_instance: FrameworkAdapter = BareFrameworkAdapter(config)
+    elif isinstance(framework, type):
+        framework_instance = framework(config)
+    else:
+        framework_instance = framework
+
     runtime = AgentRuntime(
         config=config,
-        framework=framework,
+        framework=framework_instance,
         engines=engines,
         schedulers=schedulers,
     )
