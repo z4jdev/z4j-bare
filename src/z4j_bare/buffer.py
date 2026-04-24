@@ -395,15 +395,53 @@ class BufferStore:
 
         Idempotent. After close, :meth:`append` raises and all read
         methods return empty results.
+
+        Orphan cleanup: if the buffer is empty when we close (the
+        common case after a clean drain), the SQLite files are
+        removed from disk. Combined with the per-process buffer-path
+        default added in z4j-core 1.0.3 (``buffer-{pid}.sqlite``),
+        this prevents accumulation of stale ``buffer-{old-pid}.sqlite``
+        files across many restarts. If the buffer is non-empty
+        (un-drained events from a transport outage), the file is
+        preserved so a future BufferStore at the same path could
+        pick it up.
         """
         with self._lock:
             if self._closed:
                 return
+            # Ask SQLite for the current row count BEFORE closing the
+            # connection. We can't query a closed connection, and we
+            # don't want to invoke .size() (which acquires the same
+            # lock and we're already inside it).
+            try:
+                (count,) = self._conn.execute(
+                    "SELECT COUNT(*) FROM entries",
+                ).fetchone()
+            except sqlite3.Error:
+                # If the COUNT fails for any reason, err on the side
+                # of preserving the file - we don't want to delete a
+                # buffer that might still hold un-drained events just
+                # because the count query glitched.
+                count = -1
             self._closed = True
             try:
                 self._conn.close()
             except sqlite3.Error:  # pragma: no cover
                 pass
+            # Cleanup happens AFTER close() so we are not unlinking an
+            # open file (Windows can't delete a file SQLite still
+            # holds, and even on POSIX it's tidier this way).
+            if count == 0:
+                # WAL mode produces three files; delete all of them.
+                # Failures here are non-fatal - an operator with a
+                # custom umask / network mount can clean up by hand.
+                for suffix in ("", "-wal", "-shm"):
+                    p = Path(str(self._path) + suffix)
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
 
 
 __all__ = ["BufferEntry", "BufferStore"]

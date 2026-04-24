@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-04-24
+
+### Added
+
+- **Orphan cleanup on `BufferStore.close()`.** When the buffer is empty at shutdown (the common case after a clean drain), the SQLite files (`*.sqlite`, `*.sqlite-wal`, `*.sqlite-shm`) are removed from disk. Combined with the per-process `buffer-{pid}.sqlite` default added in z4j-core 1.0.3, this prevents accumulation of stale `buffer-{old-pid}.sqlite` files across many process restarts. If the buffer is non-empty (un-drained events from a transport outage), the file is preserved so a future BufferStore at the same path could pick it up.
+
+### Fixed
+
+- **No more `cached counters drifted negative` warning** in multi-process deployments (web + worker sharing one user). Root cause was the shared default buffer path; fixed in z4j-core 1.0.3 by switching to per-process paths. This package's contribution is the orphan cleanup so the per-process files don't pile up.
+
+### Changed
+
+- Bumped minimum `z4j-core` to `>=1.0.3` to pick up the per-process buffer-path default.
+
 ## [1.0.1] - 2026-04-21
 
 ### Changed
