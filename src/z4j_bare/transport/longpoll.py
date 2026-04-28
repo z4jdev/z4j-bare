@@ -239,15 +239,24 @@ class LongPollTransport:
         agent_uuid = _safe_uuid(self.agent_id)
         project_uuid = _safe_uuid(self.project_id)
 
+        # Round-9 audit fix R9-Wire-H1+H2 (Apr 2026): bind the
+        # per-connection session_nonce into the signer/verifier so
+        # captured frames from a previous nonce can't be replayed
+        # under a fresh nonce. The brain's long-poll service
+        # binds the same nonce on its side
+        # (api/agent_longpoll.py::_get_or_create_session).
+        binding = self._session_nonce or ""
         self._signer = FrameSigner(
             secret=self._hmac_secret,
             agent_id=agent_uuid,
             project_id=project_uuid,
+            session_id=binding,
         )
         self._verifier = FrameVerifier(
             secret=self._hmac_secret,
             agent_id=agent_uuid,
             project_id=project_uuid,
+            session_id=binding,
             direction="brain->agent",
         )
         # Synthetic session id - long-poll has no real handshake,
@@ -270,8 +279,12 @@ class LongPollTransport:
         self._client = None
         if client is None:
             return
+        # Round-8 audit fix R8-Async-LOW (Apr 2026): shield the
+        # aclose so an agent SIGTERM mid-shutdown doesn't leak
+        # the httpx pool.
         try:
-            await client.aclose()
+            import asyncio as _asyncio  # noqa: PLC0415
+            await _asyncio.shield(client.aclose())
         except Exception:  # noqa: BLE001  pragma: no cover
             pass
 

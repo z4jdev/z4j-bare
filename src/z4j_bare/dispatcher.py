@@ -136,12 +136,92 @@ class CommandDispatcher:
         target = frame.payload.target
         parameters = frame.payload.parameters
 
-        # Schedule actions go to a SchedulerAdapter
+        # ``schedule.fire`` is a tick from the brain-side
+        # z4j-scheduler asking the agent to enqueue a task right
+        # now. The brain has already resolved schedule → task in
+        # the payload (task_name + args + kwargs + queue + engine),
+        # so the agent does NOT need a SchedulerAdapter — this is
+        # just a plain enqueue against the QueueEngineAdapter.
+        # Routing it through ``_dispatch_scheduler`` (the pre-1.1
+        # behaviour) failed two ways: ``fire`` was not in the
+        # enable/disable/trigger_now/delete switch, and a celery
+        # WORKER agent has no scheduler adapter registered (celery-
+        # beat is a separate process), so the lookup also returned
+        # "no scheduler adapter registered for None". Audit log
+        # finding 2026-04-28: every scheduler tick produced a
+        # ``command.failed`` row with one of those two errors.
+        if action == "schedule.fire":
+            return await self._dispatch_schedule_fire(target, parameters)
+
+        # Other ``schedule.*`` actions (enable/disable/trigger_now/
+        # delete) go to a SchedulerAdapter — those DO require a
+        # scheduler-side mutation.
         if action.startswith("schedule."):
             return await self._dispatch_scheduler(action, target, parameters)
 
         # Everything else goes to a QueueEngineAdapter
         return await self._dispatch_engine(action, target, parameters)
+
+    async def _dispatch_schedule_fire(
+        self,
+        target: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> CommandResult:
+        """Enqueue the task that the brain-side scheduler decided to fire.
+
+        The payload from the brain
+        (:class:`z4j_brain.scheduler_grpc.handlers.SchedulerService`)
+        carries:
+
+        - ``task_name``  - dotted task name to enqueue
+        - ``engine``     - which queue engine adapter to use
+                           (e.g. ``"celery"``); falls back to the
+                           sole registered engine if unique
+        - ``queue``      - optional broker queue / routing key
+        - ``args`` / ``kwargs`` - task arguments
+
+        The schedule-id / fire-id metadata is informational only —
+        the agent doesn't need them to enqueue.
+        """
+        task_name = parameters.get("task_name") or target.get("task_name")
+        if not task_name:
+            return CommandResult(
+                status="failed",
+                error="schedule.fire: task_name required in payload",
+            )
+        engine_name = (
+            parameters.get("engine")
+            or target.get("engine")
+            or self._single_engine_name()
+        )
+        adapter = self.engines.get(engine_name) if engine_name else None
+        if adapter is None:
+            return CommandResult(
+                status="failed",
+                error=(
+                    f"schedule.fire: no engine adapter registered for "
+                    f"{engine_name!r}"
+                ),
+            )
+        method = getattr(adapter, "submit_task", None)
+        if method is None:
+            return CommandResult(
+                status="failed",
+                error=(
+                    f"schedule.fire: engine {adapter.name!r} does not "
+                    f"implement submit_task"
+                ),
+            )
+        args = parameters.get("args") or ()
+        if isinstance(args, list):
+            args = tuple(args)
+        kwargs = parameters.get("kwargs") or {}
+        return await method(
+            task_name,
+            args=args,
+            kwargs=kwargs,
+            queue=parameters.get("queue"),
+        )
 
     async def _dispatch_engine(
         self,

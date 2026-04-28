@@ -24,7 +24,7 @@ from z4j_bare.install import install_agent
 from z4j_bare.runtime import AgentRuntime, RuntimeState
 from z4j_bare.safety import safe_boundary, safe_call
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "AgentRuntime",
