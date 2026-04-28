@@ -659,6 +659,134 @@ class TestUnrecognizedAction:
         assert parsed["payload"]["status"] == "failed"
 
 
+class TestScheduleFire:
+    """Regression tests for the v1.1.0 ``schedule.fire`` dispatcher fix.
+
+    Pre-1.1 every brain-side scheduler tick produced a ``command.failed``
+    audit row with one of two errors:
+      - ``unrecognized schedule action 'schedule.fire'`` (the
+        ``_dispatch_scheduler`` switch had no ``fire`` handler), or
+      - ``no scheduler adapter registered for None`` (a Celery WORKER
+        agent doesn't have a SchedulerAdapter — celery-beat is a
+        separate process).
+    Both modes were observed in docker on 2026-04-28. Fix: route
+    ``schedule.fire`` to the QueueEngineAdapter's ``submit_task``
+    using the task payload the brain already populated.
+    """
+
+    async def test_schedule_fire_routes_to_engine_submit_task(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        buf: BufferStore,
+    ) -> None:
+        engine.submit_calls: list[tuple] = []  # type: ignore[attr-defined]
+
+        async def fake_submit(name, *, args=(), kwargs=None, queue=None,
+                              eta=None, priority=None):  # noqa: ARG001
+            engine.submit_calls.append((name, args, kwargs, queue))  # type: ignore[attr-defined]
+            return CommandResult(
+                status="success",
+                result={"task_id": f"new-{name}"},
+            )
+
+        engine.submit_task = fake_submit  # type: ignore[attr-defined]
+
+        cmd = _make_command(
+            action="schedule.fire",
+            target={"id": "sched-uuid"},
+            parameters={
+                "schedule_id": "sched-uuid",
+                "schedule_name": "nightly-cleanup",
+                "task_name": "myapp.tasks.cleanup",
+                "engine": "fake",
+                "queue": "default",
+                "args": ["arg1"],
+                "kwargs": {"k": "v"},
+                "fire_id": "fire-uuid",
+            },
+        )
+        await dispatcher.handle(cmd)
+
+        assert engine.submit_calls == [  # type: ignore[attr-defined]
+            ("myapp.tasks.cleanup", ("arg1",), {"k": "v"}, "default"),
+        ]
+        results = [e for e in buf.drain(10) if e.kind == "command_result"]
+        parsed = _decode_frame(results[0].payload)
+        assert parsed["payload"]["status"] == "success"
+
+    async def test_schedule_fire_works_without_scheduler_adapter(
+        self, buf: BufferStore, engine: FakeEngine,
+    ) -> None:
+        """Celery worker agent has zero SchedulerAdapters — must still fire."""
+        engine.submit_called = False  # type: ignore[attr-defined]
+
+        async def fake_submit(name, *, args=(), kwargs=None,  # noqa: ARG001
+                              queue=None, eta=None, priority=None):
+            engine.submit_called = True  # type: ignore[attr-defined]
+            return CommandResult(status="success", result={"task_id": "ok"})
+
+        engine.submit_task = fake_submit  # type: ignore[attr-defined]
+
+        # No schedulers={} — exactly the celery-worker shape.
+        dispatcher = CommandDispatcher(
+            engines={"fake": engine},
+            schedulers={},
+            buffer=buf,
+        )
+
+        cmd = _make_command(
+            action="schedule.fire",
+            target={},
+            parameters={
+                "task_name": "t",
+                "engine": "fake",
+                "args": [],
+                "kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+
+        assert engine.submit_called is True  # type: ignore[attr-defined]
+        results = [e for e in buf.drain(10) if e.kind == "command_result"]
+        parsed = _decode_frame(results[0].payload)
+        assert parsed["payload"]["status"] == "success"
+
+    async def test_schedule_fire_falls_back_to_sole_engine(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        buf: BufferStore,
+    ) -> None:
+        """If payload omits ``engine``, dispatch to the only registered one."""
+        engine.submit_called = False  # type: ignore[attr-defined]
+
+        async def fake_submit(name, *, args=(), kwargs=None,  # noqa: ARG001
+                              queue=None, eta=None, priority=None):
+            engine.submit_called = True  # type: ignore[attr-defined]
+            return CommandResult(status="success", result={"task_id": "ok"})
+
+        engine.submit_task = fake_submit  # type: ignore[attr-defined]
+
+        cmd = _make_command(
+            action="schedule.fire",
+            target={},
+            parameters={"task_name": "t"},  # no engine, no args/kwargs
+        )
+        await dispatcher.handle(cmd)
+        assert engine.submit_called is True  # type: ignore[attr-defined]
+
+    async def test_schedule_fire_missing_task_name_fails_cleanly(
+        self, dispatcher: CommandDispatcher, buf: BufferStore,
+    ) -> None:
+        cmd = _make_command(
+            action="schedule.fire",
+            target={},
+            parameters={"engine": "fake"},  # no task_name
+        )
+        await dispatcher.handle(cmd)
+        results = [e for e in buf.drain(10) if e.kind == "command_result"]
+        parsed = _decode_frame(results[0].payload)
+        assert parsed["payload"]["status"] == "failed"
+        assert "task_name" in (parsed["payload"]["error"] or "")
+
+
 class TestCapabilityGating:
     async def test_action_rejected_if_not_in_capabilities(
         self, buf: BufferStore,

@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.0.7"
+version = "1.1.0"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,11 +22,14 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Floor bumped to 1.0.5 for Config.model_validator rejecting
-    # transport='longpoll' with empty/invalid agent_id - the
-    # bare transport at 1.0.7 depends on this new validator
-    # (audit 2026-04-24 Medium-2).
-    "z4j-core>=1.0.5",
+    # Floor bumped to 1.1.0 for the v1.1.0 ecosystem family
+    # release. The schedule.fire dispatcher path requires the
+    # CommandPayload schema shipped with z4j-core 1.1.0 (the
+    # brain-side z4j-scheduler 1.1.0 emits the new payload
+    # shape). Older z4j-core releases still work for the
+    # 1.0.x agent path, but a 1.1.0 ecosystem install pins the
+    # whole slice together so operators get a known-good set.
+    "z4j-core>=1.1.0",
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]

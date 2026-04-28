@@ -297,15 +297,21 @@ class WebSocketTransport:
         # and verifier are recreated on every reconnect so the seq
         # counter resets with the session - the brain resets its
         # mirror counter the same way.
+        # Round-9 audit fix R9-Wire-H1+H2 (Apr 2026): bind the
+        # brain-supplied session_id into the HMAC envelope so a
+        # captured frame from a previous session can't be replayed.
+        # See z4j_core/transport/framing.py for the threat model.
         self._signer = FrameSigner(
             secret=self._hmac_secret,
             agent_id=ack.payload.agent_id,
             project_id=ack.payload.project_id,
+            session_id=ack.payload.session_id,
         )
         self._verifier = FrameVerifier(
             secret=self._hmac_secret,
             agent_id=ack.payload.agent_id,
             project_id=ack.payload.project_id,
+            session_id=ack.payload.session_id,
             direction="brain->agent",
         )
 

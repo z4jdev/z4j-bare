@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-04-28
+
+### Security (round-9 audit)
+
+- **Wire protocol cross-session replay closed.** Pre-fix the
+  agent's transport layer reset the ``seq + nonce`` counters per
+  session, which let an attacker who recorded an envelope from
+  session A replay it into session B (since both sessions had
+  independent counter spaces starting at the same low values).
+  Fix: the HMAC envelope now binds the ``session_id`` into the
+  signed payload - verifier rejects the frame if the session_id
+  in the envelope doesn't match the connection's session_id.
+  Wired in both ``transport/websocket.py`` and
+  ``transport/longpoll.py`` so both transports get the same
+  protection. Mirrored by the brain-side change in z4j-core 1.1.0
+  (signer + verifier).
+
+### Fixed
+
+- **Critical: ``schedule.fire`` now actually fires.** Pre-1.1 the dispatcher routed every ``schedule.*`` action to ``_dispatch_scheduler``, which only handled ``enable`` / ``disable`` / ``trigger_now`` / ``delete``. The brain-side z4j-scheduler 1.1.0 emits ``schedule.fire`` on every tick - the agent always rejected it with one of two errors:
+  - ``unrecognized schedule action 'schedule.fire'``
+  - ``no scheduler adapter registered for None`` (a Celery WORKER agent doesn't register a SchedulerAdapter - celery-beat is a separate process)
+
+  Result: every brain-side scheduled tick produced a ``command.failed`` audit row, and no scheduled work ever ran end-to-end. New ``_dispatch_schedule_fire`` routes ``schedule.fire`` to the QueueEngineAdapter's ``submit_task(task_name, args, kwargs, queue)`` using the payload the brain already populates. No SchedulerAdapter required. Verified live in the multi-framework docker e2e: zero ``command.failed`` rows in 60s of ticks across django/flask/fastapi after the fix. (z4j ecosystem v1.1.0 family release; brain 1.1.0 + scheduler 1.1.0 + bare 1.1.0 ship together.)
+
+### Changed
+
+- Bumped minimum ``z4j-core`` to ``>=1.1.0`` to align with the v1.1.0 ecosystem family release. Operators who install the 1.1.0 family get a known-good slice of brain + scheduler + agent + adapters resolved together.
+
+## [1.0.7] - 2026-04-25
+
+### Changed
+
+- Promoted ``z4j_bare.storage.clamp_buffer_path`` from private to public API. Used by the framework adapters (z4j-django, z4j-flask, z4j-fastapi) to clamp operator-set ``Z4J_BUFFER_PATH`` values without re-implementing the security boundary check.
+
 ## [1.0.6] - 2026-04-24
 
 ### Added
