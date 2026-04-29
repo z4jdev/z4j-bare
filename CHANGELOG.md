@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-29
+
+### Added
+
+- **Worker-first protocol generation in `AgentRuntime`.** Each
+  agent process now generates a stable `worker_id` of the form
+  `<framework>-<pid>-<unix_ms>` at startup and sends it in the
+  Hello frame alongside `worker_role`, `worker_pid`, and
+  `worker_started_at`. The brain registry uses this to allow
+  multiple concurrent connections per agent_id (the gunicorn
+  4-worker case). Resolves the agent-flap pattern that occurred
+  when multiple workers under the same agent_token competed for
+  the single registry slot in 1.1.x.
+- **`worker_role` resolution chain**: `Z4J_WORKER_ROLE` env /
+  `Config.worker_role` overrides; falls back to the framework
+  adapter's `default_worker_role` (django/flask/fastapi all
+  default to `web`); else None.
+
+### Changed
+
+- `WebSocketTransport.__init__` accepts new optional kwargs
+  `worker_id`, `worker_role`, `worker_pid`, `worker_started_at`.
+  Adds them to `__slots__`.
+- Dependency floor `z4j-core>=1.2.0`.
+
+
 ## [1.1.2] - 2026-04-28
 
 ### Fixed
