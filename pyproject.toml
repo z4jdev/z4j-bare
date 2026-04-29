@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.1.0"
+version = "1.1.2"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,6 +33,13 @@ dependencies = [
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]
+
+[project.scripts]
+# 1.1.2+ console-script entry. ``z4j-bare`` (hyphen) is a thin
+# wrapper around ``python -m z4j_bare`` - both forms work, both
+# are supported. Operators choose based on shop convention; the
+# hyphen form matches the pip distribution name.
+z4j-bare = "z4j_bare.cli:main"
 
 [project.optional-dependencies]
 # Filesystem watcher for ``Z4J_DEV_MODE=true``. Lets the agent

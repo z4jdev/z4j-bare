@@ -77,6 +77,25 @@ _RECONNECT_INITIAL = 1.0
 _RECONNECT_MAX = 30.0
 _RECONNECT_JITTER = 0.3
 
+# Auth-error backoff schedule. AuthenticationError indicates the
+# brain rejected the agent's bearer token (mismatched HMAC, revoked
+# agent, rotated secret, etc.). Pre-1.1.2 this was treated as fatal
+# and stopped the reconnect loop forever, leaving the agent process
+# alive but offline until manually restarted (the failure mode that
+# bit tasks.jfk.work on 2026-04-28). 1.1.2 retries forever with a
+# longer cap (10 minutes) so an operator-initiated token rotation
+# eventually succeeds without flooding the brain's auth endpoint.
+_AUTH_RECONNECT_INITIAL = 10.0
+_AUTH_RECONNECT_MAX = 600.0
+_AUTH_RECONNECT_JITTER = 0.3
+
+# ProtocolError handling. These come from the wire layer: bad
+# handshake, version skew during a brain restart, malformed frames
+# from a partial deploy. Almost always transient - same backoff as
+# ConnectionError. Pre-1.1.2 these were also fatal; same fix.
+_PROTOCOL_RECONNECT_INITIAL = 1.0
+_PROTOCOL_RECONNECT_MAX = 60.0
+
 
 def _decode_hmac_secret(value: str) -> bytes:
     """Decode the configured ``hmac_secret`` string into raw bytes.
@@ -152,9 +171,60 @@ class AgentRuntime:
         self._dispatcher: CommandDispatcher | None = None
         self._heartbeat: Heartbeat | None = None
 
+        # Per-class consecutive-failure counters (reset on clean
+        # connect cycle). Surfaced to the doctor CLI and heartbeat
+        # frames so operators can distinguish "agent is in a flap
+        # loop" from "agent is fine, just disconnected once."
+        self._auth_error_count = 0
+        self._protocol_error_count = 0
+        self._connection_error_count = 0
+
+        # Reconnect-now event. set() by the SIGHUP handler from
+        # z4j_bare.control.install_sighup_handler. The supervisor
+        # checks this between cycles and skips its backoff timer
+        # when set, going straight to the next connect attempt.
+        # Shared across all framework adapters because they all
+        # use this same runtime.
+        self._reconnect_now: asyncio.Event | None = None
+
     # ------------------------------------------------------------------
     # Sync API (safe from any thread/context)
     # ------------------------------------------------------------------
+
+    def request_reconnect(self) -> None:
+        """Request the supervisor skip its current backoff and reconnect now.
+
+        Thread-safe. Called by the SIGHUP signal handler installed
+        by ``z4j_bare.control.install_sighup_handler``. The
+        supervisor's ``asyncio.wait_for`` on the stop_event will
+        early-return when this event fires; the next iteration
+        attempts a fresh connection without waiting for the rest of
+        the backoff timer.
+
+        Returns silently if the runtime hasn't started yet.
+        """
+        if self._loop is not None and self._reconnect_now is not None:
+            self._loop.call_soon_threadsafe(self._reconnect_now.set)
+
+    def supervisor_state(self) -> dict[str, object]:
+        """Return current supervisor health for the doctor CLI.
+
+        Snapshot includes the runtime state, per-error-class
+        consecutive-failure counters, and (if connected) the current
+        session id. Doctor formats this for human consumption; status
+        prints a one-line summary.
+        """
+        return {
+            "state": self.state.value,
+            "auth_error_count": self._auth_error_count,
+            "protocol_error_count": self._protocol_error_count,
+            "connection_error_count": self._connection_error_count,
+            "session_id": (
+                getattr(self._transport, "session_id", None)
+                if self._transport is not None
+                else None
+            ),
+        }
 
     @property
     def state(self) -> RuntimeState:
@@ -223,6 +293,37 @@ class AgentRuntime:
         with self._state_lock:
             self._state = RuntimeState.RUNNING
 
+        # Pidfile + SIGHUP wiring (1.1.2+). Best-effort: failure to
+        # write the pidfile or install the handler is logged but
+        # does NOT prevent the runtime from running. The agent stays
+        # functional; the only feature operators lose is the
+        # ``z4j-<adapter> restart`` shortcut (they can still
+        # restart their host process via their supervisor).
+        try:
+            from z4j_bare.control import (
+                install_sighup_handler,
+                write_pidfile,
+            )
+
+            adapter_id = self.framework.name if self.framework else "bare"
+            try:
+                pf = write_pidfile(adapter_id)
+                logger.debug("z4j agent: pidfile written at %s", pf)
+            except OSError as exc:
+                logger.warning(
+                    "z4j agent: pidfile write failed (%s); "
+                    "`z4j-%s restart` will not work until the "
+                    "next clean restart",
+                    exc,
+                    adapter_id,
+                )
+            install_sighup_handler(self)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "z4j agent: failed to set up control surface "
+                "(pidfile + SIGHUP). Runtime is unaffected.",
+            )
+
         logger.info(
             "z4j agent runtime started (project=%s, engines=%s)",
             self.config.project_id,
@@ -266,6 +367,15 @@ class AgentRuntime:
         if self._buffer is not None:
             self._buffer.close()
             self._buffer = None
+
+        # Best-effort pidfile cleanup so a stale entry doesn't
+        # confuse the next ``z4j-<adapter> restart``.
+        try:
+            from z4j_bare.control import remove_pidfile
+
+            remove_pidfile(self.framework.name if self.framework else "bare")
+        except Exception:  # noqa: BLE001
+            pass
 
         with self._state_lock:
             self._state = RuntimeState.STOPPED
@@ -355,6 +465,7 @@ class AgentRuntime:
             asyncio.set_event_loop(loop)
             self._loop = loop
             self._stop_event = asyncio.Event()
+            self._reconnect_now = asyncio.Event()
         except Exception:  # noqa: BLE001
             logger.exception("z4j agent failed to create asyncio loop")
             self._loop_ready.set()  # unblock the caller's wait()
@@ -603,64 +714,168 @@ class AgentRuntime:
     async def _supervise(self) -> None:
         """Supervisor: connect → run tasks → on disconnect, reconnect.
 
+        Forever-retry contract (1.1.2+): every error class except
+        ``_StopRequested`` schedules a reconnect. The reconnect loop
+        is structurally infinite; only an explicit operator stop
+        terminates it. This is the difference between an agent that
+        self-heals and an agent that goes offline forever after one
+        bad handshake.
+
+        Per-error-class backoff schedules:
+
+        - ``ConnectionError`` (network, TCP, TLS, WS-level): 1s -> 30s
+        - ``ProtocolError`` (handshake, version skew, malformed frame): 1s -> 60s
+        - ``AuthenticationError`` (rejected bearer, HMAC mismatch,
+          revoked agent): 10s -> 600s. Longer cap because if it's
+          a real config issue, hammering the brain at 30s intervals
+          is rude; if it's a transient secret-rotation window, 10
+          minutes is short enough that operators don't notice.
+        - ``Exception`` (anything else, including bugs in our own
+          code): treated as ConnectionError-equivalent. Logged with
+          full traceback at every cycle.
+
         ``_connect_and_run`` runs an ``asyncio.TaskGroup`` which raises
         ``ExceptionGroup`` (PEP 654) when any child task fails. We use
-        ``except*`` to peel out the failure classes we care about
-        without losing the others - a bare ``except`` would silently
-        swallow ``AuthenticationError`` if it was wrapped in a group.
+        ``except*`` to peel out the failure classes so the longer
+        AuthenticationError schedule is applied independently of the
+        others.
         """
         assert self._stop_event is not None
-        delay = _RECONNECT_INITIAL
+        # Per-class delay state - each error class has its own
+        # exponential timer so a flap in one doesn't reset the others.
+        delay_conn = _RECONNECT_INITIAL
+        delay_proto = _PROTOCOL_RECONNECT_INITIAL
+        delay_auth = _AUTH_RECONNECT_INITIAL
+        # Per-class consecutive-failure counters for diagnostics.
+        # Surfaced in heartbeats and the doctor CLI so operators can
+        # see "5 consecutive AuthErrors" without grepping logs.
+        self._auth_error_count = 0
+        self._protocol_error_count = 0
+        self._connection_error_count = 0
         stop_loop = False
         while not stop_loop and not self._stop_event.is_set():
-            fatal: BaseException | None = None
-            transient: BaseException | None = None
+            error_class: str | None = None
+            err: BaseException | None = None
             try:
                 await self._connect_and_run()
-                delay = _RECONNECT_INITIAL  # reset on clean cycle
+                # Clean cycle - reset every per-class delay so the
+                # next failure starts at the floor again.
+                delay_conn = _RECONNECT_INITIAL
+                delay_proto = _PROTOCOL_RECONNECT_INITIAL
+                delay_auth = _AUTH_RECONNECT_INITIAL
+                self._auth_error_count = 0
+                self._protocol_error_count = 0
+                self._connection_error_count = 0
             except* _StopRequested:
                 # Watchdog cancelled the group on stop_event - clean exit.
                 # PEP 654 forbids ``return`` inside an ``except*`` block,
                 # so we set a flag and break out at the next loop guard.
                 stop_loop = True
             except* AuthenticationError as eg:
-                fatal = _first(eg)
+                error_class = "auth"
+                err = _first(eg)
+                self._auth_error_count += 1
             except* ProtocolError as eg:
-                fatal = _first(eg)
+                error_class = "protocol"
+                err = _first(eg)
+                self._protocol_error_count += 1
             except* ConnectionError as eg:
-                transient = _first(eg)
+                error_class = "connection"
+                err = _first(eg)
+                self._connection_error_count += 1
             except* Exception as eg:  # noqa: BLE001
-                # Anything else is treated as transient - reconnect
-                # after the backoff. Log the full group so operators
-                # see every sub-exception, not just the first one.
+                # Unknown failure class. Treat as connection-class
+                # for backoff purposes; log full traceback so future
+                # categorisation is possible. Never fatal.
                 logger.exception(
                     "z4j agent unexpected supervisor error",
                     exc_info=eg,
                 )
-                transient = _first(eg)
+                error_class = "connection"
+                err = _first(eg)
+                self._connection_error_count += 1
 
             if stop_loop:
                 break
 
-            if fatal is not None:
-                logger.error(
-                    "z4j agent fatal: %s; stopping reconnect loop",
-                    fatal,
-                )
-                return
-            if transient is not None:
-                logger.warning("z4j agent disconnected: %s", transient)
+            if err is not None:
+                if error_class == "auth":
+                    logger.warning(
+                        "z4j agent auth rejected (#%d consecutive): %s; "
+                        "retrying with backoff (10min cap)",
+                        self._auth_error_count,
+                        err,
+                    )
+                elif error_class == "protocol":
+                    logger.warning(
+                        "z4j agent protocol error (#%d consecutive): %s; "
+                        "retrying with backoff",
+                        self._protocol_error_count,
+                        err,
+                    )
+                else:
+                    logger.warning("z4j agent disconnected: %s", err)
 
             if self._stop_event.is_set():
                 return
 
-            sleep_for = delay + random.uniform(0, delay * _RECONNECT_JITTER)
+            # Pick the schedule for the most recent error class.
+            if error_class == "auth":
+                base = delay_auth
+                jitter = _AUTH_RECONNECT_JITTER
+                cap = _AUTH_RECONNECT_MAX
+            elif error_class == "protocol":
+                base = delay_proto
+                jitter = _RECONNECT_JITTER
+                cap = _PROTOCOL_RECONNECT_MAX
+            else:
+                base = delay_conn
+                jitter = _RECONNECT_JITTER
+                cap = _RECONNECT_MAX
+
+            sleep_for = base + random.uniform(0, base * jitter)
+            # Wake either on stop (clean exit) or reconnect_now
+            # (SIGHUP from z4j-<adapter> restart). On reconnect_now
+            # we clear the event and skip straight to the next
+            # connect attempt; the per-class backoff timer is NOT
+            # reset (so an operator can't accidentally hammer the
+            # brain by spamming SIGHUP).
+            assert self._reconnect_now is not None
+            stop_task = asyncio.create_task(self._stop_event.wait())
+            reconnect_task = asyncio.create_task(self._reconnect_now.wait())
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=sleep_for)
-                return  # stop requested
-            except TimeoutError:
-                pass
-            delay = min(delay * 2.0, _RECONNECT_MAX)
+                done, pending = await asyncio.wait(
+                    {stop_task, reconnect_task},
+                    timeout=sleep_for,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                if stop_task in done:
+                    return  # stop requested
+                if reconnect_task in done:
+                    self._reconnect_now.clear()
+                    logger.info(
+                        "z4j agent reconnect requested via SIGHUP; "
+                        "skipping remaining backoff",
+                    )
+            finally:
+                # Defensively cancel any task that survived the
+                # done/pending split (shouldn't happen, but
+                # cancellation is cheap).
+                for t in (stop_task, reconnect_task):
+                    if not t.done():
+                        t.cancel()
+
+            # Advance only the schedule that fired. Other classes
+            # keep their state so a flap pattern in one class doesn't
+            # zero out an unrelated class's progress.
+            if error_class == "auth":
+                delay_auth = min(delay_auth * 2.0, cap)
+            elif error_class == "protocol":
+                delay_proto = min(delay_proto * 2.0, cap)
+            else:
+                delay_conn = min(delay_conn * 2.0, cap)
 
     async def _connect_and_run(self) -> None:
         """One supervisor cycle: connect, run tasks, until disconnect."""
