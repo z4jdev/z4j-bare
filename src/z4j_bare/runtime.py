@@ -1005,6 +1005,38 @@ class AgentRuntime:
                 dev_mode=self.config.dev_mode,
             )
 
+        # Worker-first protocol (1.2.0+): generate a stable worker_id
+        # for this process. ``<framework>-<pid>-<unix_ms>`` is unique
+        # across gunicorn workers (different pids), Celery workers
+        # (different pids), and process restarts (different start
+        # times) under the same agent_token. The brain registers
+        # each worker as a discrete connection slot keyed by this
+        # id, so multiple workers under the same agent_id no longer
+        # fight (the 1.1.x flap pattern).
+        import os as _os
+        import time as _time
+        from datetime import UTC, datetime
+
+        worker_started_at = datetime.now(UTC)
+        worker_id = (
+            f"{self.framework.name}-{_os.getpid()}-"
+            f"{int(_time.time() * 1000)}"
+        )
+
+        # worker_role: explicit operator config takes precedence;
+        # adapter default if it declared one (1.2.0+ adapter API);
+        # else None (legacy / untyped).
+        worker_role = (
+            getattr(self.config, "worker_role", None)
+            or getattr(self.framework, "default_worker_role", None)
+            or None
+        )
+        if callable(worker_role):
+            try:
+                worker_role = worker_role()
+            except Exception:  # noqa: BLE001
+                worker_role = None
+
         return WebSocketTransport(
             brain_url=str(self.config.brain_url),
             token=self.config.token.get_secret_value(),
@@ -1016,6 +1048,10 @@ class AgentRuntime:
             hmac_secret=hmac_secret,
             agent_name=self.config.agent_name,
             dev_mode=self.config.dev_mode,
+            worker_id=worker_id,
+            worker_role=worker_role,
+            worker_pid=_os.getpid(),
+            worker_started_at=worker_started_at,
         )
 
 

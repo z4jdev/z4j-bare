@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from urllib.parse import urlparse
 
 import websockets
@@ -87,6 +88,11 @@ class WebSocketTransport:
         "_dev_mode",
         "_signer",
         "_verifier",
+        # Worker-first protocol (1.2.0+)
+        "worker_id",
+        "worker_role",
+        "worker_pid",
+        "worker_started_at",
     )
 
     def __init__(
@@ -104,6 +110,15 @@ class WebSocketTransport:
         agent_name: str | None = None,
         max_frame_size: int = 1_048_576,
         dev_mode: bool = False,
+        # Worker-first protocol (1.2.0+). All optional - if any are
+        # None, the transport sends a legacy 1.1.x-shaped Hello and
+        # the brain treats this connection under "one slot per
+        # agent_id" semantics. When set, the brain accepts this as
+        # one of N concurrent worker connections per agent_id.
+        worker_id: str | None = None,
+        worker_role: str | None = None,
+        worker_pid: int | None = None,
+        worker_started_at: "datetime | None" = None,
     ) -> None:
         if len(hmac_secret) < 32:
             raise ValueError(
@@ -121,6 +136,10 @@ class WebSocketTransport:
         self.agent_name = agent_name
         self.max_frame_size = max_frame_size
         self._dev_mode = dev_mode
+        self.worker_id = worker_id
+        self.worker_role = worker_role
+        self.worker_pid = worker_pid
+        self.worker_started_at = worker_started_at
 
         self._ws: ClientConnection | None = None
         self._session_id: str | None = None
@@ -254,6 +273,14 @@ class WebSocketTransport:
                 schedulers=self.schedulers,
                 capabilities=self.capabilities,
                 host=host,
+                # Worker-first protocol (1.2.0+). All None for legacy
+                # clients (single-connection mode); set for multi-
+                # worker deployments so the brain registers each
+                # worker as a discrete connection slot.
+                worker_id=self.worker_id,
+                worker_role=self.worker_role,
+                worker_pid=self.worker_pid,
+                worker_started_at=self.worker_started_at,
             ),
         )
 
