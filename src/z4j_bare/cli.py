@@ -127,9 +127,199 @@ _ENGINE_LOADERS: dict[str, EngineLoader] = {
 }
 
 
-def main(argv: list[str] | None = None) -> int:
+def make_engine_main(
+    engine_id: str,
+    *,
+    upstream_package: str,
+    broker_env: str | None = None,
+    upstream_attribute: str | None = None,
+) -> Callable[[list[str] | None], int]:
+    """Return a ``main(argv)`` for a z4j-<engine> CLI.
+
+    Engines are libraries, not runtimes (they don't manage their
+    own connection - they're plugged into a framework adapter or
+    z4j-bare). They expose a slim CLI surface for doctor / check /
+    status to confirm:
+
+    1. the upstream engine library is importable (``upstream_package``)
+    2. the z4j-<engine> adapter package is importable
+    3. the broker URL env var is set (when applicable)
+
+    Operators run engine doctors when isolating a problem: "is RQ
+    installed in this venv? Is REDIS_URL set? Is z4j-rq importable?"
+    Each is a one-line answer; running the engine's doctor as part
+    of a framework's doctor (the common path) gives the full
+    picture.
+
+    Engine adapters call this from their own ``cli.py``::
+
+        # z4j_celery/cli.py
+        from z4j_bare.cli import make_engine_main
+        main = make_engine_main(
+            "celery", upstream_package="celery", broker_env="CELERY_BROKER_URL",
+        )
+    """
+
+    def _engine_main(argv: list[str] | None = None) -> int:
+        if argv is None:
+            argv = sys.argv[1:]
+        parser = argparse.ArgumentParser(
+            prog=f"z4j-{engine_id}",
+            description=(
+                f"z4j-{engine_id}: engine adapter diagnostics. "
+                "Run from a host process for engine-specific health "
+                "checks; run framework doctors for full coverage."
+            ),
+        )
+        sub = parser.add_subparsers(dest="subcommand")
+        sub.add_parser(
+            "doctor",
+            help=f"Check that {engine_id} + z4j-{engine_id} are importable",
+        )
+        sub.add_parser("check", help="Alias for doctor")
+        sub.add_parser("status", help="One-line: package presence + broker URL")
+        sub.add_parser("version", help="Print z4j-<engine> version + exit")
+        args = parser.parse_args(argv)
+
+        if args.subcommand is None:
+            parser.print_help()
+            return 2
+
+        if args.subcommand == "version":
+            try:
+                import importlib.metadata as _md
+                print(_md.version(f"z4j-{engine_id}"))  # noqa: T201
+                return 0
+            except Exception as exc:  # noqa: BLE001
+                print(f"z4j-{engine_id} version: {exc}", file=sys.stderr)
+                return 1
+
+        # doctor / check / status all share the import probes.
+        results: list[tuple[str, bool, str]] = []
+
+        # Probe 1: upstream engine library
+        try:
+            mod = __import__(upstream_package)
+            ver = getattr(mod, "__version__", "<unknown>")
+            results.append(
+                (
+                    f"upstream {upstream_package}",
+                    True,
+                    f"v{ver}",
+                ),
+            )
+        except ImportError as exc:
+            results.append(
+                (
+                    f"upstream {upstream_package}",
+                    False,
+                    (
+                        f"not installed in this venv: {exc}. "
+                        f"Install with: pip install {upstream_package}"
+                    ),
+                ),
+            )
+
+        # Probe 2: z4j-<engine> adapter
+        adapter_pkg = f"z4j_{engine_id}"
+        try:
+            adapter_mod = __import__(adapter_pkg)
+            ver = getattr(adapter_mod, "__version__", "<unknown>")
+            results.append(
+                (
+                    f"adapter z4j-{engine_id}",
+                    True,
+                    f"v{ver}",
+                ),
+            )
+        except ImportError as exc:
+            results.append(
+                (
+                    f"adapter z4j-{engine_id}",
+                    False,
+                    f"not installed: {exc}",
+                ),
+            )
+
+        # Probe 3: broker URL (if applicable)
+        if broker_env is not None:
+            import os as _os
+            url = _os.environ.get(broker_env)
+            if url:
+                results.append(
+                    (f"broker {broker_env}", True, "set"),
+                )
+            else:
+                results.append(
+                    (
+                        f"broker {broker_env}",
+                        True,
+                        (
+                            "not set in env (this is OK if your "
+                            f"{upstream_package} app loads it from "
+                            "config files - the framework's doctor "
+                            "checks the resolved URL via the app)"
+                        ),
+                    ),
+                )
+
+        if args.subcommand == "status":
+            short = ", ".join(
+                f"{n}={'OK' if ok else 'FAIL'}" for n, ok, _ in results
+            )
+            print(f"z4j-{engine_id} status: {short}")  # noqa: T201
+            return 0 if all(ok for _, ok, _ in results) else 1
+
+        # doctor / check
+        print(f"z4j-{engine_id} doctor")  # noqa: T201
+        print("=" * (len(f"z4j-{engine_id} doctor")))  # noqa: T201
+        for name, ok, msg in results:
+            tag = "[OK]  " if ok else "[FAIL]"
+            print(f"  {tag} {name:24s}  {msg}")  # noqa: T201
+        return 0 if all(ok for _, ok, _ in results) else 1
+
+    return _engine_main
+
+
+def make_main_for_adapter(adapter_id: str) -> Callable[[list[str] | None], int]:
+    """Return a ``main(argv)`` pre-configured for a specific adapter.
+
+    Used by framework wrapper packages (z4j-django, z4j-flask,
+    z4j-fastapi) to inherit the full check/status/restart surface
+    without re-declaring every subcommand. The wrapper just needs
+    a one-liner::
+
+        # z4j_flask/cli.py
+        from z4j_bare.cli import make_main_for_adapter
+        main = make_main_for_adapter("flask")
+
+    What this does:
+    - For ``restart`` / ``reload`` subcommands, pre-fills
+      ``--adapter <adapter_id>`` so ``z4j-flask restart`` signals
+      the flask agent's pidfile, not the generic bare one.
+    - Sets ``argparse`` ``prog`` to the adapter's pip name so the
+      help text reads correctly.
+    - All other subcommands flow through unchanged.
+    """
+
+    def _adapter_main(argv: list[str] | None = None) -> int:
+        if argv is None:
+            argv = sys.argv[1:]
+        # Pre-fill --adapter for restart/reload so "z4j-django
+        # restart" routes to the django pidfile, not the generic
+        # bare one. Operator can still override with explicit
+        # --adapter X if they really want to signal a sibling.
+        if argv and argv[0] in ("restart", "reload"):
+            if "--adapter" not in argv and "-a" not in argv:
+                argv = [argv[0], "--adapter", adapter_id, *argv[1:]]
+        return main(argv, prog=f"z4j-{adapter_id}")
+
+    return _adapter_main
+
+
+def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     """CLI entry point. Returns a shell exit code."""
-    parser = _build_parser()
+    parser = _build_parser(prog=prog)
     args = parser.parse_args(argv)
 
     if args.subcommand is None:
@@ -142,14 +332,20 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_version()
     if args.subcommand == "doctor":
         return _cmd_doctor(args)
+    if args.subcommand == "check":
+        return _cmd_check(args)
+    if args.subcommand == "status":
+        return _cmd_status(args)
+    if args.subcommand == "restart" or args.subcommand == "reload":
+        return _cmd_restart(args)
 
     parser.print_help()
     return 2
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m z4j_bare",
+        prog=prog or "python -m z4j_bare",
         description="z4j agent runtime for bare Python projects",
     )
     parser.add_argument(
@@ -221,6 +417,60 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit machine-readable JSON instead of text",
+    )
+
+    # check / status / restart - the resilience triad. Mirror the
+    # brain's z4j-brain check/status verbs so operators get a
+    # consistent surface across every package.
+
+    check_parser = sub.add_parser(
+        "check",
+        help=(
+            "Short pass/fail health check (exit 0 OK, exit 1 fail). "
+            "Same probes as ``doctor`` but compact output."
+        ),
+    )
+    check_parser.add_argument(
+        "--brain-url",
+        help="Brain URL (or set Z4J_BRAIN_URL)",
+    )
+    check_parser.add_argument(
+        "--token",
+        help="Agent bearer token (or set Z4J_TOKEN)",
+    )
+    check_parser.add_argument(
+        "--project-id",
+        help="Project slug (or set Z4J_PROJECT_ID)",
+    )
+
+    sub.add_parser(
+        "status",
+        help=(
+            "One-line current state: pidfile, buffer dir, last "
+            "session id, consecutive error counts."
+        ),
+    )
+
+    restart_parser = sub.add_parser(
+        "restart",
+        help=(
+            "Force the running agent to drop its current connection "
+            "and reconnect immediately, skipping the supervisor's "
+            "exponential backoff. Sends SIGHUP via the pidfile."
+        ),
+    )
+    restart_parser.add_argument(
+        "--adapter",
+        default="bare",
+        help=(
+            "Adapter id whose pidfile to signal "
+            "(default: bare). Override when running multiple "
+            "adapters in the same process tree."
+        ),
+    )
+    sub.add_parser(
+        "reload",
+        help="Alias for ``restart`` (matches Unix service convention).",
     )
     return parser
 
@@ -343,6 +593,55 @@ def _wait_for_shutdown(runtime: AgentRuntime) -> None:
     runtime.stop(timeout=10.0)
 
 
+def _load_doctor_config(args: argparse.Namespace) -> "Config":
+    """Build a probe-ready Config from CLI args + Z4J_* env vars.
+
+    Shared by the doctor and check commands. Raises ``ValueError``
+    or ``ConfigError`` on missing / malformed config so the caller
+    can format an error message appropriate to the command.
+    """
+    import os as _os
+
+    from z4j_core.errors import ConfigError
+    from z4j_core.models import Config
+
+    brain_url = (
+        getattr(args, "brain_url", None) or _os.environ.get("Z4J_BRAIN_URL")
+    )
+    token = getattr(args, "token", None) or _os.environ.get("Z4J_TOKEN")
+    project_id = (
+        getattr(args, "project_id", None) or _os.environ.get("Z4J_PROJECT_ID")
+    )
+    hmac_secret = (
+        getattr(args, "hmac_secret", None)
+        or _os.environ.get("Z4J_HMAC_SECRET")
+    )
+
+    missing = [
+        name
+        for name, val in (
+            ("brain_url", brain_url),
+            ("token", token),
+            ("project_id", project_id),
+        )
+        if not val
+    ]
+    if missing:
+        raise ValueError(
+            f"missing required config: {', '.join(missing)}. "
+            f"Pass --{missing[0].replace('_', '-')} or set Z4J_{missing[0].upper()}."
+        )
+
+    config_kwargs: dict[str, Any] = {
+        "brain_url": brain_url,
+        "token": token,
+        "project_id": project_id,
+    }
+    if hmac_secret:
+        config_kwargs["hmac_secret"] = hmac_secret
+    return Config(**config_kwargs)
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """Run connectivity probes and report what's wrong.
 
@@ -353,50 +652,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     consistent results regardless of which entry point they use.
     """
     import json
-    import os as _os
 
-    from z4j_core.models import Config
     from z4j_core.errors import ConfigError
 
     from z4j_bare import diagnostics
 
-    brain_url = args.brain_url or _os.environ.get("Z4J_BRAIN_URL")
-    token = args.token or _os.environ.get("Z4J_TOKEN")
-    project_id = args.project_id or _os.environ.get("Z4J_PROJECT_ID")
-    hmac_secret = args.hmac_secret or _os.environ.get("Z4J_HMAC_SECRET")
-
-    missing = [
-        name for name, val in (
-            ("brain_url", brain_url),
-            ("token", token),
-            ("project_id", project_id),
-        ) if not val
-    ]
-    if missing:
-        msg = (
-            f"z4j-doctor: missing required config: {', '.join(missing)}. "
-            f"Pass --{missing[0].replace('_', '-')} or set Z4J_{missing[0].upper()}."
-        )
-        if args.json:
-            print(json.dumps({"ok": False, "stage": "config", "error": msg}, indent=2))
-        else:
-            print(msg, file=sys.stderr)
-        return 1
-
     try:
-        config_kwargs: dict[str, Any] = {
-            "brain_url": brain_url,
-            "token": token,
-            "project_id": project_id,
-        }
-        if hmac_secret:
-            config_kwargs["hmac_secret"] = hmac_secret
-        config = Config(**config_kwargs)
+        config = _load_doctor_config(args)
     except (ConfigError, ValueError) as exc:
         if args.json:
             print(json.dumps({"ok": False, "stage": "config", "error": str(exc)}, indent=2))
         else:
-            print(f"z4j-doctor: invalid config: {exc}", file=sys.stderr)
+            print(f"z4j-doctor: {exc}", file=sys.stderr)
         return 1
 
     results = []
@@ -442,6 +709,102 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             tag = "[OK]  " if r.ok else "[FAIL]"
             print(f"  {tag} {r.name:12s} {r.message}")
     return 0 if all(r.ok for r in results) else 1
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    """Short pass/fail using the doctor probes, compact output.
+
+    Exit 0 = every probe passes. Exit 1 = any probe failed. Output
+    is one line per probe, suitable for shell scripts and Nagios-
+    style monitors. ``-v`` flag (TODO) would re-emit doctor's full
+    output on failure.
+    """
+    from z4j_bare import diagnostics
+    from z4j_core.models import Config
+
+    try:
+        config = _load_doctor_config(args)
+    except Exception as exc:  # noqa: BLE001
+        print(f"z4j-bare check: config: FAIL ({exc})", file=sys.stderr)
+        return 1
+
+    results = [diagnostics.probe_buffer_path(config.buffer_path)]
+    for probe in (
+        diagnostics.probe_dns,
+        diagnostics.probe_tcp,
+        diagnostics.probe_tls,
+    ):
+        r = probe(str(config.brain_url))
+        results.append(r)
+        if not r.ok:
+            break
+
+    fails = [r for r in results if not r.ok]
+    if fails:
+        for r in fails:
+            print(f"z4j-bare check: {r.name}: FAIL ({r.message})")
+        return 1
+    print(f"z4j-bare check: all green ({len(results)} probes)")
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """One-line status: is an agent running on this host? Where?
+
+    Reads the pidfile registry under ``$Z4J_RUNTIME_DIR`` (default
+    ``~/.z4j/``). Lists every adapter with a live PID. Doesn't
+    require a working brain - it's a host-local introspection.
+
+    Exit 0 even if no agents are running (status is informational,
+    not pass/fail; use ``check`` for that).
+    """
+    from z4j_bare.control import _runtime_dir, pidfile_path  # noqa: PLC0415
+
+    rd = _runtime_dir()
+    pidfiles = sorted(rd.glob("agent-*.pid"))
+    if not pidfiles:
+        print(f"z4j-bare status: no running agents under {rd}")
+        return 0
+
+    print(f"z4j-bare status: agents under {rd}")
+    import os as _os
+    for pf in pidfiles:
+        adapter = pf.stem.removeprefix("agent-")
+        try:
+            pid = int(pf.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            print(f"  z4j-{adapter:12s}  pidfile unreadable: {pf}")
+            continue
+        try:
+            _os.kill(pid, 0)  # signal 0 = liveness probe, no signal sent
+            alive = "running"
+        except ProcessLookupError:
+            alive = "stale (process not running)"
+        except PermissionError:
+            alive = "running (different user)"
+        except OSError as exc:
+            alive = f"unknown ({exc})"
+        print(f"  z4j-{adapter:12s}  pid={pid}  {alive}")
+    return 0
+
+
+def _cmd_restart(args: argparse.Namespace) -> int:
+    """Send SIGHUP to the agent so it reconnects immediately.
+
+    Useful after a brain restart or token rotation when an operator
+    doesn't want to wait for the supervisor's backoff timer to
+    elapse. Returns the exit code from
+    :func:`z4j_bare.control.send_restart`.
+    """
+    from z4j_bare.control import send_restart
+
+    adapter = getattr(args, "adapter", "bare")
+    rc, msg = send_restart(adapter)
+    if rc == 0:
+        print(msg)
+    else:
+        print(f"z4j-bare restart: {msg}", file=sys.stderr)
+    return rc
 
 
 __all__ = ["main"]

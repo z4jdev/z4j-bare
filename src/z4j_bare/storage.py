@@ -50,11 +50,26 @@ def _user_tag() -> str:
 
 
 def primary_buffer_root() -> Path:
-    """Return ``~/.z4j`` (the preferred buffer directory).
+    """Return the preferred buffer directory.
+
+    Resolution order:
+
+    1. ``Z4J_BUFFER_DIR`` env var (1.1.2+). Explicit operator
+       override; useful for deployments that want buffer files on a
+       dedicated volume separate from ``~/.z4j`` (e.g. a tmpfs
+       reserved for high-throughput buffering, a persistent volume
+       in Kubernetes, ``/var/lib/z4j`` under systemd).
+    2. ``~/.z4j`` (the historical default, still the most common
+       case).
 
     Pure function, no I/O. Caller decides whether the directory is
-    actually usable via :func:`is_writable_dir`.
+    actually usable via :func:`is_writable_dir`. ``Z4J_BUFFER_PATH``
+    (file-level override) takes precedence over both - that env var
+    is read by ``Config.buffer_path`` directly.
     """
+    override = os.environ.get("Z4J_BUFFER_DIR")
+    if override:
+        return Path(override).resolve()
     return (Path.home() / ".z4j").resolve()
 
 

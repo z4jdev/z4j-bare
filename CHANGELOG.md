@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-04-28
+
+### Fixed
+
+- **Supervisor no longer terminates the reconnect loop on
+  AuthenticationError or ProtocolError.** Pre-1.1.2, both were
+  treated as fatal: the loop logged "fatal" and returned, leaving
+  the agent alive but offline forever until the host process was
+  restarted. This was the root cause of an operator hitting
+  agents-stuck-offline after a brain crash on 2026-04-28
+  (tasks.jfk.work). Fix: forever-retry with separate per-error-
+  class backoff schedules:
+  - `ConnectionError`: 1s -> 30s
+  - `ProtocolError`: 1s -> 60s
+  - `AuthenticationError`: 10s -> 600s (longer cap so a real
+    config issue does not hammer the brain auth endpoint; a
+    transient secret-rotation window auto-recovers within 10min)
+  Per-class consecutive-failure counters surfaced via the new
+  `supervisor_state()` method and the `z4j-bare status` command.
+
+### Added
+
+- **`z4j-bare` console script.** Both `z4j-bare <subcommand>`
+  (pip-installed entry point) and `python -m z4j_bare <subcommand>`
+  (module form) work and dispatch to the same code path.
+- **`z4j-bare check`** subcommand. Compact pass/fail health check
+  (exit 0 OK, exit 1 fail) suitable for shell scripts and Nagios.
+- **`z4j-bare status`** subcommand. One-line introspection: lists
+  every running z4j agent on this host with PID + liveness,
+  reading the pidfile registry under `$Z4J_RUNTIME_DIR` (default
+  `~/.z4j/`).
+- **`z4j-bare restart`** (alias `reload`). Sends SIGHUP to the
+  running agent via its pidfile; the supervisor drops the current
+  connection and reconnects immediately, skipping the remaining
+  backoff timer. Unix-only for 1.1.2.
+- **Pidfile + SIGHUP handler** wired into `AgentRuntime.start()`.
+  Pidfile written to `$Z4J_RUNTIME_DIR/agent-<adapter>.pid`,
+  removed on stop. Failure to write the pidfile is logged but
+  does not prevent the runtime from starting.
+- **`Z4J_BUFFER_DIR`** env var for explicit buffer-directory
+  override (Kubernetes PV, `/var/lib/z4j` under systemd, etc.).
+  Default remains `~/.z4j/`; `Z4J_BUFFER_PATH` still takes
+  precedence over both.
+
+### Internal
+
+- `runtime.AgentRuntime.request_reconnect()`: thread-safe method
+  that signals the supervisor to skip its current backoff.
+- `runtime.AgentRuntime.supervisor_state()`: returns runtime state
+  + per-error-class consecutive-failure counters.
+- New module `z4j_bare.control` with pidfile management and
+  cross-platform SIGHUP installer.
+
 ## [1.1.0] - 2026-04-28
 
 ### Security (round-9 audit)
