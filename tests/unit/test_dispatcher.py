@@ -645,6 +645,85 @@ class TestScheduleActions:
         assert parsed["payload"]["status"] == "failed"
 
 
+class TestScheduleResync:
+    """``schedule.resync`` calls the runtime-supplied resync callback
+    and reports the count back via the CommandResult payload.
+
+    Added in 1.3.3. The brain dispatches this when an operator
+    clicks *Sync now* on the Schedules page. The dispatcher itself
+    doesn't know how to drain SchedulerAdapter.list_schedules — it
+    delegates to the callback the runtime injects at construction.
+    """
+
+    async def test_resync_invokes_callback_and_reports_count(
+        self, buf: BufferStore, engine: FakeEngine, scheduler: FakeScheduler,
+    ) -> None:
+        calls: list[str] = []
+
+        async def fake_resync(reason: str) -> int:
+            calls.append(reason)
+            return 2  # pretend two scheduler adapters drained
+
+        dispatcher = CommandDispatcher(
+            engines={"fake": engine},
+            schedulers={"celery-beat": scheduler},
+            buffer=buf,
+            resync_schedules=fake_resync,
+        )
+        cmd = _make_command(action="schedule.resync", target={})
+        await dispatcher.handle(cmd)
+
+        assert calls == ["command"]
+        results = [e for e in buf.drain(10) if e.kind == "command_result"]
+        assert len(results) == 1
+        parsed = _decode_frame(results[0].payload)
+        assert parsed["payload"]["status"] == "success"
+        assert parsed["payload"]["result"] == {"schedulers_drained": 2}
+
+    async def test_resync_without_callback_fails_with_clear_message(
+        self, buf: BufferStore, engine: FakeEngine, scheduler: FakeScheduler,
+    ) -> None:
+        """A dispatcher built without ``resync_schedules`` (e.g. an
+        old runtime, a hand-built one in tests, or a future op
+        deciding to disable the feature) must NOT crash on
+        ``schedule.resync`` — it must return a clean ``failed`` result
+        with a message that points at the upgrade path."""
+        dispatcher = CommandDispatcher(
+            engines={"fake": engine},
+            schedulers={"celery-beat": scheduler},
+            buffer=buf,
+            # no resync_schedules
+        )
+        cmd = _make_command(action="schedule.resync", target={})
+        await dispatcher.handle(cmd)
+
+        results = [e for e in buf.drain(10) if e.kind == "command_result"]
+        parsed = _decode_frame(results[0].payload)
+        assert parsed["payload"]["status"] == "failed"
+        assert "1.3.1" in parsed["payload"]["error"]
+
+    async def test_resync_callback_exception_becomes_failed_result(
+        self, buf: BufferStore, engine: FakeEngine, scheduler: FakeScheduler,
+    ) -> None:
+        async def boom(reason: str) -> int:
+            raise RuntimeError("boom")
+
+        dispatcher = CommandDispatcher(
+            engines={"fake": engine},
+            schedulers={"celery-beat": scheduler},
+            buffer=buf,
+            resync_schedules=boom,
+        )
+        cmd = _make_command(action="schedule.resync", target={})
+        await dispatcher.handle(cmd)
+
+        results = [e for e in buf.drain(10) if e.kind == "command_result"]
+        parsed = _decode_frame(results[0].payload)
+        assert parsed["payload"]["status"] == "failed"
+        assert "RuntimeError" in parsed["payload"]["error"]
+        assert "boom" in parsed["payload"]["error"]
+
+
 class TestUnrecognizedAction:
     async def test_unknown_action_fails_cleanly(
         self, dispatcher: CommandDispatcher, buf: BufferStore,

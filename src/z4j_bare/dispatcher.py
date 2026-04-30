@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from z4j_bare.orchestrator_detect import detect_orchestrator
@@ -80,10 +81,20 @@ class CommandDispatcher:
         engines: dict[str, QueueEngineAdapter],
         schedulers: dict[str, SchedulerAdapter],
         buffer: BufferStore,
+        resync_schedules: Callable[[str], Awaitable[int]] | None = None,
     ) -> None:
         self.engines = engines
         self.schedulers = schedulers
         self.buffer = buffer
+        # 1.3.3: optional callback the runtime supplies so the
+        # ``schedule.resync`` command (Phase C of the snapshot
+        # feature) can drive the same drain code that the boot +
+        # periodic paths use, without making the dispatcher know
+        # about the Runtime class. Returns the number of schedulers
+        # drained. May be ``None`` for unit tests / runtime
+        # configurations that don't ship the snapshot feature
+        # (older z4j-bare versions, hand-built dispatchers, etc.).
+        self._resync_schedules = resync_schedules
         # Dedup cache: command_id -> monotonic timestamp of first processing.
         # Prevents duplicate execution if the brain resends a command
         # due to ack timeout.
@@ -153,6 +164,16 @@ class CommandDispatcher:
         if action == "schedule.fire":
             return await self._dispatch_schedule_fire(target, parameters)
 
+        # 1.3.3: ``schedule.resync`` is the dashboard's *Sync now*
+        # button. The brain dispatches one command per online agent;
+        # on receipt the agent drains EVERY scheduler adapter it has
+        # registered and emits one ``schedule.snapshot`` event per
+        # adapter. The runtime supplies the callback that knows how
+        # to do the drain — the dispatcher itself doesn't need to
+        # touch SchedulerAdapter or the buffer for this path.
+        if action == "schedule.resync":
+            return await self._dispatch_schedule_resync()
+
         # Other ``schedule.*`` actions (enable/disable/trigger_now/
         # delete) go to a SchedulerAdapter — those DO require a
         # scheduler-side mutation.
@@ -161,6 +182,41 @@ class CommandDispatcher:
 
         # Everything else goes to a QueueEngineAdapter
         return await self._dispatch_engine(action, target, parameters)
+
+    async def _dispatch_schedule_resync(self) -> CommandResult:
+        """Drain every connected scheduler adapter on demand.
+
+        The brain dispatches this when an operator clicks *Sync now*
+        on the dashboard's Schedules page. The runtime injected a
+        callback at construction time; we call it and return a
+        ``CommandResult`` describing how many scheduler adapters
+        were drained. The actual snapshot data flows through the
+        normal event pipeline as
+        :class:`~z4j_core.models.event.EventKind.SCHEDULE_SNAPSHOT`
+        events, one per adapter — this command result only reports
+        success / count, not the snapshot contents themselves.
+        """
+        if self._resync_schedules is None:
+            return CommandResult(
+                status="failed",
+                error=(
+                    "schedule.resync: this agent build does not "
+                    "support on-demand resync (resync callback "
+                    "missing). Upgrade z4j-bare to 1.3.1+."
+                ),
+            )
+        try:
+            count = await self._resync_schedules("command")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("z4j dispatcher: schedule.resync failed")
+            return CommandResult(
+                status="failed",
+                error=f"schedule.resync: {type(exc).__name__}: {exc}",
+            )
+        return CommandResult(
+            status="success",
+            result={"schedulers_drained": count},
+        )
 
     async def _dispatch_schedule_fire(
         self,
