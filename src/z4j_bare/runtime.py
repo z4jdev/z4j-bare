@@ -187,6 +187,20 @@ class AgentRuntime:
         # use this same runtime.
         self._reconnect_now: asyncio.Event | None = None
 
+        # 1.3.3: how often the periodic schedule resync timer fires.
+        # 0 disables the timer (boot snapshot still fires; on-demand
+        # ``schedule.resync`` command still works). Sourced from
+        # ``Config.schedule_resync_interval_seconds`` if present,
+        # else 900 (15 minutes) as the documented default.
+        self._schedule_resync_interval: float = float(
+            getattr(config, "schedule_resync_interval_seconds", 900),
+        )
+        # Live reference to the currently connected scheduler adapter
+        # list. Populated on every successful connect, cleared on
+        # disconnect. Read by the dispatcher's ``schedule.resync``
+        # command handler so it can drive a snapshot on demand.
+        self._connected_schedulers_ref: list[SchedulerAdapter] = []
+
     # ------------------------------------------------------------------
     # Sync API (safe from any thread/context)
     # ------------------------------------------------------------------
@@ -514,6 +528,7 @@ class AgentRuntime:
             engines=self.engines,
             schedulers=self.schedulers,
             buffer=self._buffer,
+            resync_schedules=self.resync_schedules_now,
         )
         def _collect_engine_health() -> dict[str, str]:
             """Aggregate health from all engine adapters for the heartbeat."""
@@ -595,6 +610,54 @@ class AgentRuntime:
                     )
                     engine_consumer_tasks.append(task)
 
+            # 1.3.3 - Phase A: initial schedule inventory at boot.
+            # Every scheduler adapter (z4j-celerybeat, z4j-apscheduler,
+            # z4j-rqscheduler, z4j-arqcron, z4j-hueyperiodic,
+            # z4j-taskiqscheduler) implements
+            # ``async list_schedules() -> list[Schedule]``. Pre-1.3.3
+            # the runtime only listened to ``connect_signals`` reactive
+            # hooks (Django post_save etc.), which meant schedules that
+            # existed BEFORE the agent was installed were invisible to
+            # the dashboard until each was edited+saved. We now drain
+            # ``list_schedules()`` once on boot and emit a single
+            # ``schedule.snapshot`` event per scheduler so the brain
+            # can reconcile the full inventory in one transaction. Plus
+            # the periodic timer (Phase B) catches drift over time, and
+            # the brain's ``schedule.resync`` command (Phase C) lets
+            # the dashboard "Sync now" button force one on demand.
+            # Fired as a fire-and-forget task per scheduler so a slow
+            # adapter (e.g. APScheduler with a remote SQL jobstore)
+            # doesn't block the rest of the agent's startup.
+            schedule_inventory_tasks: list[asyncio.Task[None]] = []
+            for scheduler in connected_schedulers:
+                schedule_inventory_tasks.append(asyncio.create_task(
+                    self._emit_schedule_snapshot(scheduler, reason="boot"),
+                    name=f"z4j-schedule-inventory-{getattr(scheduler, 'name', 'unknown')}",
+                ))
+
+            # 1.3.3 - Phase B: periodic schedule resync.
+            # A long-lived task that drains ``list_schedules()`` on
+            # every registered scheduler every
+            # ``schedule_resync_interval_seconds`` (default 900s = 15
+            # min). Catches drift between the brain and the agent's
+            # source (e.g. someone added a PeriodicTask via SQL
+            # while the agent was offline, or an agent reconnected
+            # after missing a ``schedule.deleted`` event). Cancelled
+            # in the same finally block as the engine consumers.
+            periodic_task: asyncio.Task[None] | None = None
+            if connected_schedulers and self._schedule_resync_interval > 0:
+                periodic_task = asyncio.create_task(
+                    self._periodic_schedule_resync(connected_schedulers),
+                    name="z4j-schedule-resync-timer",
+                )
+                engine_consumer_tasks.append(periodic_task)
+
+            # Stash schedulers + buffer reference so the dispatcher's
+            # ``schedule.resync`` command handler can drive a snapshot
+            # on demand (Phase C). The dispatcher gets these via the
+            # runtime accessor ``_schedule_snapshot_handler``.
+            self._connected_schedulers_ref = connected_schedulers
+
             await self._supervise()
         finally:
             # Cancel engine event consumers first - they reference
@@ -655,6 +718,130 @@ class AgentRuntime:
                 "z4j agent: engine %s event consumer crashed",
                 getattr(engine, "name", engine),
             )
+
+    async def _emit_schedule_snapshot(
+        self,
+        scheduler: SchedulerAdapter,
+        *,
+        reason: str,
+    ) -> None:
+        """Drain a scheduler adapter's ``list_schedules`` and emit ONE
+        ``schedule.snapshot`` event carrying the full inventory.
+
+        The brain's event ingestor 3-way diffs against the DB scoped
+        to ``(project, scheduler)`` — inserts new rows, updates
+        existing rows, deletes rows missing from the snapshot. The
+        whole thing is one transaction on the brain side.
+
+        Called from three places:
+
+        1. Boot (Phase A) once per scheduler, ``reason="boot"``.
+        2. Periodic timer (Phase B), ``reason="periodic"``.
+        3. ``schedule.resync`` command receiver (Phase C),
+           ``reason="command"``.
+
+        Wrapped in defensive try/except: a misbehaving adapter that
+        raises during ``list_schedules`` MUST NOT take down the
+        whole runtime, especially on the periodic path where it
+        would loop on the next tick anyway.
+        """
+        from uuid import uuid4
+
+        from z4j_core.models import Event, EventKind  # local import to avoid cycles
+
+        scheduler_name = getattr(scheduler, "name", "unknown")
+        try:
+            schedules = await scheduler.list_schedules()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "z4j agent: scheduler %s list_schedules failed (reason=%s)",
+                scheduler_name, reason,
+            )
+            return
+
+        # Serialize each schedule. ``model_dump(mode="json")`` produces
+        # JSON-safe primitives so the brain's frame validator does not
+        # reject e.g. datetime / UUID objects.
+        schedules_payload: list[dict[str, object]] = []
+        for schedule in schedules:
+            dump = getattr(schedule, "model_dump", None)
+            if not callable(dump):
+                continue
+            try:
+                schedules_payload.append(dump(mode="json"))
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "z4j agent: scheduler %s yielded a Schedule that "
+                    "failed model_dump",
+                    scheduler_name,
+                )
+                continue
+
+        placeholder = uuid4()
+        event = Event(
+            id=uuid4(),
+            project_id=placeholder,
+            agent_id=placeholder,
+            engine=scheduler_name,
+            task_id="",
+            kind=EventKind.SCHEDULE_SNAPSHOT,
+            occurred_at=datetime.now(UTC),
+            data={
+                "scheduler": scheduler_name,
+                "schedules": schedules_payload,
+                "reason": reason,
+            },
+        )
+        self.record_event(event)
+        logger.info(
+            "z4j agent: scheduler %s snapshot emitted (count=%d, reason=%s)",
+            scheduler_name, len(schedules_payload), reason,
+        )
+
+    async def _periodic_schedule_resync(
+        self,
+        schedulers: list[SchedulerAdapter],
+    ) -> None:
+        """Long-lived task: re-emit a snapshot for every scheduler on
+        a fixed cadence so brain ↔ agent state can never drift
+        further than ``schedule_resync_interval_seconds`` (default
+        15 min).
+
+        Sleeps via ``asyncio.wait_for(stop_event.wait(), timeout=...)``
+        so a graceful shutdown wakes the task immediately rather than
+        waiting up to a full interval.
+        """
+        interval = self._schedule_resync_interval
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=interval,
+                )
+                # Stop signalled - exit cleanly.
+                return
+            except asyncio.TimeoutError:
+                # Normal tick - drain every scheduler.
+                pass
+            for scheduler in schedulers:
+                if self._stop_event.is_set():
+                    return
+                await self._emit_schedule_snapshot(
+                    scheduler, reason="periodic",
+                )
+
+    async def resync_schedules_now(self, reason: str = "command") -> int:
+        """Drain every connected scheduler adapter and emit one
+        ``schedule.snapshot`` per adapter.
+
+        Intended caller: the dispatcher's ``schedule.resync`` command
+        handler (Phase C). Returns the number of schedulers drained.
+        Safe to call any time post-connect; before connect_signals
+        has run the connected list is empty and the call is a no-op.
+        """
+        schedulers = list(getattr(self, "_connected_schedulers_ref", ()) or ())
+        for scheduler in schedulers:
+            await self._emit_schedule_snapshot(scheduler, reason=reason)
+        return len(schedulers)
 
     def _scheduler_sink(
         self, scheduler_name: str, action: str, schedule: object,
