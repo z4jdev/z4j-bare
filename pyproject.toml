@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.2.0"
+version = "1.3.0"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,14 +22,16 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Floor bumped to 1.1.0 for the v1.1.0 ecosystem family
-    # release. The schedule.fire dispatcher path requires the
-    # CommandPayload schema shipped with z4j-core 1.1.0 (the
-    # brain-side z4j-scheduler 1.1.0 emits the new payload
-    # shape). Older z4j-core releases still work for the
-    # 1.0.x agent path, but a 1.1.0 ecosystem install pins the
-    # whole slice together so operators get a known-good set.
-    "z4j-core>=1.1.0",
+    # Audit fix CRIT-3 (1.2.2 eighth-pass): floor bumped to
+    # 1.2.2 because ``z4j_bare/declarative.py`` imports
+    # ``z4j_core.celerybeat_compat`` which only ships in
+    # z4j-core 1.2.2+. An install with z4j-core 1.1.x would
+    # ImportError on the declarative reconciler module
+    # (which every framework adapter — z4j-django, z4j-flask,
+    # z4j-fastapi — depends on). Pre-1.2.2 the dispatcher
+    # path needed CommandPayload from 1.1.0; that floor is
+    # subsumed by the 1.2.2 floor here.
+    "z4j-core>=1.3.0,<2",
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]
