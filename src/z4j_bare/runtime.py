@@ -729,7 +729,7 @@ class AgentRuntime:
         ``schedule.snapshot`` event carrying the full inventory.
 
         The brain's event ingestor 3-way diffs against the DB scoped
-        to ``(project, scheduler)`` — inserts new rows, updates
+        to ``(project, scheduler)``, inserts new rows, updates
         existing rows, deletes rows missing from the snapshot. The
         whole thing is one transaction on the brain side.
 

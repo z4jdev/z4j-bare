@@ -6,26 +6,26 @@
 
 The framework-free agent runtime for [z4j](https://z4j.com).
 
-Bootstraps a z4j agent inside any Python process — Celery worker,
-RQ worker, Dramatiq actor, plain script, custom service — and connects
+Bootstraps a z4j agent inside any Python process, Celery worker,
+RQ worker, Dramatiq actor, plain script, custom service, and connects
 it to the z4j brain over an authenticated WebSocket. Used directly when
 there's no framework adapter (z4j-django / z4j-flask / z4j-fastapi);
 used indirectly by those framework adapters too.
 
 ## What it ships
 
-- **Agent runtime** — connect, authenticate, supervise, reconnect
+- **Agent runtime**, connect, authenticate, supervise, reconnect
   with bounded backoff
-- **Outbound buffer** — every event written to a local SQLite ring
+- **Outbound buffer**, every event written to a local SQLite ring
   before going out on the wire; durable across short brain outages
   and agent restarts
-- **Engine signal hooks** — wired up by whichever engine adapter you
+- **Engine signal hooks**, wired up by whichever engine adapter you
   install (z4j-celery, z4j-rq, etc.); the runtime drains them into
   the buffer
-- **Schedule inventory** — emits a full snapshot at boot, on a
+- **Schedule inventory**, emits a full snapshot at boot, on a
   periodic timer (default 15 min), and on demand from the brain's
   *Sync now* command. Existing schedules show up automatically.
-- **Command dispatcher** — receives operator actions from the brain
+- **Command dispatcher**, receives operator actions from the brain
   (retry, cancel, restart, schedule.fire, schedule.resync, etc.)
   and routes them to the right adapter
 
@@ -68,7 +68,7 @@ Full docs at [z4j.dev/frameworks/bare/](https://z4j.dev/frameworks/bare/).
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE).
 
 ## Links
 

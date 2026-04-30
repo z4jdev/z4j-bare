@@ -651,7 +651,7 @@ class TestScheduleResync:
 
     Added in 1.3.3. The brain dispatches this when an operator
     clicks *Sync now* on the Schedules page. The dispatcher itself
-    doesn't know how to drain SchedulerAdapter.list_schedules — it
+    doesn't know how to drain SchedulerAdapter.list_schedules, it
     delegates to the callback the runtime injects at construction.
     """
 
@@ -686,7 +686,7 @@ class TestScheduleResync:
         """A dispatcher built without ``resync_schedules`` (e.g. an
         old runtime, a hand-built one in tests, or a future op
         deciding to disable the feature) must NOT crash on
-        ``schedule.resync`` — it must return a clean ``failed`` result
+        ``schedule.resync``, it must return a clean ``failed`` result
         with a message that points at the upgrade path."""
         dispatcher = CommandDispatcher(
             engines={"fake": engine},
@@ -746,7 +746,7 @@ class TestScheduleFire:
       - ``unrecognized schedule action 'schedule.fire'`` (the
         ``_dispatch_scheduler`` switch had no ``fire`` handler), or
       - ``no scheduler adapter registered for None`` (a Celery WORKER
-        agent doesn't have a SchedulerAdapter — celery-beat is a
+        agent doesn't have a SchedulerAdapter, celery-beat is a
         separate process).
     Both modes were observed in docker on 2026-04-28. Fix: route
     ``schedule.fire`` to the QueueEngineAdapter's ``submit_task``
@@ -795,7 +795,7 @@ class TestScheduleFire:
     async def test_schedule_fire_works_without_scheduler_adapter(
         self, buf: BufferStore, engine: FakeEngine,
     ) -> None:
-        """Celery worker agent has zero SchedulerAdapters — must still fire."""
+        """Celery worker agent has zero SchedulerAdapters, must still fire."""
         engine.submit_called = False  # type: ignore[attr-defined]
 
         async def fake_submit(name, *, args=(), kwargs=None,  # noqa: ARG001
@@ -805,7 +805,7 @@ class TestScheduleFire:
 
         engine.submit_task = fake_submit  # type: ignore[attr-defined]
 
-        # No schedulers={} — exactly the celery-worker shape.
+        # No schedulers={}, exactly the celery-worker shape.
         dispatcher = CommandDispatcher(
             engines={"fake": engine},
             schedulers={},

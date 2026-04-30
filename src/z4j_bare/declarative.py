@@ -65,7 +65,7 @@ def _redact_response_body(body: str, limit: int = 200) -> str:
     """
     snippet = (body or "")[:limit]
     # Collapse common secret-bearing patterns. These are best-
-    # effort — the right answer is "don't log payloads at all"
+    # effort, the right answer is "don't log payloads at all"
     # but operators rely on the brain's error message text for
     # debugging, so we keep the snippet and redact the obvious.
     snippet = re.sub(
@@ -158,10 +158,10 @@ def _spec_to_brain_payload(
 
     - Keys are sorted recursively at every level (``sort_keys=True``
       applies to nested dicts as well per stdlib).
-    - List order is significant — ``args=[1, 2]`` and ``args=[2, 1]``
+    - List order is significant, ``args=[1, 2]`` and ``args=[2, 1]``
       hash differently because Python's ``json.dumps`` preserves
       list order.
-    - Numeric type is significant — ``1`` and ``1.0`` hash
+    - Numeric type is significant, ``1`` and ``1.0`` hash
       differently. The translator preserves operator-supplied types
       verbatim.
     - ``None`` vs missing key: every documented field is always
@@ -336,7 +336,7 @@ class ScheduleReconciler:
         # a brief brain restart during deploy doesn't fail an
         # otherwise-idempotent ``:diff`` / ``:import``. ``retries=1``
         # only retries on connection-level failures (DNS, TCP
-        # reset, TLS) — NOT on 5xx responses (which httpx returns
+        # reset, TLS), NOT on 5xx responses (which httpx returns
         # to the caller for explicit handling).
         transport = httpx.HTTPTransport(retries=1)
         return httpx.Client(

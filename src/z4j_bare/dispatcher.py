@@ -151,7 +151,7 @@ class CommandDispatcher:
         # z4j-scheduler asking the agent to enqueue a task right
         # now. The brain has already resolved schedule → task in
         # the payload (task_name + args + kwargs + queue + engine),
-        # so the agent does NOT need a SchedulerAdapter — this is
+        # so the agent does NOT need a SchedulerAdapter, this is
         # just a plain enqueue against the QueueEngineAdapter.
         # Routing it through ``_dispatch_scheduler`` (the pre-1.1
         # behaviour) failed two ways: ``fire`` was not in the
@@ -169,13 +169,13 @@ class CommandDispatcher:
         # on receipt the agent drains EVERY scheduler adapter it has
         # registered and emits one ``schedule.snapshot`` event per
         # adapter. The runtime supplies the callback that knows how
-        # to do the drain — the dispatcher itself doesn't need to
+        # to do the drain, the dispatcher itself doesn't need to
         # touch SchedulerAdapter or the buffer for this path.
         if action == "schedule.resync":
             return await self._dispatch_schedule_resync()
 
         # Other ``schedule.*`` actions (enable/disable/trigger_now/
-        # delete) go to a SchedulerAdapter — those DO require a
+        # delete) go to a SchedulerAdapter, those DO require a
         # scheduler-side mutation.
         if action.startswith("schedule."):
             return await self._dispatch_scheduler(action, target, parameters)
@@ -193,7 +193,7 @@ class CommandDispatcher:
         were drained. The actual snapshot data flows through the
         normal event pipeline as
         :class:`~z4j_core.models.event.EventKind.SCHEDULE_SNAPSHOT`
-        events, one per adapter — this command result only reports
+        events, one per adapter, this command result only reports
         success / count, not the snapshot contents themselves.
         """
         if self._resync_schedules is None:
@@ -236,7 +236,7 @@ class CommandDispatcher:
         - ``queue``      - optional broker queue / routing key
         - ``args`` / ``kwargs`` - task arguments
 
-        The schedule-id / fire-id metadata is informational only —
+        The schedule-id / fire-id metadata is informational only -
         the agent doesn't need them to enqueue.
         """
         task_name = parameters.get("task_name") or target.get("task_name")
