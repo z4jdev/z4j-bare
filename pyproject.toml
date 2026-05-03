@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.3.1"
+version = "1.4.0"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,7 +35,7 @@ dependencies = [
     # the runtime emits at boot / on the periodic timer / on the
     # ``schedule.resync`` command. Pre-1.3.1 the kind doesn't exist;
     # the brain would log "unknown event kind" and ignore the snapshot.
-    "z4j-core>=1.3.1,<2",
+    "z4j-core>=1.4.0,<2",
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]

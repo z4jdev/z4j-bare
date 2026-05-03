@@ -8,7 +8,7 @@ The framework-free agent runtime for [z4j](https://z4j.com).
 
 Bootstraps a z4j agent inside any Python process, Celery worker,
 RQ worker, Dramatiq actor, plain script, custom service, and connects
-it to the z4j brain over an authenticated WebSocket. Used directly when
+it to z4j over an authenticated WebSocket. Used directly when
 there's no framework adapter (z4j-django / z4j-flask / z4j-fastapi);
 used indirectly by those framework adapters too.
 
@@ -57,7 +57,7 @@ install_agent(
 - No exception from the agent ever propagates back into your worker /
   signal handler / request path. Every brain interaction is wrapped in
   a top-level try/except.
-- Events buffer locally when the brain is unreachable. Workers never
+- Events buffer locally when z4j is unreachable. Workers never
   block on network I/O.
 - Supervisor reconnects on every transient failure (network, TLS,
   protocol mismatch) with bounded backoff.
