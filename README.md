@@ -1,8 +1,8 @@
 # z4j-bare
 
-[![PyPI version](https://img.shields.io/pypi/v/z4j-bare.svg)](https://pypi.org/project/z4j-bare/)
-[![Python](https://img.shields.io/pypi/pyversions/z4j-bare.svg)](https://pypi.org/project/z4j-bare/)
-[![License](https://img.shields.io/pypi/l/z4j-bare.svg)](https://github.com/z4jdev/z4j-bare/blob/main/LICENSE)
+[![PyPI version](https://img.shields.io/pypi/v/z4j-bare.svg?v=1.4.0)](https://pypi.org/project/z4j-bare/)
+[![Python](https://img.shields.io/pypi/pyversions/z4j-bare.svg?v=1.4.0)](https://pypi.org/project/z4j-bare/)
+[![License](https://img.shields.io/pypi/l/z4j-bare.svg?v=1.4.0)](https://github.com/z4jdev/z4j-bare/blob/main/LICENSE)
 
 The framework-free agent runtime for [z4j](https://z4j.com).
 
