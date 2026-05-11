@@ -53,7 +53,7 @@ from z4j_core.transport.frames import (
 from z4j_core.transport.framing import FrameSigner, FrameVerifier
 from z4j_core.version import __version__ as CORE_VERSION
 
-logger = logging.getLogger("z4j.agent.transport.longpoll")
+logger = logging.getLogger("z4j.transport.longpoll")
 
 
 class LongPollTransport:
@@ -239,8 +239,7 @@ class LongPollTransport:
         agent_uuid = _safe_uuid(self.agent_id)
         project_uuid = _safe_uuid(self.project_id)
 
-        # Round-9 audit fix R9-Wire-H1+H2 (Apr 2026): bind the
-        # per-connection session_nonce into the signer/verifier so
+        # Bind the per-connection session_nonce into the signer/verifier so
         # captured frames from a previous nonce can't be replayed
         # under a fresh nonce. The brain's long-poll service
         # binds the same nonce on its side
@@ -279,9 +278,8 @@ class LongPollTransport:
         self._client = None
         if client is None:
             return
-        # Round-8 audit fix R8-Async-LOW (Apr 2026): shield the
-        # aclose so an agent SIGTERM mid-shutdown doesn't leak
-        # the httpx pool.
+        # Shield the aclose so an agent SIGTERM mid-shutdown doesn't
+        # leak the httpx pool.
         try:
             import asyncio as _asyncio  # noqa: PLC0415
             await _asyncio.shield(client.aclose())

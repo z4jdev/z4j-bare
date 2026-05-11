@@ -58,7 +58,7 @@ class TestBasicRegistration:
         first = MagicMock(name="first-runtime")
         second = MagicMock(name="second-runtime")
         _process_singleton.try_register(first, owner="z4j_django.apps")
-        with caplog.at_level("INFO", logger="z4j.agent.singleton"):
+        with caplog.at_level("INFO", logger="z4j.runtime.singleton"):
             _process_singleton.try_register(second, owner="celery.worker_init")
         msg = caplog.records[-1].message
         assert "z4j_django.apps" in msg

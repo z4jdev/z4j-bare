@@ -26,7 +26,7 @@ from typing import Any, ParamSpec, TypeVar
 P = ParamSpec("P")
 R = TypeVar("R")
 
-logger = logging.getLogger("z4j.agent.safety")
+logger = logging.getLogger("z4j.runtime.safety")
 
 
 def safe_call(func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R | None:

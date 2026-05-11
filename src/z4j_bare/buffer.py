@@ -40,7 +40,7 @@ from z4j_bare.storage import (
     is_writable_dir,
 )
 
-logger = logging.getLogger("z4j.agent.buffer")
+logger = logging.getLogger("z4j.runtime.buffer")
 
 
 _SCHEMA = """
@@ -195,7 +195,7 @@ class BufferStore:
             raise BufferStorageError(
                 f"z4j buffer: cannot find any writable directory for "
                 f"{requested.name}. Tried {parent} and the per-uid "
-                f"tmp fallback. Set Z4J_BUFFER_PATH to a writable "
+                f"tmp fallback. Set Z4J_HOME to a writable "
                 f"directory.",
                 details={
                     "requested": str(requested),
@@ -343,13 +343,11 @@ class BufferStore:
         """Number of entries currently in the buffer.
 
         Always ``>= 0``. If the cached counter has drifted below
-        zero (a real bug we have seen in the live stack - see
-        audit "live stack" 2026-04-21) we reconcile from disk,
-        log once, and return the reconciled value. The heartbeat
-        frame's ``buffer_size`` field is Pydantic-validated
-        ``ge=0``; without this clamp a drifted counter would
-        crash the heartbeat loop and force agent reconnect
-        churn.
+        zero we reconcile from disk, log once, and return the
+        reconciled value. The heartbeat frame's ``buffer_size``
+        field is Pydantic-validated ``ge=0``; without this clamp a
+        drifted counter would crash the heartbeat loop and force
+        agent reconnect churn.
         """
         with self._lock:
             if self._closed:

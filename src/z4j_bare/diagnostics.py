@@ -38,14 +38,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from z4j_core.models import Config
+from z4j_core.paths import buffer_root, z4j_home
 
-from z4j_bare.storage import (
-    fallback_buffer_root,
-    is_writable_dir,
-    primary_buffer_root,
-)
+from z4j_bare.storage import is_writable_dir, primary_buffer_root
 
-logger = logging.getLogger("z4j.agent.diagnostics")
+logger = logging.getLogger("z4j.runtime.diagnostics")
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,11 +80,13 @@ def probe_buffer_path(buffer_path: Path) -> ProbeResult:
             details={"path": str(buffer_path)},
         )
 
-    fallback = fallback_buffer_root()
-    fb_ok = is_writable_dir(fallback)
+    # Probe the per-uid temp fallback that buffer_root() falls back to.
+    # If it's also unwritable, advise creating the primary directory.
+    resolved_fallback = buffer_root()
+    fb_ok = resolved_fallback != z4j_home() and is_writable_dir(resolved_fallback)
     suggestion = (
-        f"set Z4J_BUFFER_PATH={fallback / buffer_path.name} (per-uid tmp dir "
-        f"is writable) or chown {parent} to the running user"
+        f"set Z4J_HOME={resolved_fallback} (per-uid tmp dir is writable) "
+        f"or chown {parent} to the running user"
         if fb_ok
         else f"create {parent} and chown it to the running user "
         f"(uid={_uid_or_user()}); the per-uid tmp fallback is also "
@@ -100,7 +99,7 @@ def probe_buffer_path(buffer_path: Path) -> ProbeResult:
         details={
             "path": str(buffer_path),
             "uid": _uid_or_user(),
-            "fallback": str(fallback),
+            "fallback": str(resolved_fallback),
             "fallback_writable": fb_ok,
         },
     )

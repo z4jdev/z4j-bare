@@ -39,7 +39,7 @@ from z4j_core.transport.framing import FrameSigner, FrameVerifier
 from z4j_core.transport.versioning import CURRENT_PROTOCOL, check_compatibility
 from z4j_core.version import __version__ as CORE_VERSION
 
-logger = logging.getLogger("z4j.agent.transport.websocket")
+logger = logging.getLogger("z4j.transport.websocket")
 
 
 class WebSocketTransport:
@@ -93,6 +93,9 @@ class WebSocketTransport:
         "worker_role",
         "worker_pid",
         "worker_started_at",
+        # Phase G: tokens returned by observability.bind() so close()
+        # can restore the previous contextvar snapshot.
+        "_log_context_tokens",
     )
 
     def __init__(
@@ -148,6 +151,7 @@ class WebSocketTransport:
         self._closed = False
         self._signer: FrameSigner | None = None
         self._verifier: FrameVerifier | None = None
+        self._log_context_tokens: dict[object, object] | None = None
 
     def __repr__(self) -> str:
         return (
@@ -196,7 +200,7 @@ class WebSocketTransport:
             raise RuntimeError("WebSocketTransport is closed")
 
         url = self.ws_url
-        # Security (audit H6): refuse plain ``ws://`` unless the
+        # Security: refuse plain ``ws://`` unless the
         # operator explicitly opted into ``dev_mode`` OR the brain
         # is on a loopback address. The bearer token goes in the
         # ``Authorization`` header of the initial HTTP upgrade; a
@@ -211,7 +215,7 @@ class WebSocketTransport:
             host = (urlparse(url).hostname or "").lower()
             loopback_hosts = {"localhost", "127.0.0.1", "::1"}
             if host in loopback_hosts:
-                logger.info(
+                logger.debug(
                     "z4j agent: allowing plain ws:// to loopback host %r "
                     "(no MITM risk on loopback)",
                     host,
@@ -222,25 +226,44 @@ class WebSocketTransport:
                     f"bearer token would travel in cleartext over the "
                     f"network. Fix one of:\n"
                     f"  1. Set Z4J_BRAIN_URL=https://... (recommended)\n"
-                    f"  2. Set Z4J_DEV_MODE=true in your environment\n"
-                    f"     (works for the framework adapters: z4j-django,\n"
-                    f"     z4j-flask, z4j-fastapi - the bearer token is\n"
-                    f"     still vulnerable, only do this for trusted\n"
-                    f"     networks)\n"
-                    f"  3. Use a loopback hostname (localhost, 127.0.0.1,\n"
-                    f"     ::1) - allowed by default, no flag needed",
+                    f"  2. Use a loopback hostname (localhost, 127.0.0.1,\n"
+                    f"     ::1) - allowed by default, no flag needed.\n"
+                    f"  3. Opt in to dev_mode via your framework's config\n"
+                    f"     (NOT via Z4J_DEV_MODE env var - that is\n"
+                    f"     refused as of 1.5 since untrusted env can't\n"
+                    f"     disable HMAC, see security audit C3):\n"
+                    f"       Django: settings.Z4J = {{'dev_mode': True, ...}}\n"
+                    f"       Flask:  app.config['Z4J'] = {{'dev_mode': True, ...}}\n"
+                    f"               or app.config['Z4J_DEV_MODE'] = True\n"
+                    f"       FastAPI: install_z4j(dev_mode=True, ...)\n"
+                    f"       bare:    install_agent(dev_mode=True, ...)\n"
+                    f"     The bearer token is still vulnerable in\n"
+                    f"     dev_mode; only enable on trusted networks.",
                 )
         headers = [("Authorization", f"Bearer {self._token}")]
 
-        logger.info("z4j agent connecting to %s (project=%s)", url, self.project_id)
+        # DEBUG, not INFO: this fires on every reconnect attempt and a
+        # default-level INFO would flood the host's stderr in any
+        # configuration where the brain is briefly unreachable. The
+        # supervisor's first-in-streak WARNING and the post-handshake
+        # "connected" INFO below are the operator-facing signals.
+        logger.debug("z4j agent connecting to %s (project=%s)", url, self.project_id)
 
         try:
+            # ping_interval=60, ping_timeout=60: under sustained
+            # 100 task/s × 10 agent fanout the application-message
+            # stream can starve the websockets-library internal PING
+            # task on either side of the wire for 30+ seconds at a
+            # time. The 60s windows tolerate ~2 minutes of cumulative
+            # starvation before close, which a healthy connection
+            # should never approach. Mirror the brain-side
+            # ws_ping_interval / ws_ping_timeout in cli.py serve().
             self._ws = await websockets.connect(
                 url,
                 additional_headers=headers,
                 max_size=self.max_frame_size,
-                ping_interval=20,
-                ping_timeout=10,
+                ping_interval=60,
+                ping_timeout=60,
                 close_timeout=5,
             )
         except InvalidStatus as exc:
@@ -319,13 +342,39 @@ class WebSocketTransport:
         self._session_id = ack.payload.session_id
         self._heartbeat_interval = ack.payload.heartbeat_interval_seconds
 
+        # Phase G: bind identity into ContextVars so every log line
+        # emitted from inside this session (transport, runtime,
+        # adapters, dispatcher, heartbeat) carries agent_id, session_id,
+        # worker_id, project_id automatically. The bind tokens are
+        # stored on the instance so close() can restore the previous
+        # snapshot symmetrically. Child asyncio tasks (send_loop,
+        # receive_loop, heartbeat, watchdog spawned in TaskGroup)
+        # inherit the context at create-time; close() unbinds in
+        # this task only, which is the correct semantic - dying
+        # child tasks keep the snapshot they captured.
+        from z4j_core.observability import bind as _bind
+        self._log_context_tokens = _bind(
+            agent_id=ack.payload.agent_id,
+            session_id=ack.payload.session_id,
+            project_id=ack.payload.project_id,
+            worker_id=self.worker_id,
+        )
+
+        # The single operator-facing INFO at the transport layer:
+        # connection is fully established, handshake verified, signer
+        # ready. Fires once per successful connect - not per attempt -
+        # so dev consoles stay quiet while the brain is unreachable
+        # and produce one useful line the moment it comes up.
+        logger.info(
+            "z4j agent connected to %s (session=%s)", url, self._session_id,
+        )
+
         # Protocol v2: every stateful frame carries an envelope HMAC
         # bound to (agent_id, project_id, ts, nonce, seq). The signer
         # and verifier are recreated on every reconnect so the seq
         # counter resets with the session - the brain resets its
         # mirror counter the same way.
-        # Round-9 audit fix R9-Wire-H1+H2 (Apr 2026): bind the
-        # brain-supplied session_id into the HMAC envelope so a
+        # Bind the brain-supplied session_id into the HMAC envelope so a
         # captured frame from a previous session can't be replayed.
         # See z4j_core/transport/framing.py for the threat model.
         self._signer = FrameSigner(
@@ -366,6 +415,12 @@ class WebSocketTransport:
     async def close(self) -> None:
         """Close the WebSocket and mark the transport unusable."""
         self._closed = True
+        # Phase G: restore the previous contextvar snapshot. Safe to
+        # call even if connect() never ran - tokens is None in that case.
+        if self._log_context_tokens is not None:
+            from z4j_core.observability import clear as _clear
+            _clear(self._log_context_tokens)  # type: ignore[arg-type]
+            self._log_context_tokens = None
         await self._close_ws()
 
     async def _close_ws(self) -> None:

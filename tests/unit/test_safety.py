@@ -51,7 +51,7 @@ class TestSafeCall:
     def test_logs_exception_type_not_message(
         self, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        caplog.set_level(logging.ERROR, logger="z4j.agent.safety")
+        caplog.set_level(logging.ERROR, logger="z4j.runtime.safety")
 
         def boom() -> None:
             raise RuntimeError("api_key=sk_live_secret_value")

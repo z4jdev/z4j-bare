@@ -16,32 +16,15 @@ from typing import TYPE_CHECKING, Any
 
 from z4j_core.errors import ConfigError
 from z4j_core.models import Config
+from z4j_core.paths import reject_deprecated_path_env
 from z4j_core.protocols import FrameworkAdapter, QueueEngineAdapter, SchedulerAdapter
 
 from z4j_bare._process_singleton import try_register
 from z4j_bare.framework import BareFrameworkAdapter
 from z4j_bare.runtime import AgentRuntime
-from z4j_bare.storage import clamp_buffer_path as _clamp_public
 
 if TYPE_CHECKING:
     pass
-
-
-def _clamp_buffer_path(candidate: Path) -> Path:
-    """Adapt :func:`z4j_bare.storage.clamp_buffer_path` to raise :class:`ConfigError`.
-
-    The public helper lives in :mod:`z4j_bare.storage` and raises
-    ``ValueError`` so it has no package-local error class dependency.
-    Callers of ``install_agent`` expect :class:`ConfigError` for every
-    configuration failure, so we rewrap here. The helper was promoted
-    from private in audit 2026-04-24 Low-2 - the Django / Flask /
-    FastAPI adapters bypass ``install_agent`` and now call the public
-    helper directly.
-    """
-    try:
-        return _clamp_public(candidate)
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from None
 
 
 def install_agent(
@@ -102,33 +85,41 @@ def install_agent(
 
     Raises:
         ConfigError: Required configuration is missing or invalid.
+        RuntimeError: Any of the dropped 1.4 path-override env vars
+            (``Z4J_RUNTIME_DIR``, ``Z4J_BUFFER_DIR``, ``Z4J_BUFFER_PATH``)
+            is set. Set ``Z4J_HOME`` instead.
     """
+    # Hard-fail early on dropped path-override env vars so operators
+    # who upgraded from 1.4 see the migration message instead of a
+    # silently-relocated state directory.
+    reject_deprecated_path_env()
+
     if not engines:
         raise ConfigError("install_agent: at least one engine adapter is required")
 
-    resolved = _resolve(
-        brain_url=brain_url,
-        token=token,
-        project_id=project_id,
-        hmac_secret=hmac_secret,
-        agent_name=agent_name,
-        agent_id=agent_id,
-        transport=transport,
-        environment=environment,
-        tags=tags,
-        dev_mode=dev_mode,
-        strict_mode=strict_mode,
-        autostart=autostart,
-        buffer_path=buffer_path,
-        max_payload_bytes=max_payload_bytes,
-        redaction_extra_key_patterns=redaction_extra_key_patterns,
-        redaction_extra_value_patterns=redaction_extra_value_patterns,
-    )
+    from z4j_core.config import resolve_agent_config
 
-    try:
-        config = Config(**resolved)
-    except Exception as exc:  # noqa: BLE001
-        raise ConfigError(f"invalid z4j agent configuration: {exc}") from exc
+    config = resolve_agent_config(
+        framework_name="bare",
+        explicit_kwargs={
+            "brain_url": brain_url,
+            "token": token,
+            "project_id": project_id,
+            "hmac_secret": hmac_secret,
+            "agent_name": agent_name,
+            "agent_id": agent_id,
+            "transport": transport,
+            "environment": environment,
+            "tags": tags,
+            "dev_mode": dev_mode,
+            "strict_mode": strict_mode,
+            "autostart": autostart,
+            "buffer_path": buffer_path,
+            "max_payload_bytes": max_payload_bytes,
+            "redaction_extra_key_patterns": redaction_extra_key_patterns,
+            "redaction_extra_value_patterns": redaction_extra_value_patterns,
+        },
+    )
 
     # Resolve the framework adapter:
     #   - explicit instance: use as-is
@@ -167,166 +158,6 @@ def install_agent(
     if config.autostart:
         runtime.start()
     return runtime
-
-
-# ---------------------------------------------------------------------------
-# Resolution helpers
-# ---------------------------------------------------------------------------
-
-
-def _resolve(  # noqa: PLR0912  (a flat field-by-field resolver is clearer)
-    *,
-    brain_url: str | None,
-    token: str | None,
-    project_id: str | None,
-    hmac_secret: str | None,
-    environment: str | None,
-    tags: dict[str, str] | None,
-    dev_mode: bool | None,
-    strict_mode: bool | None,
-    autostart: bool | None,
-    buffer_path: Path | None,
-    max_payload_bytes: int | None,
-    redaction_extra_key_patterns: list[str] | None,
-    redaction_extra_value_patterns: list[str] | None,
-    agent_name: str | None = None,
-    agent_id: str | None = None,
-    transport: str | None = None,
-) -> dict[str, Any]:
-    """Merge explicit kwargs with ``Z4J_*`` env vars."""
-    env = os.environ
-
-    # Explicit kwarg > env var. Use ``is not None`` rather than a
-    # truthy ``or`` so an operator passing an empty string as a
-    # required field fails the non-empty check below rather than
-    # silently sliding onto an env fallback value. Surfaced by
-    # audit pass 8 2026-04-21 - matched the same bug in
-    # ``z4j-fastapi`` and fixed consistently here.
-    resolved_brain = brain_url if brain_url is not None else env.get("Z4J_BRAIN_URL")
-    resolved_token = token if token is not None else env.get("Z4J_TOKEN")
-    resolved_project = project_id if project_id is not None else env.get("Z4J_PROJECT_ID")
-    # Protocol v2 envelope HMAC is mandatory - runtime.start() refuses
-    # to come up without a secret. Framework adapters (Django, Flask,
-    # FastAPI) had their own env-read code for this field; bare-Python
-    # agents (RQ, Dramatiq, future Go/Java bootstrappers) were missing
-    # it entirely, which surfaced as "hmac_secret is required" when
-    # booting the dramatiq-sandbox. Centralizing the read here fixes
-    # every bare caller at once.
-    resolved_hmac = (
-        hmac_secret if hmac_secret is not None else env.get("Z4J_HMAC_SECRET")
-    )
-
-    missing: list[str] = []
-    if not resolved_brain:
-        missing.append("Z4J_BRAIN_URL (or brain_url kwarg)")
-    if not resolved_token:
-        missing.append("Z4J_TOKEN (or token kwarg)")
-    if not resolved_project:
-        missing.append("Z4J_PROJECT_ID (or project_id kwarg)")
-    if missing:
-        raise ConfigError("missing required configuration: " + ", ".join(missing))
-
-    # At this point resolved_brain etc are non-None - assert for the type checker.
-    assert resolved_brain is not None
-    assert resolved_token is not None
-    assert resolved_project is not None
-
-    out: dict[str, Any] = {
-        "brain_url": resolved_brain,
-        "token": resolved_token,
-        "project_id": resolved_project,
-    }
-    if resolved_hmac:
-        out["hmac_secret"] = resolved_hmac
-
-    resolved_agent_name = (
-        agent_name if agent_name is not None else env.get("Z4J_AGENT_NAME")
-    )
-    if resolved_agent_name:
-        out["agent_name"] = resolved_agent_name
-
-    # Transport selection + long-poll agent_id. Until audit Medium-2
-    # (2026-04-24) these two fields were never resolved in bare, so
-    # the long-poll transport silently coerced a missing agent_id to
-    # a fresh uuid4() inside ``_safe_uuid`` and every frame failed
-    # HMAC verification. Config now rejects this at construction
-    # time; here we feed env -> Config so operators can set them
-    # without code changes.
-    resolved_transport = (
-        transport if transport is not None else env.get("Z4J_TRANSPORT")
-    )
-    if resolved_transport:
-        out["transport"] = resolved_transport
-
-    resolved_agent_id = (
-        agent_id if agent_id is not None else env.get("Z4J_AGENT_ID")
-    )
-    if resolved_agent_id:
-        out["agent_id"] = resolved_agent_id
-
-    if environment is not None:
-        out["environment"] = environment
-    elif "Z4J_ENVIRONMENT" in env:
-        out["environment"] = env["Z4J_ENVIRONMENT"]
-
-    if tags is not None:
-        out["tags"] = tags
-
-    # Security (audit C3): ``dev_mode`` is explicitly NOT read from
-    # the environment. It disables the HMAC-required invariant, so
-    # letting an env var flip it turns one compromised .env / K8s
-    # configmap into silent signature bypass. The kwarg is the only
-    # accepted source, and the caller must be code (so the switch
-    # is reviewable in git).
-    #
-    # If ``Z4J_DEV_MODE`` is set in the environment, we log a loud
-    # warning and ignore it - a legacy sandbox might still have it;
-    # we don't want to crash, but we also don't want to honor it.
-    if dev_mode is not None:
-        out["dev_mode"] = dev_mode
-    elif "Z4J_DEV_MODE" in env:
-        import warnings
-
-        warnings.warn(
-            "Z4J_DEV_MODE env var is IGNORED for security reasons. "
-            "Pass ``dev_mode=True`` as a kwarg to ``install_agent`` "
-            "if you really want to disable HMAC verification. See "
-            "docs/SECURITY.md for why.",
-            stacklevel=3,
-        )
-
-    if strict_mode is not None:
-        out["strict_mode"] = strict_mode
-    elif "Z4J_STRICT_MODE" in env:
-        out["strict_mode"] = env["Z4J_STRICT_MODE"].lower() in ("1", "true", "yes", "on")
-
-    if autostart is not None:
-        out["autostart"] = autostart
-    elif "Z4J_AUTOSTART" in env:
-        out["autostart"] = env["Z4J_AUTOSTART"].lower() in ("1", "true", "yes", "on")
-
-    # Security (audit H8): the buffer path is resolved inside a
-    # fixed allowed root (``~/.z4j/`` by default) so a compromised
-    # env var cannot make the agent ``sqlite3.connect`` to
-    # ``/etc/cron.d/...`` or ``C:\Windows\...``. An absolute path
-    # outside the root, a symlink target outside the root, or any
-    # ``..`` traversal attempt is rejected.
-    if buffer_path is not None:
-        out["buffer_path"] = _clamp_buffer_path(buffer_path)
-    elif "Z4J_BUFFER_PATH" in env:
-        out["buffer_path"] = _clamp_buffer_path(Path(env["Z4J_BUFFER_PATH"]))
-
-    if max_payload_bytes is not None:
-        out["max_payload_bytes"] = max_payload_bytes
-    elif "Z4J_MAX_PAYLOAD_BYTES" in env:
-        out["max_payload_bytes"] = int(env["Z4J_MAX_PAYLOAD_BYTES"])
-
-    if redaction_extra_key_patterns is not None:
-        out["redaction_extra_key_patterns"] = redaction_extra_key_patterns
-    if redaction_extra_value_patterns is not None:
-        out["redaction_extra_value_patterns"] = redaction_extra_value_patterns
-
-    return out
 
 
 __all__ = ["install_agent"]

@@ -39,7 +39,7 @@ from z4j_core.celerybeat_compat import (
     parse_celery_beat_entries,
 )
 
-logger = logging.getLogger("z4j.agent.declarative")
+logger = logging.getLogger("z4j.runtime.declarative")
 
 
 #: Project-slug regex matching the brain's own
@@ -154,7 +154,7 @@ def _spec_to_brain_payload(
     content; the brain uses it for idempotency: re-running the
     reconciler with no changes is a no-op (same hash → unchanged).
 
-    Canonicalization contract (audit fix LOW):
+    Canonicalization contract:
 
     - Keys are sorted recursively at every level (``sort_keys=True``
       applies to nested dicts as well per stdlib).
@@ -231,7 +231,7 @@ class ScheduleReconciler:
     ) -> None:
         self.brain_url = brain_url.rstrip("/")
         self.api_key = api_key
-        # Audit fix HIGH-9: project_slug is operator-supplied
+        # Project_slug is operator-supplied
         # config (not network input), but a typo or legacy slug
         # containing ``/``, ``?``, or ``#`` would otherwise break
         # the URL path (silently routing to a different brain
@@ -332,7 +332,7 @@ class ScheduleReconciler:
         return self._call_import(body)
 
     def _http_client(self) -> httpx.Client:
-        # Audit fix LOW: 1 retry on transient transport errors so
+        # 1 retry on transient transport errors so
         # a brief brain restart during deploy doesn't fail an
         # otherwise-idempotent ``:diff`` / ``:import``. ``retries=1``
         # only retries on connection-level failures (DNS, TCP

@@ -17,8 +17,7 @@ each builds its own :class:`AgentRuntime`, each opens its own
 WebSocket to the brain. The brain receives two registrations for
 the same agent token, treats the second as a takeover, and the
 agent ends up showing as ``OFFLINE`` even though heartbeats are
-arriving - observed live on 2026-04-21 with the ``sandbox-worker``
-container in the dev stack.
+arriving.
 
 This module is the shared coordination point. Both paths call
 :func:`try_register` before constructing a runtime; whichever
@@ -46,7 +45,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from z4j_bare.runtime import AgentRuntime
 
-logger = logging.getLogger("z4j.agent.singleton")
+logger = logging.getLogger("z4j.runtime.singleton")
 
 _lock = threading.Lock()
 _runtime: "AgentRuntime | None" = None

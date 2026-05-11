@@ -9,7 +9,7 @@ without restarting it.
 
 The Unix idiom is **pidfile + SIGHUP**:
 
-1. On startup, the agent writes its PID to ``~/.z4j/agent-<id>.pid``.
+1. On startup, the agent writes its PID to ``$Z4J_HOME/agent-<id>.pid``.
 2. The agent's main thread installs a ``SIGHUP`` handler that calls
    :meth:`AgentRuntime.request_reconnect`.
 3. The CLI command ``z4j-<adapter> restart`` reads the pidfile and
@@ -26,14 +26,18 @@ restart command on Windows logs a clear "not yet supported on
 Windows; restart your host process via your supervisor" message
 rather than silently failing.
 
-Pidfile lives at ``$Z4J_RUNTIME_DIR/agent-<adapter_id>.pid``,
-defaulting to ``~/.z4j/`` (NOT ``$TMPDIR``: the tmpfs case of
-``/tmp`` losing files on reboot is exactly what we want to avoid
-for an agent's own state). One pidfile per adapter id (django,
-flask, fastapi, bare, celery-worker, etc.) so multiple z4j
-agents in the same process don't collide; one pidfile per
-process inside a given adapter via ``-<pid>`` suffix when the
-process supervisor allows multiple replicas.
+Pidfile lives at ``$Z4J_HOME/agent-<adapter_id>.pid``, defaulting
+to ``~/.z4j/`` (NOT ``$TMPDIR``: the tmpfs case of ``/tmp``
+losing files on reboot is exactly what we want to avoid for an
+agent's own state). One pidfile per adapter id (django, flask,
+fastapi, bare, celery-worker, etc.) so multiple z4j agents in
+the same process don't collide; one pidfile per process inside
+a given adapter via ``-<pid>`` suffix when the process supervisor
+allows multiple replicas.
+
+Path overrides are centralised on ``Z4J_HOME``; setting the
+deprecated ``Z4J_RUNTIME_DIR`` hard-fails at startup (see
+``z4j_core.paths.reject_deprecated_path_env``).
 """
 
 from __future__ import annotations
@@ -45,27 +49,23 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from z4j_core.paths import ensure_z4j_home, z4j_home
+
 if TYPE_CHECKING:
     from z4j_bare.runtime import AgentRuntime
 
-logger = logging.getLogger("z4j.agent.control")
+logger = logging.getLogger("z4j.runtime.control")
 
 
 def _runtime_dir() -> Path:
     """Return the directory where pidfiles live.
 
-    ``Z4J_RUNTIME_DIR`` env override > ``~/.z4j/``. We deliberately
-    don't fall back to ``$TMPDIR`` because the OS may clear it on
-    reboot, and an orphaned pidfile from a previous boot is more
-    confusing than a missing one.
+    Always ``z4j_home()`` (defaulting to ``~/.z4j/``). Operators
+    who want to relocate state set ``Z4J_HOME``; that variable
+    moves every state file (brain DB, secrets, PKI, allowed-hosts,
+    agent pidfiles, agent buffers) to one directory.
     """
-    override = os.environ.get("Z4J_RUNTIME_DIR")
-    if override:
-        path = Path(override)
-    else:
-        path = Path.home() / ".z4j"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return ensure_z4j_home()
 
 
 def pidfile_path(adapter_id: str) -> Path:
@@ -176,7 +176,7 @@ def send_restart(adapter_id: str) -> tuple[int, str]:
             1,
             f"no pidfile at {pf}. Either the agent is not running, "
             f"or it ran but did not register a pidfile (older z4j "
-            f"version, or a different Z4J_RUNTIME_DIR). Restart "
+            f"version, or a different Z4J_HOME). Restart "
             f"your host process to bring the agent up fresh.",
         )
     try:

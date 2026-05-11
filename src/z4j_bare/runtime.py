@@ -40,6 +40,7 @@ from z4j_core.models import Event
 from z4j_core.protocols import FrameworkAdapter, QueueEngineAdapter, SchedulerAdapter
 from z4j_core.transport.frames import (
     CommandFrame,
+    EventBatchAckFrame,
     EventBatchFrame,
     EventBatchPayload,
     Frame,
@@ -56,7 +57,34 @@ from z4j_bare.transport.websocket import PartialSendError, WebSocketTransport
 if TYPE_CHECKING:
     from z4j_core.models import Config
 
-logger = logging.getLogger("z4j.agent.runtime")
+logger = logging.getLogger("z4j.runtime.supervisor")
+
+
+def _peek_frame_id(payload: bytes) -> str | None:
+    """Cheap extraction of the ``id`` field from a serialized frame.
+
+    The send loop hands the buffer the pre-serialized frame bytes;
+    to correlate the brain's ``event_batch_ack`` to the buffer entry
+    that produced the batch, we need the frame.id at send time
+    without paying for a full Pydantic parse on every entry. JSON
+    parsing of a few hundred bytes is single-digit microseconds and
+    runs only at send time (not for every event).
+
+    Returns ``None`` if parsing fails. Caller falls back to the
+    legacy "confirm immediately" path for that entry, so a
+    pathologically corrupt payload doesn't pin the buffer.
+    """
+    import json as _json
+
+    try:
+        decoded = _json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(decoded, dict):
+        fid = decoded.get("id")
+        if isinstance(fid, str):
+            return fid
+    return None
 
 
 class RuntimeState(StrEnum):
@@ -77,14 +105,26 @@ _RECONNECT_INITIAL = 1.0
 _RECONNECT_MAX = 30.0
 _RECONNECT_JITTER = 0.3
 
+#: How long an event_batch frame can sit in
+#: ``_pending_acks`` before the watchdog evicts it. First eviction
+#: also flips ``_brain_supports_acks`` to False (legacy-mode
+#: fallback). 90s is generous to allow first-batch drain under
+#: heavy fanout (brain ingest is bounded around 80
+#: events/s/connection); going lower thrashes legacy-mode under
+#: load and silently undermines the per-batch ack delivery
+#: guarantee.
+_ACK_DEADLINE_SECONDS = 90.0
+#: Watchdog poll cadence. Sleeps this long between sweeps. Aim for
+#: the fastest cadence that doesn't burn CPU while keeping eviction
+#: precise to within a few seconds.
+_ACK_WATCHDOG_INTERVAL_SECONDS = 2.0
+
 # Auth-error backoff schedule. AuthenticationError indicates the
 # brain rejected the agent's bearer token (mismatched HMAC, revoked
-# agent, rotated secret, etc.). Pre-1.1.2 this was treated as fatal
-# and stopped the reconnect loop forever, leaving the agent process
-# alive but offline until manually restarted (the failure mode that
-# bit tasks.jfk.work on 2026-04-28). 1.1.2 retries forever with a
-# longer cap (10 minutes) so an operator-initiated token rotation
-# eventually succeeds without flooding the brain's auth endpoint.
+# agent, rotated secret, etc.). We retry forever with a 10-minute
+# cap so an operator-initiated token rotation eventually succeeds
+# without flooding the brain's auth endpoint, and a transiently
+# misconfigured agent doesn't permanently park itself offline.
 _AUTH_RECONNECT_INITIAL = 10.0
 _AUTH_RECONNECT_MAX = 600.0
 _AUTH_RECONNECT_JITTER = 0.3
@@ -92,7 +132,7 @@ _AUTH_RECONNECT_JITTER = 0.3
 # ProtocolError handling. These come from the wire layer: bad
 # handshake, version skew during a brain restart, malformed frames
 # from a partial deploy. Almost always transient - same backoff as
-# ConnectionError. Pre-1.1.2 these were also fatal; same fix.
+# ConnectionError, retried forever.
 _PROTOCOL_RECONNECT_INITIAL = 1.0
 _PROTOCOL_RECONNECT_MAX = 60.0
 
@@ -171,13 +211,61 @@ class AgentRuntime:
         self._dispatcher: CommandDispatcher | None = None
         self._heartbeat: Heartbeat | None = None
 
-        # Per-class consecutive-failure counters (reset on clean
-        # connect cycle). Surfaced to the doctor CLI and heartbeat
-        # frames so operators can distinguish "agent is in a flap
-        # loop" from "agent is fine, just disconnected once."
+        # Per-class consecutive-failure counters. Reset by
+        # ``_connect_and_run`` on successful handshake (which is the
+        # only place that observably happens, since the supervisor's
+        # task-group exit is always via _StopRequested). Surfaced to
+        # the doctor CLI and heartbeat frames so operators can
+        # distinguish "agent is in a flap loop" from "agent is fine,
+        # just disconnected once."
         self._auth_error_count = 0
         self._protocol_error_count = 0
         self._connection_error_count = 0
+
+        # Per-class connect-retry backoff. Held as instance state
+        # rather than stack-locals inside _supervise so that
+        # _connect_and_run can reset them on successful handshake.
+        # Without this, the delay schedule advanced monotonically
+        # for the lifetime of the runtime, leaving a long-stable
+        # connection pinned at the cap (30s/60s/600s) after eventual
+        # disconnect instead of returning to the floor.
+        self._delay_conn = _RECONNECT_INITIAL
+        self._delay_proto = _PROTOCOL_RECONNECT_INITIAL
+        self._delay_auth = _AUTH_RECONNECT_INITIAL
+
+        # Phase H: timestamp of the most recent successful handshake.
+        # None until the first connect, then monotonically updated.
+        # Used by the agent_status_provider to compute session age.
+        self._last_successful_connect_at: datetime | None = None
+
+        # Pending event_batch ack tracking.
+        # Maps ``frame.id -> (buffer_entry_id, sent_at)`` for
+        # event_batch frames we shipped but haven't yet seen the
+        # brain ack. The send loop adds entries; the receive loop
+        # pops on ``EventBatchAckFrame``; the watchdog sweeps
+        # entries older than ``_ACK_DEADLINE_SECONDS`` (which on the
+        # FIRST stale batch flips the brain to legacy mode for the
+        # rest of this session). Bounded indirectly by the buffer
+        # size: a stuck-pending entry holds the buffer entry too,
+        # so backpressure is via the buffer cap, not unbounded
+        # growth here.
+        self._pending_acks: dict[str, tuple[int, datetime]] = {}
+        # Whether the brain we're talking to speaks the v1.5 ack
+        # protocol. True at the start of each session. The watchdog
+        # flips it to False ONLY if a batch ages out without ever
+        # seeing an ack AND we have not observed any ack from this
+        # brain yet (``_brain_acks_observed`` below). Once we see
+        # one ack we know the brain is 1.5+ and never fall back -
+        # a missing ack thereafter means a poison batch the brain
+        # rejected, NOT a legacy brain, and the agent must let the
+        # buffer entry stay un-confirmed so the next reconnect
+        # re-sends it.
+        self._brain_supports_acks: bool = True
+        # Sticky "we've seen at least one ack from this brain" flag.
+        # Set on first ``EventBatchAckFrame`` arrival; reset only on
+        # ``_connect_and_run`` cycle (the brain may have changed
+        # versions across reconnect).
+        self._brain_acks_observed: bool = False
 
         # Reconnect-now event. set() by the SIGHUP handler from
         # z4j_bare.control.install_sighup_handler. The supervisor
@@ -554,11 +642,44 @@ class AgentRuntime:
                         result[f"{name}.error"] = "health check failed"
             return result
 
+        # Phase H: status_provider drains supervisor counters + buffer
+        # state into the agent_status frame the heartbeat loop emits
+        # alongside the heartbeat. Closure over self so the live
+        # values are read at emission time, not snapshot at boot.
+        def _collect_agent_status() -> dict[str, Any]:
+            from z4j_core.transport.versioning import (
+                CURRENT_PROTOCOL as _CUR_PROTO,
+            )
+            from z4j_core.version import __version__ as _agent_ver
+
+            buffer_depth = (
+                self._buffer.size() if self._buffer is not None else 0
+            )
+            session_age: float | None = None
+            last_connect: datetime | None = self._last_successful_connect_at
+            if last_connect is not None:
+                session_age = max(
+                    (datetime.now(UTC) - last_connect).total_seconds(), 0.0,
+                )
+            return {
+                "auth_failure_streak": self._auth_error_count,
+                "protocol_failure_streak": self._protocol_error_count,
+                "connection_failure_streak": self._connection_error_count,
+                "last_successful_connect_at": last_connect,
+                "current_session_age_seconds": session_age,
+                "buffer_depth": buffer_depth,
+                "agent_version": _agent_ver,
+                "protocol_version": str(_CUR_PROTO),
+                "engines": list(self.engines),
+                "schedulers": list(self.schedulers),
+            }
+
         self._heartbeat = Heartbeat(
             buffer=self._buffer,
             stop_event=self._stop_event,
             interval=10.0,
             health_provider=_collect_engine_health,
+            status_provider=_collect_agent_status,
         )
 
         # CRIT #1: wire engine + scheduler signal handlers. Without this
@@ -921,6 +1042,21 @@ class AgentRuntime:
           code): treated as ConnectionError-equivalent. Logged with
           full traceback at every cycle.
 
+        Logging policy (matches Sentry / OpenTelemetry / New Relic
+        SDK convention so the agent does not spam dev consoles when
+        the brain is unreachable for an extended period):
+
+        - First disconnect of a streak: WARNING with full context
+          and a hint to raise the ``z4j.agent`` logger to DEBUG for
+          per-attempt detail.
+        - Subsequent disconnects of the same class while the streak
+          continues: DEBUG.
+        - Every 10th attempt in a long streak: INFO summary so an
+          operator tailing the log sees a heartbeat-rate signal that
+          the agent is still alive and trying.
+        - Successful reconnect after a streak: INFO log emitted by
+          ``_connect_and_run`` with the failure count.
+
         ``_connect_and_run`` runs an ``asyncio.TaskGroup`` which raises
         ``ExceptionGroup`` (PEP 654) when any child task fails. We use
         ``except*`` to peel out the failure classes so the longer
@@ -928,31 +1064,24 @@ class AgentRuntime:
         others.
         """
         assert self._stop_event is not None
-        # Per-class delay state - each error class has its own
-        # exponential timer so a flap in one doesn't reset the others.
-        delay_conn = _RECONNECT_INITIAL
-        delay_proto = _PROTOCOL_RECONNECT_INITIAL
-        delay_auth = _AUTH_RECONNECT_INITIAL
-        # Per-class consecutive-failure counters for diagnostics.
-        # Surfaced in heartbeats and the doctor CLI so operators can
-        # see "5 consecutive AuthErrors" without grepping logs.
+        # Counters and per-class delays are instance state initialised
+        # in __init__ and reset on successful handshake by
+        # _connect_and_run. We re-initialise them here as well in case
+        # _supervise is invoked more than once over the runtime's life
+        # (it currently is not, but the contract should not depend on
+        # call-count).
         self._auth_error_count = 0
         self._protocol_error_count = 0
         self._connection_error_count = 0
+        self._delay_conn = _RECONNECT_INITIAL
+        self._delay_proto = _PROTOCOL_RECONNECT_INITIAL
+        self._delay_auth = _AUTH_RECONNECT_INITIAL
         stop_loop = False
         while not stop_loop and not self._stop_event.is_set():
             error_class: str | None = None
             err: BaseException | None = None
             try:
                 await self._connect_and_run()
-                # Clean cycle - reset every per-class delay so the
-                # next failure starts at the floor again.
-                delay_conn = _RECONNECT_INITIAL
-                delay_proto = _PROTOCOL_RECONNECT_INITIAL
-                delay_auth = _AUTH_RECONNECT_INITIAL
-                self._auth_error_count = 0
-                self._protocol_error_count = 0
-                self._connection_error_count = 0
             except* _StopRequested:
                 # Watchdog cancelled the group on stop_event - clean exit.
                 # PEP 654 forbids ``return`` inside an ``except*`` block,
@@ -986,37 +1115,27 @@ class AgentRuntime:
                 break
 
             if err is not None:
-                if error_class == "auth":
-                    logger.warning(
-                        "z4j agent auth rejected (#%d consecutive): %s; "
-                        "retrying with backoff (10min cap)",
-                        self._auth_error_count,
-                        err,
-                    )
-                elif error_class == "protocol":
-                    logger.warning(
-                        "z4j agent protocol error (#%d consecutive): %s; "
-                        "retrying with backoff",
-                        self._protocol_error_count,
-                        err,
-                    )
-                else:
-                    logger.warning("z4j agent disconnected: %s", err)
+                count = (
+                    self._auth_error_count if error_class == "auth"
+                    else self._protocol_error_count if error_class == "protocol"
+                    else self._connection_error_count
+                )
+                _log_disconnect(error_class, err, count)
 
             if self._stop_event.is_set():
                 return
 
             # Pick the schedule for the most recent error class.
             if error_class == "auth":
-                base = delay_auth
+                base = self._delay_auth
                 jitter = _AUTH_RECONNECT_JITTER
                 cap = _AUTH_RECONNECT_MAX
             elif error_class == "protocol":
-                base = delay_proto
+                base = self._delay_proto
                 jitter = _RECONNECT_JITTER
                 cap = _PROTOCOL_RECONNECT_MAX
             else:
-                base = delay_conn
+                base = self._delay_conn
                 jitter = _RECONNECT_JITTER
                 cap = _RECONNECT_MAX
 
@@ -1058,11 +1177,11 @@ class AgentRuntime:
             # keep their state so a flap pattern in one class doesn't
             # zero out an unrelated class's progress.
             if error_class == "auth":
-                delay_auth = min(delay_auth * 2.0, cap)
+                self._delay_auth = min(self._delay_auth * 2.0, cap)
             elif error_class == "protocol":
-                delay_proto = min(delay_proto * 2.0, cap)
+                self._delay_proto = min(self._delay_proto * 2.0, cap)
             else:
-                delay_conn = min(delay_conn * 2.0, cap)
+                self._delay_conn = min(self._delay_conn * 2.0, cap)
 
     async def _connect_and_run(self) -> None:
         """One supervisor cycle: connect, run tasks, until disconnect."""
@@ -1072,12 +1191,53 @@ class AgentRuntime:
         assert self._dispatcher is not None
 
         await self._transport.connect()
+
+        # Connection established. Reset failure counters AND the
+        # per-class backoff delays so the next disconnect starts at
+        # the floor again. This is the only reachable reset point in
+        # the supervisor lifecycle: the supervise() task-group always
+        # exits via _StopRequested, never by clean return, so a reset
+        # placed there would never fire. Without this reset a runtime
+        # that flapped once on startup and then stabilised for hours
+        # would still be pinned at the 30s/60s/600s cap on its next
+        # disconnect, which is worse than starting at 1s/1s/10s.
+        prior_failures = (
+            self._connection_error_count
+            + self._protocol_error_count
+            + self._auth_error_count
+        )
+        if prior_failures > 0:
+            logger.info(
+                "z4j agent recovered after %d failed connect attempt(s)",
+                prior_failures,
+            )
+        self._connection_error_count = 0
+        self._protocol_error_count = 0
+        self._auth_error_count = 0
+        self._delay_conn = _RECONNECT_INITIAL
+        self._delay_proto = _PROTOCOL_RECONNECT_INITIAL
+        self._delay_auth = _AUTH_RECONNECT_INITIAL
+        # Phase H: timestamp the successful connect so the agent_status
+        # frame can report session age. Updated on every connect, not
+        # just the first.
+        self._last_successful_connect_at = datetime.now(UTC)
+
         self._heartbeat.set_interval(float(self._transport.heartbeat_interval))
+
+        # Reset per-connection ack tracking
+        # before the send loop starts on this connection. The
+        # ``_brain_supports_acks`` probe re-runs on every connect so
+        # an operator who restarts a 1.5+ brain after a 1.4 brain
+        # picks up ack mode again without restarting agents.
+        self._pending_acks.clear()
+        self._brain_supports_acks = True
+        self._brain_acks_observed = False
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._run_send_loop(), name="z4j-send")
             tg.create_task(self._heartbeat.run(), name="z4j-heartbeat")
             tg.create_task(self._run_receive_loop(), name="z4j-receive")
+            tg.create_task(self._ack_watchdog_loop(), name="z4j-ack-watchdog")
             # One "watchdog" task exits when stop_event fires, cancelling the group.
             tg.create_task(self._wait_for_stop(), name="z4j-watchdog")
 
@@ -1117,10 +1277,41 @@ class AgentRuntime:
                 self._buffer.increment_attempts([e.id for e in entries])
                 raise
 
-            accepted_ids = [entries[i].id for i in accepted]
-            self._buffer.confirm(accepted_ids)
-            if self._heartbeat is not None and accepted_ids:
-                self._heartbeat.record_flush(datetime.now(UTC))
+            # Defer ``buffer.confirm`` for event_batch frames until
+            # the matching ``event_batch_ack`` arrives from the
+            # brain. Without the application-level ack, confirming
+            # on ws-layer ``send()`` success would silently lose
+            # events whenever the brain dropped the batch (deadlock,
+            # restart mid-batch, ingest queue full).
+            #
+            # Bidi compat: an old brain (pre-1.5) does NOT send acks.
+            # The watchdog (_ack_watchdog_loop) detects stale entries
+            # and sets ``_brain_supports_acks = False`` after the
+            # first ack-window expires unanswered; subsequent batches
+            # then confirm immediately (legacy mode). One round-trip
+            # of latency per agent on the first batch is the cost of
+            # the safe negotiation - acceptable.
+            #
+            # Heartbeat / agent_status / command_ack / command_result
+            # frames don't need acks (they're observability + control,
+            # not data); confirm those immediately regardless of mode.
+            now = datetime.now(UTC)
+            confirm_now: list[int] = []
+            for i in accepted:
+                entry = entries[i]
+                if entry.kind == "event_batch" and self._brain_supports_acks:
+                    frame_id = _peek_frame_id(entry.payload)
+                    if frame_id is None:
+                        confirm_now.append(entry.id)
+                    else:
+                        self._pending_acks[frame_id] = (entry.id, now)
+                else:
+                    confirm_now.append(entry.id)
+
+            if confirm_now:
+                self._buffer.confirm(confirm_now)
+            if self._heartbeat is not None and accepted:
+                self._heartbeat.record_flush(now)
 
     async def _run_receive_loop(self) -> None:
         """Read inbound frames and dispatch commands.
@@ -1135,13 +1326,127 @@ class AgentRuntime:
 
         await self._transport.receive_frames(on_frame)
 
+    async def _ack_watchdog_loop(self) -> None:
+        """Bug A.2: evict ``_pending_acks`` entries past their deadline.
+
+        Two responsibilities:
+
+        1. Detect a brain that doesn't speak the v1.5 ack protocol.
+           If any pending entry ages past ``_ACK_DEADLINE_SECONDS``
+           we flip ``_brain_supports_acks`` to False so subsequent
+           batches confirm immediately (legacy mode). The first
+           batch on a fresh connect pays at most one deadline of
+           latency before legacy mode kicks in - acceptable.
+        2. Evict the now-stale pending entries by confirming them
+           in the buffer (so they don't pin the buffer indefinitely
+           after legacy-mode is engaged). Safe: the brain dedupes
+           replays via the content-derived event_id (Bug X-B fix),
+           so evicted-then-re-shipped events collapse to one row.
+
+        Exits cleanly when ``stop_event`` is set so the supervisor
+        can tear the connection down without a stale task.
+        """
+        assert self._stop_event is not None
+        assert self._buffer is not None
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=_ACK_WATCHDOG_INTERVAL_SECONDS,
+                )
+                return
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+            now = datetime.now(UTC)
+            stale_ids: list[int] = []
+            stale_keys: list[str] = []
+            for frame_id, (entry_id, sent_at) in self._pending_acks.items():
+                if (now - sent_at).total_seconds() < _ACK_DEADLINE_SECONDS:
+                    continue
+                stale_keys.append(frame_id)
+                stale_ids.append(entry_id)
+            if not stale_ids:
+                continue
+            for k in stale_keys:
+                self._pending_acks.pop(k, None)
+            if self._brain_acks_observed:
+                # We've seen at least one ack from this brain in this
+                # session, so it's a 1.5+ build. A missing ack here
+                # means the brain rejected the batch (poison events,
+                # transient DB error, etc.). Re-increment the buffer
+                # entries' attempt counter and DO NOT confirm - the
+                # next reconnect cycle re-sends them, and the brain's
+                # content-derived event_id collapses any
+                # duplicate-with-prior-success that was committed.
+                # Bounded retries via the buffer's attempt counter
+                # eventually evict a true poison entry; the operator
+                # sees the elevated drop counter in the next
+                # heartbeat.
+                logger.warning(
+                    "z4j agent: brain did not ack event_batch within "
+                    "%.0fs; brain previously acked so treating as "
+                    "rejected batch, will re-send on reconnect "
+                    "(stale_count=%d)",
+                    _ACK_DEADLINE_SECONDS, len(stale_ids),
+                )
+                self._buffer.increment_attempts(stale_ids)
+                continue
+            if self._brain_supports_acks:
+                # First-batch timeout AND we've never seen an ack:
+                # the brain is pre-1.5 and never sends acks. Fall
+                # back to legacy "confirm immediately" mode for this
+                # session.
+                self._brain_supports_acks = False
+                logger.warning(
+                    "z4j agent: brain did not ack event_batch within %.0fs "
+                    "and no prior ack observed; assuming pre-1.5 brain "
+                    "and switching to legacy mode for this session "
+                    "(stale_count=%d)",
+                    _ACK_DEADLINE_SECONDS, len(stale_ids),
+                )
+            self._buffer.confirm(stale_ids)
+
     async def _handle_inbound(self, frame: Frame) -> None:
         """Route one verified inbound frame."""
         assert self._dispatcher is not None
         if isinstance(frame, CommandFrame):
             await self._dispatcher.handle(frame)
             return
+        if isinstance(frame, EventBatchAckFrame):
+            self._handle_event_batch_ack(frame)
+            return
         logger.debug("z4j agent received %s frame", frame.type)
+
+    def _handle_event_batch_ack(self, frame: "EventBatchAckFrame") -> None:
+        """Confirm-and-evict the buffer entry matching the ack.
+
+        Brain emits one ``event_batch_ack`` per committed
+        ``event_batch`` carrying ``payload.acked_id = original
+        event_batch.id``. We look up the entry id we deferred when
+        sending and tell the buffer to drop it. The first ack
+        received also confirms the brain speaks the v1.5 ack-aware
+        protocol.
+        """
+        assert self._buffer is not None
+        # First ack pins the brain as "speaks the v1.5 ack protocol".
+        # The watchdog must NOT flip to legacy mode after this point;
+        # any subsequent missing ack means the brain rejected the
+        # batch (poison events, DB outage), not a legacy brain.
+        self._brain_acks_observed = True
+        acked_id = frame.payload.acked_id
+        if not acked_id:
+            # Brain sent ack without correlation id (some pre-release
+            # or 1.5.x spec drift). Nothing safe to confirm against;
+            # the watchdog handles eviction.
+            return
+        pending = self._pending_acks.pop(acked_id, None)
+        if pending is None:
+            # Could be a duplicate ack (network retry) or an ack for a
+            # batch that already aged out via the watchdog. Safe to
+            # ignore.
+            return
+        entry_id, _sent_at = pending
+        self._buffer.confirm([entry_id])
 
     # ------------------------------------------------------------------
     # Transport selection
@@ -1270,6 +1575,81 @@ def _first(eg: BaseExceptionGroup[BaseException]) -> BaseException:
             return _first(exc)
         return exc
     return eg
+
+
+# Every Nth consecutive failure of the same class re-emits an INFO
+# summary so an operator tailing the log sees a heartbeat-rate
+# signal that the agent is still alive and trying. 10 is chosen so
+# that with the connection-error backoff schedule (1s, 2s, 4s, 8s,
+# 16s, 30s, 30s, ...) the first INFO summary fires roughly two
+# minutes into a streak - quick enough that someone investigating
+# does not assume the agent has died, slow enough that the log
+# does not look like spam.
+_LOG_SUMMARY_EVERY = 10
+
+
+def _log_disconnect(
+    error_class: str | None, err: BaseException, count: int,
+) -> None:
+    """Tiered logging for supervisor disconnects.
+
+    First failure in a streak emits a WARNING with full context. Every
+    subsequent failure of the same class drops to DEBUG. Every Nth
+    consecutive failure escalates back to INFO as a "still trying"
+    summary. This mirrors the SDK convention used by Sentry, OpenTelemetry,
+    New Relic, and Datadog: an unreachable backend should never cause
+    the host application's stderr to flood.
+
+    Args:
+        error_class: One of ``"auth"`` / ``"protocol"`` / ``"connection"``
+            (or ``None`` if the supervisor saw no error - the caller
+            never invokes this helper in that case).
+        err: The leaf exception extracted from the supervisor's
+            ExceptionGroup.
+        count: Position of this failure within the current streak.
+            ``1`` means it is the first failure since the last
+            successful handshake (or since the runtime started).
+    """
+    if count == 1:
+        # First failure of a streak: full WARNING with the class and
+        # an explicit pointer to the per-attempt DEBUG channel for
+        # operators who want the firehose.
+        if error_class == "auth":
+            logger.warning(
+                "z4j agent auth rejected: %s. Will retry with backoff "
+                "(10min cap). Subsequent identical failures suppressed; "
+                "set the z4j.agent logger to DEBUG to see every attempt.",
+                err,
+            )
+        elif error_class == "protocol":
+            logger.warning(
+                "z4j agent protocol error: %s. Will retry with backoff. "
+                "Subsequent identical failures suppressed; set the "
+                "z4j.agent logger to DEBUG to see every attempt.",
+                err,
+            )
+        else:
+            logger.warning(
+                "z4j agent disconnected: %s. Will retry with backoff. "
+                "Subsequent identical failures suppressed; set the "
+                "z4j.agent logger to DEBUG to see every attempt.",
+                err,
+            )
+    elif count % _LOG_SUMMARY_EVERY == 0:
+        # Periodic INFO so a tailing operator can see the agent is
+        # still alive. Class is part of the message so the message
+        # is also useful when piped through a log aggregator.
+        logger.info(
+            "z4j agent: still disconnected (#%d %s)", count, error_class,
+        )
+    else:
+        # Suppressed mid-streak failure. DEBUG keeps the per-attempt
+        # detail available to anyone investigating without ever
+        # surfacing in the default-level host log.
+        logger.debug(
+            "z4j agent disconnect retry #%d (%s): %s",
+            count, error_class, err,
+        )
 
 
 __all__ = ["AgentRuntime", "RuntimeState"]

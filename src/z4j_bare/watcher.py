@@ -40,7 +40,7 @@ from pathlib import Path
 
 from z4j_bare.safety import safe_call
 
-logger = logging.getLogger("z4j.agent.watcher")
+logger = logging.getLogger("z4j.runtime.watcher")
 
 #: Default debounce window. Matches "fast typist hits Cmd-S twice".
 _DEFAULT_DEBOUNCE_MS = 250

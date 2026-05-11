@@ -43,7 +43,7 @@ from typing import Any, Callable
 from z4j_bare.install import install_agent
 from z4j_bare.runtime import AgentRuntime
 
-logger = logging.getLogger("z4j.agent.cli")
+logger = logging.getLogger("z4j.runtime.cli")
 
 
 # ---------------------------------------------------------------------------
@@ -523,11 +523,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    logging.getLogger("z4j").setLevel(level)
+    """Install the agent's root log handler.
+
+    Format is controlled by ``Z4J_LOG_FORMAT`` (``text`` | ``json``);
+    see :func:`z4j_core.observability.configure_stdlib_logging` for
+    the format spec. Default is ``text`` for human dev consoles;
+    set ``Z4J_LOG_FORMAT=json`` for SIEM ingestion.
+    """
+    from z4j_core.observability import configure_stdlib_logging
+
+    configure_stdlib_logging(level=level)
 
 
 def _load_engine(engine_name: str, app_path: str | None) -> Any:
@@ -638,6 +643,28 @@ def _load_doctor_config(args: argparse.Namespace) -> "Config":
         "project_id": project_id,
     }
     if hmac_secret:
+        # Audit L-7: validate the HMAC secret length up front so the
+        # operator gets a clear "secret too short" error rather than
+        # a confusing "websocket connect succeeded but no HMAC
+        # verifier built" failure later. The brain mints
+        # urlsafe-base64 of 32 raw bytes (44 chars with one trailing
+        # '='); we accept anything that decodes to >= 32 bytes.
+        try:
+            import base64 as _base64
+            padded = hmac_secret + "=" * (-len(hmac_secret) % 4)
+            decoded = _base64.urlsafe_b64decode(padded)
+            if len(decoded) < 32:
+                raise ValueError(
+                    f"hmac_secret decodes to {len(decoded)} bytes; "
+                    f"the brain expects >= 32 bytes. Re-mint the agent "
+                    f"and copy the value from the brain's response."
+                )
+        except (ValueError, _base64.binascii.Error) as exc:  # type: ignore[attr-defined]
+            raise ValueError(
+                f"Z4J_HMAC_SECRET is malformed: {exc}. The value should "
+                f"be the urlsafe-base64 string the brain returned at "
+                f"agent-mint time.",
+            ) from None
         config_kwargs["hmac_secret"] = hmac_secret
     return Config(**config_kwargs)
 
@@ -751,7 +778,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:  # noqa: ARG001
     """One-line status: is an agent running on this host? Where?
 
-    Reads the pidfile registry under ``$Z4J_RUNTIME_DIR`` (default
+    Reads the pidfile registry under ``$Z4J_HOME`` (default
     ``~/.z4j/``). Lists every adapter with a live PID. Doesn't
     require a working brain - it's a host-local introspection.
 

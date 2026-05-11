@@ -41,7 +41,7 @@ from z4j_core.transport.frames import (
 if TYPE_CHECKING:
     from z4j_bare.buffer import BufferStore
 
-logger = logging.getLogger("z4j.agent.dispatcher")
+logger = logging.getLogger("z4j.runtime.dispatcher")
 
 #: Hard ceiling on the number of tasks a single ``bulk_retry`` command
 #: may touch. Even if the brain (or a forged command that slipped past
@@ -101,7 +101,7 @@ class CommandDispatcher:
         self._seen_commands: OrderedDict[str, float] = OrderedDict()
         # Flap-guard anchor: how long has this process been alive?
         # Used by ``_self_exit_restart`` to refuse too-frequent
-        # restarts (audit M3).
+        # Restarts.
         self._process_start_monotonic = time.monotonic()
 
     # ------------------------------------------------------------------
@@ -153,14 +153,13 @@ class CommandDispatcher:
         # the payload (task_name + args + kwargs + queue + engine),
         # so the agent does NOT need a SchedulerAdapter, this is
         # just a plain enqueue against the QueueEngineAdapter.
-        # Routing it through ``_dispatch_scheduler`` (the pre-1.1
-        # behaviour) failed two ways: ``fire`` was not in the
-        # enable/disable/trigger_now/delete switch, and a celery
-        # WORKER agent has no scheduler adapter registered (celery-
-        # beat is a separate process), so the lookup also returned
-        # "no scheduler adapter registered for None". Audit log
-        # finding 2026-04-28: every scheduler tick produced a
-        # ``command.failed`` row with one of those two errors.
+        # We must NOT route this through ``_dispatch_scheduler``:
+        # ``fire`` is not in the enable/disable/trigger_now/delete
+        # switch, and a celery WORKER agent has no scheduler adapter
+        # registered (celery-beat is a separate process), so the
+        # lookup would return "no scheduler adapter registered for
+        # None" and every scheduler tick would land as a
+        # ``command.failed`` row.
         if action == "schedule.fire":
             return await self._dispatch_schedule_fire(target, parameters)
 
@@ -632,7 +631,7 @@ class CommandDispatcher:
         # anchored supervisor signal is present - prevents an
         # unprivileged attacker who can only set env vars on the
         # worker process from turning the call into a non-
-        # respawning self-exit (audit H2).
+        # Respawning self-exit.
         detection = detect_orchestrator()
         if not detection.detected:
             logger.warning(
@@ -651,7 +650,7 @@ class CommandDispatcher:
                 ),
             )
 
-        # Flap guard (audit M3): refuse a restart within the first
+        # Flap guard: refuse a restart within the first
         # ``_RESTART_MIN_UPTIME_SECONDS`` of the process's life so
         # a compromised brain can't loop the worker into a meltdown
         # against the orchestrator's restart policy.
@@ -729,7 +728,7 @@ class CommandDispatcher:
     # at exit.
     _RESTART_EXIT_DELAY: float = 0.25
 
-    # Flap guard (audit M3): the agent refuses to self-exit within
+    # Flap guard: the agent refuses to self-exit within
     # this many seconds of its own startup. Prevents a compromised
     # brain from putting the worker into a restart loop that burns
     # through the orchestrator's restart budget.

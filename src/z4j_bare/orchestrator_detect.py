@@ -33,7 +33,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-logger = logging.getLogger("z4j.agent.orchestrator_detect")
+logger = logging.getLogger("z4j.runtime.orchestrator_detect")
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +77,7 @@ def detect_orchestrator(
                 False, "Z4J_ORCHESTRATED=0 (explicit opt-out)",
             )
 
-    # Audit H2: env-vars alone are spoofable in shared hosting
+    # Env-vars alone are spoofable in shared hosting
     # (a malicious tenant who can set KUBERNETES_SERVICE_HOST or
     # Z4J_ORCHESTRATED=1 in their own process env could then
     # trigger restart_worker self-exits that never respawn). We

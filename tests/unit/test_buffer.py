@@ -230,7 +230,7 @@ class TestDriftRecovery:
     ) -> None:
         # Simulate the drift observed in production.
         buf._cached_count = -12  # noqa: SLF001 - deliberate drift
-        with caplog.at_level("WARNING", logger="z4j.agent.buffer"):
+        with caplog.at_level("WARNING", logger="z4j.runtime.buffer"):
             assert buf.size() == 0
         assert any(
             "drifted negative" in rec.message for rec in caplog.records
@@ -264,7 +264,7 @@ class TestDriftRecovery:
         # A persistent bug would otherwise spam the log every
         # heartbeat (10s cadence). One warning per BufferStore
         # lifetime is enough signal for operators.
-        with caplog.at_level("WARNING", logger="z4j.agent.buffer"):
+        with caplog.at_level("WARNING", logger="z4j.runtime.buffer"):
             buf._cached_count = -1  # noqa: SLF001
             buf.size()
             buf._cached_count = -5  # noqa: SLF001
