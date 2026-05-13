@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.5.0"
+version = "1.6.0"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
