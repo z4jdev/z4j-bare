@@ -161,6 +161,102 @@ class TestClosedStore:
         buf.close()
         assert buf.size() == 0
 
+
+class TestSecurityP1FilePermissions:
+    """z4j-bare 1.6.5 (security advisory P1): the buffer SQLite DB
+    and its WAL/SHM sidecar files MUST be created with owner-only
+    permissions (0600). Pre-1.6.5 they inherited the process umask,
+    which on multi-tenant POSIX hosts (default umask 022) produced
+    a world-readable buffer holding task/event payload BLOBs.
+    """
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "getuid"),
+        reason="POSIX-only test (no chmod on Windows)",
+    )
+    def test_buffer_db_is_0600_after_create(
+        self, buffer_path: Path,
+    ) -> None:
+        import os
+        import stat
+
+        buf = BufferStore(path=buffer_path)
+        try:
+            # Write something to force WAL + SHM materialisation
+            # (SQLite WAL mode lazily creates sidecar files on first
+            # write; if we don't write, the chmod targets may not
+            # exist yet -- which is expected and tolerated, but we
+            # want to assert the chmod actually fires on real files).
+            buf.append("event_batch", b"x" * 32)
+        finally:
+            buf.close()
+
+        # Primary DB file: must be owner-only.
+        db_mode = stat.S_IMODE(os.stat(buffer_path).st_mode)
+        assert db_mode == 0o600, (
+            f"1.6.5 P1 regression: buffer DB {buffer_path} has "
+            f"mode 0{db_mode:o}, expected 0600. "
+            "On a multi-tenant POSIX host this leaks task payload "
+            "BLOBs to other local users."
+        )
+
+        # WAL sidecar (created on first write since WAL is enabled).
+        wal_path = buffer_path.with_suffix(buffer_path.suffix + "-wal")
+        if wal_path.exists():
+            wal_mode = stat.S_IMODE(os.stat(wal_path).st_mode)
+            assert wal_mode == 0o600, (
+                f"1.6.5 P1 regression: WAL sidecar {wal_path} has "
+                f"mode 0{wal_mode:o}, expected 0600"
+            )
+
+        # SHM sidecar (memory-mapped index for the WAL).
+        shm_path = buffer_path.with_suffix(buffer_path.suffix + "-shm")
+        if shm_path.exists():
+            shm_mode = stat.S_IMODE(os.stat(shm_path).st_mode)
+            assert shm_mode == 0o600, (
+                f"1.6.5 P1 regression: SHM sidecar {shm_path} has "
+                f"mode 0{shm_mode:o}, expected 0600"
+            )
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "getuid"),
+        reason="POSIX-only test",
+    )
+    def test_loose_z4j_home_emits_warning(
+        self, buffer_path: Path, caplog,
+    ) -> None:
+        """When the buffer's parent directory is group/world
+        accessible, BufferStore startup MUST log a WARN naming the
+        path + the remediation command. Operators on multi-tenant
+        hosts need this signal."""
+        import logging
+        import os
+
+        # Reset the one-shot guard so this test always exercises the
+        # check, even when run after another test that triggered it.
+        from z4j_bare import buffer as buffer_module
+
+        buffer_module._z4j_home_perms_warned = False
+
+        # Make the parent dir group-readable (0o755 inclusive of
+        # group/world read bits) -- this is the bit pattern the
+        # warning is supposed to flag.
+        os.chmod(buffer_path.parent, 0o755)
+
+        with caplog.at_level(logging.WARNING, logger="z4j.runtime.buffer"):
+            buf = BufferStore(path=buffer_path)
+            try:
+                pass
+            finally:
+                buf.close()
+
+        warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("group/world accessible" in r.getMessage() for r in warns), (
+            "1.6.5 P1: BufferStore must WARN when Z4J_HOME (or the "
+            "buffer's parent dir) is group/world accessible. Found "
+            f"WARN records: {[r.getMessage() for r in warns]}"
+        )
+
     def test_close_is_idempotent(self, buf: BufferStore) -> None:
         buf.close()
         buf.close()  # must not raise

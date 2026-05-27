@@ -69,6 +69,96 @@ _PRAGMAS = (
 )
 
 
+#: Module-level flag so the Z4J_HOME perms warning fires at most
+#: once per process (not once per BufferStore construction).
+_z4j_home_perms_warned: bool = False
+
+
+def _warn_if_z4j_home_loose(db_path: Path) -> None:
+    """Warn if the buffer's parent directory is group/world accessible.
+
+    Added in z4j-bare 1.6.5 (security advisory P1). When the
+    operator sets ``Z4J_HOME`` (or accepts the default ``~/.z4j``)
+    on a multi-tenant host, the directory may have permissive
+    bits inherited from a parent or set deliberately for some
+    other reason. We don't presume to chmod the directory itself
+    (the operator may have reasons), but we DO want to surface
+    the risk so an operator who didn't intend a shared-host setup
+    sees the warning in the worker logs.
+
+    No-op on Windows.
+
+    Fires at most once per process via a module-level guard.
+    """
+    global _z4j_home_perms_warned
+    if _z4j_home_perms_warned or os.name != "posix":
+        return
+    parent = db_path.parent
+    try:
+        mode = parent.stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:  # any group or other permission bit set
+        logger.warning(
+            "z4j-bare buffer: directory %s has mode 0%o "
+            "(group/world accessible). The buffer database "
+            "contains task/event payload bytes (potentially PII). "
+            "Run `chmod 700 %s` (or set Z4J_HOME to a private "
+            "directory) before the next agent start to harden.",
+            parent, mode, parent,
+        )
+    _z4j_home_perms_warned = True
+
+
+def _restrict_buffer_files(db_path: Path) -> None:
+    """Force owner-only permissions (0600) on the buffer DB and its
+    SQLite sidecar files.
+
+    Added in z4j-bare 1.6.5 (security advisory P1). The buffer
+    stores task/event payload BLOBs that may contain PII. On a
+    multi-tenant host where ``Z4J_HOME`` was created with a
+    permissive umask (or points to a pre-existing world-readable
+    directory) the SQLite ``connect`` call inherits the umask and
+    creates the DB world-readable. This helper re-tightens after
+    the file exists.
+
+    Sidecar files (``-wal``, ``-shm``) are created lazily by SQLite
+    on first write; we attempt to chmod them too, tolerating
+    ``FileNotFoundError`` when they haven't materialised yet
+    (subsequent writes recreate them, and operators who care can
+    re-run a maintenance task -- but typical agent workloads
+    produce both files within the first second).
+
+    Best-effort: errors are logged at WARN level but do NOT raise.
+    Some filesystems (tmpfs without perm semantics, FAT-on-USB,
+    SMB mounts) intentionally ignore chmod; the agent must still
+    start in those environments.
+
+    No-op on Windows (POSIX permissions don't apply).
+    """
+    if os.name != "posix":
+        return
+
+    targets = [
+        db_path,
+        db_path.with_suffix(db_path.suffix + "-wal"),
+        db_path.with_suffix(db_path.suffix + "-shm"),
+    ]
+    for target in targets:
+        try:
+            os.chmod(target, 0o600)
+        except FileNotFoundError:
+            # Sidecar files may not exist until the first write.
+            continue
+        except OSError as exc:
+            logger.warning(
+                "z4j-bare buffer: chmod 0600 failed on %s: %s "
+                "(buffer may be world-readable; ensure Z4J_HOME "
+                "permissions are tight)",
+                target, exc,
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class BufferEntry:
     """A single buffered frame awaiting transmission to the brain.
@@ -143,6 +233,21 @@ class BufferStore:
             self._conn.execute(pragma)
         self._conn.executescript(_SCHEMA)
         self._closed = False
+
+        # z4j-bare 1.6.5 (security advisory P1): force private mode
+        # on the buffer DB + its WAL/SHM sidecar files. The buffer
+        # stores task/event payload BLOBs which may contain PII; on
+        # multi-tenant hosts the inherited umask is not tight enough
+        # by default (e.g., 0644 with umask 022). We re-tighten to
+        # owner-only after SQLite has created/touched each file.
+        # Best-effort: the chmod is a no-op on platforms where it
+        # doesn't apply (Windows), and we tolerate errors so an
+        # ephemeral filesystem (e.g., a tmpfs mounted without
+        # permission semantics) doesn't break agent startup.
+        _restrict_buffer_files(path)
+        # Surface a one-shot WARN if Z4J_HOME itself is group/world
+        # accessible so operators on multi-tenant hosts notice.
+        _warn_if_z4j_home_loose(path)
 
         # Cached running totals - sourced from disk on startup, then
         # adjusted incrementally on append/evict/confirm. Avoids running
