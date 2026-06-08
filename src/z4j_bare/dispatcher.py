@@ -409,17 +409,76 @@ class CommandDispatcher:
             task_id = parameters.get("task_id") or target.get("task_id") or target.get("id")
             if not task_id:
                 return CommandResult(status="failed", error="target.task_id required")
-            return await adapter.retry_task(
-                task_id,
-                override_args=_maybe_tuple(parameters.get("override_args")),
-                override_kwargs=parameters.get("override_kwargs"),
-                eta=parameters.get("eta"),
-                # Brain looks up the original task's priority and
-                # forwards it so high-priority work doesn't get
-                # silently demoted on retry. ``None`` falls back
-                # to the broker's default priority slot.
-                priority=parameters.get("priority"),
-            )
+            # R7 H-2 + R8 H-1: the adapter MUST receive every value it
+            # needs to re-enqueue (task_name, args, kwargs) from the
+            # brain rather than reading them off the broker itself.
+            # Broker payloads are pickle on RQ + Dramatiq + Huey + arq,
+            # and the agent process holds the HMAC signing key, so a
+            # writable broker would otherwise be RCE on the agent.
+            # Operator-supplied ``override_args`` / ``override_kwargs``
+            # win; otherwise we fall back to the ``args`` / ``kwargs``
+            # snapshot the brain captured at ``task.received`` and
+            # forwarded in the command payload. Adapters that don't
+            # honor overrides (celery natively re-reads the broker,
+            # safe there) accept the kwargs and ignore them.
+            override_args = _maybe_tuple(parameters.get("override_args"))
+            if override_args is None:
+                override_args = _maybe_tuple(parameters.get("args"))
+            override_kwargs = parameters.get("override_kwargs")
+            if override_kwargs is None:
+                snapshot_kwargs = parameters.get("kwargs")
+                if isinstance(snapshot_kwargs, dict):
+                    override_kwargs = snapshot_kwargs
+
+            # R8 H-1: brain-supplied task_name replaces job.func_name
+            # for adapters that would otherwise lazy-pickle-load on
+            # attribute access (RQ is the documented case; arq /
+            # dramatiq / taskiq read their own envelopes safely).
+            task_name = parameters.get("task_name")
+
+            # R8 L-1: Huey's adapter expects task_name inside
+            # override_kwargs at the magic key ``__z4j_task_name__``
+            # (its retry_task signature pre-dates the task_name kwarg
+            # contract). Inject it here so the Huey engine looks up
+            # the registered callable correctly. We only inject for
+            # Huey to avoid surprising other adapters that might
+            # pass override_kwargs straight to the user function.
+            adapter_name = getattr(adapter, "name", "")
+            if task_name and adapter_name == "huey":
+                override_kwargs = dict(override_kwargs or {})
+                override_kwargs.setdefault("__z4j_task_name__", task_name)
+
+            # Pass task_name as an explicit kwarg for adapters that
+            # accept it (z4j-rq 1.6.7+ requires it; the action layer
+            # fails closed if absent). Older adapter signatures
+            # (z4j-rq <=1.6.6, all other adapters not yet updated)
+            # don't accept the kwarg - fall back via TypeError to the
+            # legacy signature. Operators on the old z4j-rq adapter
+            # paired with this new dispatcher still get fail-closed
+            # behavior because retry_task_action enforces task_name
+            # presence at the action layer, not just the adapter
+            # signature.
+            try:
+                return await adapter.retry_task(
+                    task_id,
+                    task_name=task_name,
+                    override_args=override_args,
+                    override_kwargs=override_kwargs,
+                    eta=parameters.get("eta"),
+                    # Brain looks up the original task's priority and
+                    # forwards it so high-priority work doesn't get
+                    # silently demoted on retry. ``None`` falls back
+                    # to the broker's default priority slot.
+                    priority=parameters.get("priority"),
+                )
+            except TypeError:
+                return await adapter.retry_task(
+                    task_id,
+                    override_args=override_args,
+                    override_kwargs=override_kwargs,
+                    eta=parameters.get("eta"),
+                    priority=parameters.get("priority"),
+                )
 
         if action == "cancel_task":
             task_id = parameters.get("task_id") or target.get("task_id") or target.get("id")
@@ -442,6 +501,36 @@ class CommandDispatcher:
                     error="bulk_retry max must be positive",
                 )
             bounded = min(requested, BULK_RETRY_HARD_MAX)
+            # R7 H-2 + R8 H-1: per-task overrides live in
+            # ``filter["overrides"]`` and per-task task_names live in
+            # ``filter["task_names"]`` (both {task_id: ...} maps
+            # populated by the brain). The dispatcher passes ``filter``
+            # through verbatim so the action gets every override AND
+            # task_name the brain captured; no extra threading needed
+            # here. We forward batch-wide ``override_args`` /
+            # ``override_kwargs`` too when the brain sets them as a
+            # default for the whole batch (uncommon, but used by
+            # scripted bulk retries that want a single rewritten
+            # payload across all ids). Older adapters without those
+            # kwargs fall back via TypeError.
+            override_args = _maybe_tuple(parameters.get("override_args"))
+            override_kwargs = parameters.get("override_kwargs")
+            if override_args is not None or isinstance(override_kwargs, dict):
+                try:
+                    return await adapter.bulk_retry(
+                        filt,
+                        max=bounded,
+                        override_args=override_args,
+                        override_kwargs=(
+                            override_kwargs
+                            if isinstance(override_kwargs, dict)
+                            else None
+                        ),
+                    )
+                except TypeError:
+                    # Older adapter signature: bulk_retry(filter, max).
+                    # Fall through to the unenriched call.
+                    pass
             return await adapter.bulk_retry(filt, max=bounded)
 
         if action == "purge_queue":
@@ -458,7 +547,48 @@ class CommandDispatcher:
             task_id = parameters.get("task_id") or target.get("task_id") or target.get("id")
             if not task_id:
                 return CommandResult(status="failed", error="target.task_id required")
-            return await adapter.requeue_dead_letter(task_id)
+            # R7 H-2 + R8 H-1 (DLQ fallback path): some adapters (rq)
+            # fall back to ``retry_task_action`` when the broker's
+            # native dead-letter API is unreachable, and that path
+            # requires brain-supplied task_name AND override_args /
+            # override_kwargs for the same pickle-safety reason as
+            # ``retry_task`` above. Forward operator overrides first,
+            # snapshot ``args`` / ``kwargs`` second. Older adapters
+            # that ignore the kwargs (signature only accepts task_id)
+            # keep working via TypeError fallback.
+            override_args = _maybe_tuple(parameters.get("override_args"))
+            if override_args is None:
+                override_args = _maybe_tuple(parameters.get("args"))
+            override_kwargs = parameters.get("override_kwargs")
+            if override_kwargs is None:
+                snapshot_kwargs = parameters.get("kwargs")
+                if isinstance(snapshot_kwargs, dict):
+                    override_kwargs = snapshot_kwargs
+            task_name = parameters.get("task_name")
+            try:
+                return await adapter.requeue_dead_letter(
+                    task_id,
+                    task_name=task_name,
+                    override_args=override_args,
+                    override_kwargs=override_kwargs,
+                )
+            except TypeError:
+                # Mid-version adapter signature: accepts overrides but
+                # not task_name. Try without task_name; the action layer
+                # still fails closed if task_name is required.
+                try:
+                    return await adapter.requeue_dead_letter(
+                        task_id,
+                        override_args=override_args,
+                        override_kwargs=override_kwargs,
+                    )
+                except TypeError:
+                    # Oldest adapter signature: requeue_dead_letter(task_id)
+                    # only. Fall back so a brand-new brain doesn't break
+                    # a pinned older agent. The pickle-safety bound still
+                    # applies inside the action; this is just protocol
+                    # tolerance.
+                    return await adapter.requeue_dead_letter(task_id)
 
         if action == "restart_worker":
             worker_name = parameters.get("worker_name") or target.get("worker_name") or target.get("worker_id") or target.get("id")

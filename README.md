@@ -1,8 +1,8 @@
 # z4j-bare
 
-[![PyPI version](https://img.shields.io/pypi/v/z4j-bare.svg?v=1.4.0)](https://pypi.org/project/z4j-bare/)
-[![Python](https://img.shields.io/pypi/pyversions/z4j-bare.svg?v=1.4.0)](https://pypi.org/project/z4j-bare/)
-[![License](https://img.shields.io/pypi/l/z4j-bare.svg?v=1.4.0)](https://github.com/z4jdev/z4j-bare/blob/main/LICENSE)
+[![PyPI version](https://img.shields.io/pypi/v/z4j-bare.svg?v=1.6.7)](https://pypi.org/project/z4j-bare/)
+[![Python](https://img.shields.io/pypi/pyversions/z4j-bare.svg?v=1.6.7)](https://pypi.org/project/z4j-bare/)
+[![License](https://img.shields.io/pypi/l/z4j-bare.svg?v=1.6.7)](https://github.com/z4jdev/z4j-bare/blob/main/LICENSE)
 
 The framework-free agent runtime for [z4j](https://z4j.com).
 
@@ -11,6 +11,12 @@ RQ worker, Dramatiq actor, plain script, custom service, and connects
 it to z4j over an authenticated WebSocket. Used directly when
 there's no framework adapter (z4j-django / z4j-flask / z4j-fastapi);
 used indirectly by those framework adapters too.
+
+## Compatibility
+
+Python 3.11+. No framework or engine pinned; pair with whichever engine adapter your worker runs (`z4j-celery`, `z4j-rq`, `z4j-dramatiq`, `z4j-huey`, `z4j-arq`, `z4j-taskiq`) and that adapter carries the engine-version floor.
+
+Full per-adapter matrix at <https://z4j.dev/reference/compatibility/>.
 
 ## What it ships
 

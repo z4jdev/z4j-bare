@@ -301,6 +301,72 @@ class TestRetryTask:
         await dispatcher.handle(cmd)
         assert engine.retry_calls == [("abc", None, None, None)]
 
+    async def test_retry_threads_brain_snapshot_args_kwargs_as_overrides(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+    ) -> None:
+        """R7 H-2: when the operator did NOT supply ``override_args`` /
+        ``override_kwargs``, the dispatcher MUST forward the brain's
+        ``args`` / ``kwargs`` snapshot (captured at ``task.received``)
+        as override_args=/override_kwargs= so the adapter never has to
+        read the broker (which would be a pickle load on RQ / Dramatiq
+        / Huey / arq). This is the H-2 thread-through contract.
+        """
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "snap-1"},
+            parameters={
+                # No operator overrides; only the brain snapshot.
+                "task_name": "myapp.do_thing",
+                "args": [10, 20],
+                "kwargs": {"flag": True},
+            },
+        )
+        await dispatcher.handle(cmd)
+        task_id, args, kwargs, _ = engine.retry_calls[0]
+        assert task_id == "snap-1"
+        # Snapshot args/kwargs must reach the adapter as overrides,
+        # NOT as None - otherwise the adapter falls back to reading
+        # job.args (pickle path) and H-2 is still open.
+        assert args == (10, 20)
+        assert kwargs == {"flag": True}
+
+    async def test_retry_operator_override_beats_brain_snapshot(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+    ) -> None:
+        """When BOTH the operator's overrides AND the brain's snapshot
+        are present, the operator wins - that's the whole point of the
+        override surface."""
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "snap-2"},
+            parameters={
+                "args": [99, 99],
+                "kwargs": {"snapshot": True},
+                "override_args": [1, 2],
+                "override_kwargs": {"operator": True},
+            },
+        )
+        await dispatcher.handle(cmd)
+        _, args, kwargs, _ = engine.retry_calls[0]
+        assert args == (1, 2)
+        assert kwargs == {"operator": True}
+
+    async def test_retry_snapshot_kwargs_only_args_missing(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+    ) -> None:
+        """Mixed shape: brain only forwarded kwargs (the original task
+        had no positional args). Snapshot kwargs still thread through
+        as override_kwargs while override_args remains None."""
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "snap-3"},
+            parameters={"kwargs": {"only_kwargs": "yes"}},
+        )
+        await dispatcher.handle(cmd)
+        _, args, kwargs, _ = engine.retry_calls[0]
+        assert args is None
+        assert kwargs == {"only_kwargs": "yes"}
+
 
 class TestCancelAndOthers:
     async def test_cancel(
@@ -545,6 +611,82 @@ class TestCancelAndOthers:
         await dispatcher.handle(cmd)
         assert engine.bulk_calls == [({"state": "failure"}, 500)]
 
+    async def test_bulk_retry_forwards_per_task_overrides_in_filter(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+    ) -> None:
+        """R7 H-2: per-task overrides ride inside ``filter["overrides"]``
+        (a {task_id: {args, kwargs}} map populated by the brain). The
+        dispatcher MUST pass the filter through verbatim so the action
+        sees every override the brain captured. This is the bulk-retry
+        side of the H-2 thread-through contract."""
+        overrides = {
+            "j1": {"args": [1], "kwargs": {"a": 1}},
+            "j2": {"args": [2], "kwargs": {"a": 2}},
+        }
+        cmd = _make_command(
+            action="bulk_retry",
+            target={"engine": "fake"},
+            parameters={
+                "filter": {
+                    "state": "failure",
+                    "task_ids": ["j1", "j2"],
+                    "overrides": overrides,
+                },
+                "max": 100,
+            },
+        )
+        await dispatcher.handle(cmd)
+        # Filter must arrive at the adapter byte-for-byte; the action
+        # layer relies on filter["overrides"] for its pickle-safety
+        # refusal.
+        forwarded_filter, forwarded_max = engine.bulk_calls[0]
+        assert forwarded_max == 100
+        assert forwarded_filter["overrides"] == overrides
+        assert forwarded_filter["task_ids"] == ["j1", "j2"]
+
+    async def test_bulk_retry_batch_wide_override_fallback_on_old_adapter(
+        self, buf: BufferStore,
+    ) -> None:
+        """The dispatcher forwards batch-wide ``override_args`` /
+        ``override_kwargs`` to ``adapter.bulk_retry`` when the brain
+        sets them. If the installed adapter is older (signature only
+        accepts ``filter`` + ``max``) the TypeError must trigger a
+        clean fall-back to the bare call; the bulk retry must still
+        proceed, not fail."""
+
+        class OldBulkEngine(FakeEngine):
+            async def bulk_retry(
+                self, filter: dict, *, max: int = 1000,  # noqa: A002
+            ) -> CommandResult:
+                # No override_args / override_kwargs kwargs - old shape.
+                self.bulk_calls.append((filter, max))
+                return CommandResult(status="success", result={"retried": 0})
+
+        old_engine = OldBulkEngine()
+        d = CommandDispatcher(
+            engines={"fake": old_engine}, schedulers={}, buffer=buf,
+        )
+        cmd = _make_command(
+            action="bulk_retry",
+            target={"engine": "fake"},
+            parameters={
+                "filter": {"task_ids": ["j1"]},
+                "max": 10,
+                "override_args": [42],
+                "override_kwargs": {"forced": True},
+            },
+        )
+        await d.handle(cmd)
+        # Old adapter still received the call (via fallback).
+        assert old_engine.bulk_calls == [({"task_ids": ["j1"]}, 10)]
+        # And the result frame reports success, not a 'unexpected
+        # keyword' crash.
+        result_frames = [
+            e for e in buf.drain(10) if e.kind == "command_result"
+        ]
+        parsed = _decode_frame(result_frames[0].payload)
+        assert parsed["payload"]["status"] == "success"
+
     async def test_purge_queue(
         self, dispatcher: CommandDispatcher, engine: FakeEngine,
     ) -> None:
@@ -563,7 +705,53 @@ class TestCancelAndOthers:
             target={"engine": "fake", "task_id": "abc"},
         )
         await dispatcher.handle(cmd)
+        # FakeEngine's old-shape signature triggers the TypeError
+        # fallback path; the task_id still lands in dlq_calls.
         assert engine.dlq_calls == ["abc"]
+
+    async def test_requeue_dead_letter_threads_overrides_to_new_adapter(
+        self, buf: BufferStore,
+    ) -> None:
+        """R7 H-2 (DLQ fallback): when an adapter advertises the H-2
+        overload (override_args / override_kwargs kwargs) the dispatcher
+        must thread brain-supplied overrides through so the rq DLQ
+        fallback path (delegates to retry_task_action under the hood)
+        receives operator-vetted inputs instead of unpickling broker
+        bytes."""
+
+        class NewDLQEngine(FakeEngine):
+            def __init__(self) -> None:
+                super().__init__()
+                self.dlq_kwargs_calls: list[tuple] = []
+
+            async def requeue_dead_letter(
+                self,
+                task_id: str,
+                *,
+                override_args: tuple | None = None,
+                override_kwargs: dict | None = None,
+            ) -> CommandResult:
+                self.dlq_kwargs_calls.append(
+                    (task_id, override_args, override_kwargs),
+                )
+                return CommandResult(status="success")
+
+        new_engine = NewDLQEngine()
+        d = CommandDispatcher(
+            engines={"fake": new_engine}, schedulers={}, buffer=buf,
+        )
+        cmd = _make_command(
+            action="requeue_dead_letter",
+            target={"engine": "fake", "task_id": "dead-1"},
+            parameters={
+                "args": [7, 8],
+                "kwargs": {"reason": "from-dlq"},
+            },
+        )
+        await d.handle(cmd)
+        assert new_engine.dlq_kwargs_calls == [
+            ("dead-1", (7, 8), {"reason": "from-dlq"}),
+        ]
 
     async def test_restart_worker(
         self, dispatcher: CommandDispatcher, engine: FakeEngine,
@@ -889,3 +1077,226 @@ class TestCapabilityGating:
         parsed = _decode_frame(results[0].payload)
         assert parsed["payload"]["status"] == "failed"
         assert "not support" in (parsed["payload"]["error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# R8 H-1 and R8 L-1: task_name thread-through across the dispatcher
+# ---------------------------------------------------------------------------
+
+
+class FakeEngineWithTaskName(FakeEngine):
+    """Adapter that accepts the 1.6.7 ``task_name`` retry kwarg.
+
+    Models the post-R8-H1 z4j-rq adapter shape so we can assert the
+    dispatcher actually threads the brain-supplied task_name through
+    rather than silently dropping it on the TypeError fallback path.
+    """
+
+    name = "fake_with_task_name"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.task_name_calls: list[str | None] = []
+
+    async def retry_task(  # type: ignore[override]
+        self,
+        task_id: str,
+        *,
+        task_name: str | None = None,
+        override_args: tuple | None = None,
+        override_kwargs: dict | None = None,
+        eta: float | None = None,
+        priority: object = None,  # noqa: ARG002
+    ) -> CommandResult:
+        self.retry_calls.append((task_id, override_args, override_kwargs, eta))
+        self.task_name_calls.append(task_name)
+        return CommandResult(status="success", result={"new_task_id": f"new-{task_id}"})
+
+    async def requeue_dead_letter(  # type: ignore[override]
+        self,
+        task_id: str,
+        *,
+        task_name: str | None = None,
+        override_args: tuple | None = None,
+        override_kwargs: dict | None = None,
+    ) -> CommandResult:
+        self.dlq_calls.append(task_id)
+        self.task_name_calls.append(task_name)
+        return CommandResult(status="success")
+
+
+class FakeHueyEngine(FakeEngine):
+    """Adapter advertising ``name = "huey"`` so the dispatcher injects
+    ``__z4j_task_name__`` into ``override_kwargs`` per R8 L-1."""
+
+    name = "huey"
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Capture override_kwargs that reach the adapter so the test
+        # can assert __z4j_task_name__ landed there.
+        self.last_override_kwargs: dict | None = None
+
+    async def retry_task(  # type: ignore[override]
+        self,
+        task_id: str,
+        *,
+        override_args: tuple | None = None,
+        override_kwargs: dict | None = None,
+        eta: float | None = None,
+        priority: object = None,  # noqa: ARG002
+    ) -> CommandResult:
+        self.retry_calls.append((task_id, override_args, override_kwargs, eta))
+        self.last_override_kwargs = (
+            dict(override_kwargs) if override_kwargs is not None else None
+        )
+        return CommandResult(status="success", result={"new_task_id": f"new-{task_id}"})
+
+
+class TestR8H1TaskNameThreadThrough:
+    """Dispatcher MUST forward the brain-supplied task_name when the
+    adapter signature accepts it (post-1.6.7 z4j-rq shape)."""
+
+    async def test_retry_task_threads_task_name_to_modern_adapter(
+        self, buf: BufferStore,
+    ) -> None:
+        engine = FakeEngineWithTaskName()
+        dispatcher = CommandDispatcher(
+            engines={"fake_with_task_name": engine},
+            schedulers={},
+            buffer=buf,
+        )
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake_with_task_name", "task_id": "xyz"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+        assert engine.task_name_calls == ["myapp.tasks.send_email"]
+
+    async def test_retry_task_falls_back_for_legacy_adapter(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+    ) -> None:
+        """FakeEngine doesn't accept task_name= kwarg. The dispatcher
+        catches the TypeError and falls back to the legacy signature
+        so a brand-new brain doesn't break a pinned older agent. The
+        action-layer fail-closed check is what preserves the security
+        guarantee when adapters lag behind."""
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "legacy-1"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+        # Fallback path lands the retry without task_name; tuple still
+        # records the call so we know it executed (vs raising).
+        task_ids = [c[0] for c in engine.retry_calls]
+        assert "legacy-1" in task_ids
+
+    async def test_dlq_threads_task_name_to_modern_adapter(
+        self, buf: BufferStore,
+    ) -> None:
+        engine = FakeEngineWithTaskName()
+        dispatcher = CommandDispatcher(
+            engines={"fake_with_task_name": engine},
+            schedulers={},
+            buffer=buf,
+        )
+        cmd = _make_command(
+            action="requeue_dead_letter",
+            target={"engine": "fake_with_task_name", "task_id": "dlq-1"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+        assert engine.task_name_calls == ["myapp.tasks.send_email"]
+
+
+class TestR8L1HueyInjection:
+    """Dispatcher injects ``__z4j_task_name__`` into override_kwargs
+    for adapters with name == 'huey'. R8 L-1 regression."""
+
+    async def test_huey_retry_receives_magic_key_in_override_kwargs(
+        self, buf: BufferStore,
+    ) -> None:
+        engine = FakeHueyEngine()
+        dispatcher = CommandDispatcher(
+            engines={"huey": engine},
+            schedulers={},
+            buffer=buf,
+        )
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "huey", "task_id": "huey-1"},
+            parameters={
+                "task_name": "myapp.tasks.send_sms",
+                "override_args": [],
+                "override_kwargs": {"existing": "value"},
+            },
+        )
+        await dispatcher.handle(cmd)
+        assert engine.last_override_kwargs is not None
+        # Magic key landed at the path the Huey engine pops from.
+        assert engine.last_override_kwargs.get("__z4j_task_name__") == (
+            "myapp.tasks.send_sms"
+        )
+        # Existing operator-supplied kwarg preserved.
+        assert engine.last_override_kwargs.get("existing") == "value"
+
+    async def test_huey_retry_does_not_clobber_operator_supplied_magic_key(
+        self, buf: BufferStore,
+    ) -> None:
+        """If the operator already supplied a __z4j_task_name__ in
+        override_kwargs (unusual but possible), the dispatcher must
+        not overwrite it. ``setdefault`` is the correct shape."""
+        engine = FakeHueyEngine()
+        dispatcher = CommandDispatcher(
+            engines={"huey": engine},
+            schedulers={},
+            buffer=buf,
+        )
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "huey", "task_id": "huey-2"},
+            parameters={
+                "task_name": "myapp.brain.choice",
+                "override_args": [],
+                "override_kwargs": {"__z4j_task_name__": "myapp.operator.choice"},
+            },
+        )
+        await dispatcher.handle(cmd)
+        assert engine.last_override_kwargs is not None
+        assert engine.last_override_kwargs["__z4j_task_name__"] == (
+            "myapp.operator.choice"
+        )
+
+    async def test_non_huey_adapter_does_not_get_magic_key_injection(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+    ) -> None:
+        """The injection is Huey-specific. Other adapters must NOT
+        receive an unexpected __z4j_task_name__ key in their
+        override_kwargs (would otherwise reach the user function)."""
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "non-huey-1"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {"user_key": "value"},
+            },
+        )
+        await dispatcher.handle(cmd)
+        _, _, kwargs, _ = engine.retry_calls[0]
+        assert kwargs == {"user_key": "value"}
+        assert "__z4j_task_name__" not in (kwargs or {})
