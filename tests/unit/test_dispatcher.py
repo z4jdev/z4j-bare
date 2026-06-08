@@ -1254,12 +1254,19 @@ class TestR8L1HueyInjection:
         # Existing operator-supplied kwarg preserved.
         assert engine.last_override_kwargs.get("existing") == "value"
 
-    async def test_huey_retry_does_not_clobber_operator_supplied_magic_key(
+    async def test_huey_retry_brain_name_overrides_operator_supplied_magic_key_r9_l1(
         self, buf: BufferStore,
     ) -> None:
-        """If the operator already supplied a __z4j_task_name__ in
-        override_kwargs (unusual but possible), the dispatcher must
-        not overwrite it. ``setdefault`` is the correct shape."""
+        """R9-L1 regression: brain-derived task_name MUST win over an
+        operator-supplied ``__z4j_task_name__`` in override_kwargs.
+
+        Pre-R9-L1 the dispatcher used ``setdefault`` which preserved
+        the operator-supplied value and let it slip through to Huey's
+        registry lookup. The fix is direct assignment so the brain's
+        canonical task name always wins. This test asserts the new
+        safe behavior; the previous test asserted the unsafe behavior
+        as expected and was flipped as part of the R9-L1 closure.
+        """
         engine = FakeHueyEngine()
         dispatcher = CommandDispatcher(
             engines={"huey": engine},
@@ -1277,8 +1284,16 @@ class TestR8L1HueyInjection:
         )
         await dispatcher.handle(cmd)
         assert engine.last_override_kwargs is not None
+        # R9-L1: brain-derived wins, operator-supplied magic key is
+        # silently replaced (not echoed back to the audit trail at
+        # this layer; the brain audit log records the operator's
+        # retry click separately).
         assert engine.last_override_kwargs["__z4j_task_name__"] == (
-            "myapp.operator.choice"
+            "myapp.brain.choice"
+        ), (
+            "R9-L1 regression: dispatcher reverted to setdefault, "
+            "letting operator-supplied __z4j_task_name__ slip through "
+            "to Huey's registry lookup. Must be direct assignment."
         )
 
     async def test_non_huey_adapter_does_not_get_magic_key_injection(
@@ -1300,3 +1315,187 @@ class TestR8L1HueyInjection:
         _, _, kwargs, _ = engine.retry_calls[0]
         assert kwargs == {"user_key": "value"}
         assert "__z4j_task_name__" not in (kwargs or {})
+
+
+# ---------------------------------------------------------------------------
+# R9-H2: dispatcher must FAIL CLOSED for RQ on the TypeError fallback.
+# Mixed-version (new z4j-bare 1.6.8+ + old z4j-rq <=1.6.6) would
+# otherwise silently re-open the R8-H1 pickle RCE because old z4j-rq
+# retry_task_action reads job.func_name / args / kwargs on the
+# broker-stored Job.
+# ---------------------------------------------------------------------------
+
+
+class FakeLegacyRqEngine(FakeEngine):
+    """Simulates an old z4j-rq adapter (<=1.6.6) that doesn't accept
+    the ``task_name`` kwarg the 1.6.8+ dispatcher passes.
+
+    ``name = "rq"`` so the dispatcher's RQ-specific fail-closed
+    branch engages on the TypeError. ``retry_task`` and
+    ``requeue_dead_letter`` both REFUSE the new-shape call by raising
+    TypeError, matching the legacy 1.6.0 signature.
+    """
+
+    name = "rq"
+
+    async def retry_task(  # type: ignore[override]
+        self,
+        task_id: str,
+        *,
+        override_args: tuple | None = None,
+        override_kwargs: dict | None = None,
+        eta: float | None = None,
+        priority: object = None,  # noqa: ARG002
+    ) -> CommandResult:
+        # Legacy signature: no task_name kwarg. The dispatcher's
+        # try/except on TypeError engages when the new shape is
+        # rejected.
+        self.retry_calls.append((task_id, override_args, override_kwargs, eta))
+        return CommandResult(status="success", result={"new_task_id": f"new-{task_id}"})
+
+    async def requeue_dead_letter(  # type: ignore[override]
+        self,
+        task_id: str,
+    ) -> CommandResult:
+        # Legacy: only task_id, no overrides, no task_name.
+        self.dlq_calls.append(task_id)
+        return CommandResult(status="success")
+
+
+class TestR9H2RqFailClosed:
+    """Dispatcher must refuse retry / DLQ against a legacy RQ adapter
+    rather than fall back to a signature that re-opens R8-H1."""
+
+    async def test_retry_against_legacy_rq_fails_closed_r9_h2(
+        self, buf: BufferStore,
+    ) -> None:
+        engine = FakeLegacyRqEngine()
+        dispatcher = CommandDispatcher(
+            engines={"rq": engine},
+            schedulers={},
+            buffer=buf,
+        )
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "rq", "task_id": "rq-legacy-1"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+        entries = buf.drain(10)
+        result_frames = [e for e in entries if e.kind == "command_result"]
+        assert len(result_frames) == 1
+        parsed = json.loads(result_frames[0].payload.decode("utf-8"))
+        assert parsed["payload"]["status"] == "failed", (
+            "R9-H2 regression: dispatcher fell back to the legacy "
+            "no-task_name retry call against an old z4j-rq adapter. "
+            "Old z4j-rq reads job.func_name from the broker on retry "
+            "(the R8-H1 pickle RCE). Must fail closed instead."
+        )
+        err = parsed["payload"]["error"] or ""
+        assert "z4j-rq" in err and "1.6.7" in err, (
+            f"R9-H2 regression: failure message must name z4j-rq + "
+            f"the required floor so operators know what to upgrade. "
+            f"Got: {err!r}"
+        )
+        # Verify the legacy adapter's retry_task was NOT called.
+        assert engine.retry_calls == [], (
+            "R9-H2 CRITICAL: dispatcher invoked the legacy adapter's "
+            "retry_task despite the fail-closed branch. The R8-H1 "
+            "pickle RCE is re-opened on this code path."
+        )
+
+    async def test_dlq_against_legacy_rq_fails_closed_r9_h2(
+        self, buf: BufferStore,
+    ) -> None:
+        engine = FakeLegacyRqEngine()
+        dispatcher = CommandDispatcher(
+            engines={"rq": engine},
+            schedulers={},
+            buffer=buf,
+        )
+        cmd = _make_command(
+            action="requeue_dead_letter",
+            target={"engine": "rq", "task_id": "rq-legacy-dlq-1"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+        entries = buf.drain(10)
+        result_frames = [e for e in entries if e.kind == "command_result"]
+        assert len(result_frames) == 1
+        parsed = json.loads(result_frames[0].payload.decode("utf-8"))
+        assert parsed["payload"]["status"] == "failed", (
+            "R9-H2 regression: DLQ dispatcher fell back to the legacy "
+            "requeue_dead_letter against an old z4j-rq adapter. The "
+            "DLQ-registry fallback in old z4j-rq routes through "
+            "retry_task_action which reads job.func_name. Must fail "
+            "closed."
+        )
+        assert "z4j-rq" in (parsed["payload"]["error"] or "")
+        assert engine.dlq_calls == [], (
+            "R9-H2 CRITICAL: dispatcher invoked the legacy adapter's "
+            "requeue_dead_letter despite the fail-closed branch."
+        )
+
+    async def test_retry_against_modern_rq_still_succeeds(
+        self, buf: BufferStore,
+    ) -> None:
+        """Sanity: the R9-H2 fail-closed posture is RQ-specific to
+        legacy adapters. A modern z4j-rq 1.6.7+ that accepts task_name
+        must still receive the call cleanly."""
+        # Reuse the FakeEngineWithTaskName from the earlier R8 tests.
+        engine = FakeEngineWithTaskName()
+        engine.name = "rq"  # type: ignore[assignment]  # pretend to be RQ
+        dispatcher = CommandDispatcher(
+            engines={"rq": engine},
+            schedulers={},
+            buffer=buf,
+        )
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "rq", "task_id": "rq-modern-1"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+        assert engine.task_name_calls == ["myapp.tasks.send_email"], (
+            "Modern adapter retry must still get task_name via the "
+            "normal kwarg path; R9-H2 fail-closed must NOT engage "
+            "when the adapter accepts the new signature."
+        )
+
+    async def test_retry_against_legacy_non_rq_still_falls_back(
+        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+    ) -> None:
+        """Sanity: the fail-closed posture is RQ-ONLY. Other legacy
+        adapters (celery, dramatiq, huey, arq, taskiq) keep the
+        TypeError fallback because they have different security
+        models (celery natively re-reads broker; dramatiq doesn't
+        read pickle attributes; etc.)."""
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "non-rq-legacy"},
+            parameters={
+                "task_name": "myapp.tasks.send_email",
+                "override_args": [],
+                "override_kwargs": {},
+            },
+        )
+        await dispatcher.handle(cmd)
+        # FakeEngine (name="fake") falls back via TypeError to the
+        # legacy signature; the call lands on the adapter.
+        task_ids = [c[0] for c in engine.retry_calls]
+        assert "non-rq-legacy" in task_ids, (
+            "Non-RQ legacy adapters must keep the TypeError fallback "
+            "behavior; the R9-H2 fail-closed gate is RQ-specific."
+        )

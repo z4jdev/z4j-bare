@@ -436,28 +436,46 @@ class CommandDispatcher:
             # dramatiq / taskiq read their own envelopes safely).
             task_name = parameters.get("task_name")
 
-            # R8 L-1: Huey's adapter expects task_name inside
+            # R8 L-1 + R9 L-1: Huey's adapter expects task_name inside
             # override_kwargs at the magic key ``__z4j_task_name__``
             # (its retry_task signature pre-dates the task_name kwarg
             # contract). Inject it here so the Huey engine looks up
             # the registered callable correctly. We only inject for
             # Huey to avoid surprising other adapters that might
             # pass override_kwargs straight to the user function.
+            #
+            # R9 L-1: brain-derived task_name MUST win over any
+            # operator-supplied ``__z4j_task_name__`` in override_kwargs.
+            # Previously this used ``setdefault`` which would preserve
+            # an operator-supplied value and let it slip through to
+            # Huey's registry lookup. Direct assignment closes that.
             adapter_name = getattr(adapter, "name", "")
             if task_name and adapter_name == "huey":
                 override_kwargs = dict(override_kwargs or {})
-                override_kwargs.setdefault("__z4j_task_name__", task_name)
+                override_kwargs["__z4j_task_name__"] = task_name
 
             # Pass task_name as an explicit kwarg for adapters that
-            # accept it (z4j-rq 1.6.7+ requires it; the action layer
-            # fails closed if absent). Older adapter signatures
-            # (z4j-rq <=1.6.6, all other adapters not yet updated)
-            # don't accept the kwarg - fall back via TypeError to the
-            # legacy signature. Operators on the old z4j-rq adapter
-            # paired with this new dispatcher still get fail-closed
-            # behavior because retry_task_action enforces task_name
-            # presence at the action layer, not just the adapter
-            # signature.
+            # accept it. z4j-rq 1.6.7+ requires task_name (the action
+            # layer fails closed if absent); the dispatcher must NOT
+            # silently fall back to the legacy no-task_name call for
+            # RQ specifically because mixed-version installs
+            # (new z4j-bare 1.6.7+ + old z4j-rq <=1.6.6) would
+            # otherwise re-expose the R8 H-1 pickle RCE -- old z4j-rq
+            # retry_task_action still reads ``job.func_name`` /
+            # ``job.args`` / ``job.kwargs`` on the broker-stored Job.
+            #
+            # R9 H-2: hard-refuse the RQ retry instead of falling back.
+            # The operator gets a clear "upgrade z4j-rq" message; the
+            # alternative is a silent CVE re-opening, which is the
+            # exact mistake the 1.6.7 CHANGELOG inadvertently claimed
+            # was safe.
+            #
+            # For other adapters (celery natively re-reads the broker
+            # safely; dramatiq's retry path doesn't read pickle
+            # attributes; huey reads from its registry by name; arq
+            # and taskiq decline retry without explicit overrides),
+            # the legacy TypeError fallback is safe and preserves
+            # mixed-version operator compat.
             try:
                 return await adapter.retry_task(
                     task_id,
@@ -472,6 +490,20 @@ class CommandDispatcher:
                     priority=parameters.get("priority"),
                 )
             except TypeError:
+                if adapter_name == "rq":
+                    return CommandResult(
+                        status="failed",
+                        error=(
+                            "refusing retry: this z4j-bare dispatcher "
+                            "(1.6.8+) requires z4j-rq 1.6.7 or newer "
+                            "to thread brain-supplied task_name through "
+                            "the retry path. Older z4j-rq adapters "
+                            "ignore the kwarg and fall back to reading "
+                            "the broker-stored job.func_name, which "
+                            "re-opens the R8 H-1 pickle RCE. Upgrade "
+                            "with: pip install --upgrade 'z4j-rq>=1.6.7'"
+                        ),
+                    )
                 return await adapter.retry_task(
                     task_id,
                     override_args=override_args,
@@ -565,6 +597,7 @@ class CommandDispatcher:
                 if isinstance(snapshot_kwargs, dict):
                     override_kwargs = snapshot_kwargs
             task_name = parameters.get("task_name")
+            adapter_name = getattr(adapter, "name", "")
             try:
                 return await adapter.requeue_dead_letter(
                     task_id,
@@ -573,6 +606,23 @@ class CommandDispatcher:
                     override_kwargs=override_kwargs,
                 )
             except TypeError:
+                # R9 H-2: same RQ-specific fail-closed posture as the
+                # retry_task path above. Old z4j-rq adapters silently
+                # read job.func_name / args / kwargs on the registry
+                # fallback - refuse rather than silently re-open the
+                # pickle RCE.
+                if adapter_name == "rq":
+                    return CommandResult(
+                        status="failed",
+                        error=(
+                            "refusing DLQ requeue: this z4j-bare "
+                            "dispatcher (1.6.8+) requires z4j-rq "
+                            "1.6.7 or newer for safe registry-fallback "
+                            "behavior. Older z4j-rq adapters would "
+                            "re-open the R8 H-1 pickle RCE. Upgrade "
+                            "with: pip install --upgrade 'z4j-rq>=1.6.7'"
+                        ),
+                    )
                 # Mid-version adapter signature: accepts overrides but
                 # not task_name. Try without task_name; the action layer
                 # still fails closed if task_name is required.
