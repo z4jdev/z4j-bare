@@ -381,9 +381,18 @@ class BufferStore:
         """
         if limit <= 0:
             raise ValueError("drain limit must be positive")
-        if self._closed:
-            return []
         with self._lock:
+            # Re-check ``_closed`` INSIDE the lock. ``close()`` takes the
+            # same lock to flip ``_closed`` and close the connection, so a
+            # check OUTSIDE the lock has a TOCTOU window: a concurrent
+            # ``stop()`` on another thread (the atexit teardown path of a
+            # short-lived process exiting while the send loop is still
+            # draining) can close the connection between the check and the
+            # ``execute`` below, raising ``sqlite3.ProgrammingError:
+            # Cannot operate on a closed database``. Mirrors the in-lock
+            # guard already in ``confirm`` / ``size`` / ``byte_size``.
+            if self._closed:
+                return []
             rows = self._conn.execute(
                 "SELECT id, kind, payload, created_at, attempts "
                 "FROM entries ORDER BY id ASC LIMIT ?",

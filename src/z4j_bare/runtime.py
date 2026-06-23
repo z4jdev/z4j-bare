@@ -25,7 +25,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import random
+import sys
 import threading
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -58,6 +60,106 @@ if TYPE_CHECKING:
     from z4j_core.models import Config
 
 logger = logging.getLogger("z4j.runtime.supervisor")
+
+
+def _drain_default_executor(loop: asyncio.AbstractEventLoop, *, deadline_s: float) -> None:
+    """Drain the loop's default ThreadPoolExecutor before ``loop.close()``.
+
+    The "Fix B" half of the heartbeat shutdown-race fix. A final
+    heartbeat tick may have dispatched a sync provider via
+    ``asyncio.to_thread`` -> ``loop.run_in_executor`` -> the default
+    executor. Closing the loop with that work in flight races the
+    executor teardown and surfaces
+    ``RuntimeError('cannot schedule new futures after shutdown')``.
+    Draining here closes the window deterministically.
+
+    Version-aware to stay safe on Python 3.11:
+
+    - **3.12+**: ``loop.shutdown_default_executor(timeout=...)`` exists;
+      use the native bounded drain.
+    - **3.11**: no ``timeout`` parameter. An unbounded
+      ``shutdown_default_executor()`` would block teardown forever if
+      a provider thread is genuinely wedged (the ``inspector.stats()``
+      BRPOP case the heartbeat is built to defend against). Mirror
+      CPython's own ``_do_shutdown`` helper-thread pattern: run the
+      blocking ``executor.shutdown(wait=True)`` on a side thread and
+      bound the wait. If the deadline passes, abandon with
+      ``shutdown(wait=False)`` and let the daemon agent thread be the
+      ultimate net.
+
+    Best-effort: any error is swallowed by the caller. Never blocks
+    longer than ``deadline_s``.
+    """
+    if loop.is_closed():
+        return
+
+    if sys.version_info >= (3, 12):
+        import warnings
+
+        try:
+            # On a wedged provider thread the timeout fires and the
+            # stdlib emits a RuntimeWarning ("executor did not finish
+            # joining its threads") - that is the exact case we are
+            # deliberately bounding, and the warning is itself
+            # teardown noise (it would otherwise reach operator logs).
+            # Suppress it here; the daemon agent thread is the net.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                loop.run_until_complete(
+                    loop.shutdown_default_executor(timeout=deadline_s),
+                )
+        except (TimeoutError, RuntimeError):
+            # Timeout: a wedged provider thread. RuntimeError: loop
+            # state edge during teardown. Either way the daemon thread
+            # is the net; don't escalate.
+            pass
+        return
+
+    # Python 3.11 fallback: own the join with a hard bound.
+    executor = getattr(loop, "_default_executor", None)
+    if executor is None:
+        return
+    done = threading.Event()
+
+    def _join() -> None:
+        try:
+            executor.shutdown(wait=True)
+        finally:
+            done.set()
+
+    threading.Thread(
+        target=_join, name="z4j-exec-drain", daemon=True,
+    ).start()
+    if not done.wait(deadline_s):
+        # Wedged provider thread; abandon the wait. The pool threads
+        # are daemon and will be reaped at interpreter exit.
+        try:
+            executor.shutdown(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _heartbeat_enabled() -> bool:
+    """Whether to run the liveness heartbeat loop. On by default.
+
+    Disable with ``Z4J_HEARTBEAT=0`` (also accepts ``false`` / ``no``
+    / ``off``). The heartbeat is a 10s-interval liveness + adapter-
+    health loop that a long-lived worker/process benefits from but a
+    short-lived one-shot process (a boot-then-exit Django ``manage.py
+    <cmd>`` that auto-starts the agent) does not: the command finishes
+    its real work in seconds, the heartbeat never ships anything
+    actionable, and the final in-flight tick is the thing that races
+    the executor teardown. Turning it off for those processes removes
+    the race class entirely AND cuts a small amount of startup cost.
+
+    Business events (``record_event`` -> buffer) are unaffected; they
+    flow on a separate synchronous path and ship on the next connect
+    regardless of whether the heartbeat runs.
+    """
+    val = os.environ.get("Z4J_HEARTBEAT")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def _peek_frame_id(payload: bytes) -> str | None:
@@ -581,6 +683,23 @@ class AgentRuntime:
         except Exception:  # noqa: BLE001
             logger.exception("z4j agent runtime loop crashed")
         finally:
+            # Deterministic executor drain BEFORE close (the "Fix B"
+            # half of the heartbeat shutdown-race fix). Any final
+            # heartbeat tick dispatched a sync provider through the
+            # loop's default ThreadPoolExecutor via ``to_thread``; if
+            # we close the loop with a tick still in flight, the
+            # executor teardown races the submit. Draining the
+            # executor here (while the loop is still usable) closes
+            # that window. Bounded so a genuinely wedged provider
+            # thread (the ``inspector.stats()`` BRPOP case the
+            # heartbeat defends against) can never hang teardown -
+            # the daemon thread is the ultimate net.
+            try:
+                _drain_default_executor(loop, deadline_s=2.0)
+            except Exception:  # noqa: BLE001
+                # Drain is best-effort hardening; never let it block
+                # or crash the close path below.
+                pass
             try:
                 loop.close()
             except Exception:  # noqa: BLE001
@@ -674,13 +793,24 @@ class AgentRuntime:
                 "schedulers": list(self.schedulers),
             }
 
-        self._heartbeat = Heartbeat(
-            buffer=self._buffer,
-            stop_event=self._stop_event,
-            interval=10.0,
-            health_provider=_collect_engine_health,
-            status_provider=_collect_agent_status,
-        )
+        if _heartbeat_enabled():
+            self._heartbeat = Heartbeat(
+                buffer=self._buffer,
+                stop_event=self._stop_event,
+                interval=10.0,
+                health_provider=_collect_engine_health,
+                status_provider=_collect_agent_status,
+            )
+        else:
+            # One-shot / short-lived mode: no liveness heartbeat. The
+            # send/receive/ack loops still run so business events flush;
+            # we just don't spin the 10s health tick that would race
+            # the executor teardown on a boot-then-exit process.
+            self._heartbeat = None
+            logger.debug(
+                "z4j agent heartbeat disabled (Z4J_HEARTBEAT=0); "
+                "running heartbeat-less",
+            )
 
         # CRIT #1: wire engine + scheduler signal handlers. Without this
         # the agent connects but never observes anything in the host
@@ -1187,8 +1317,9 @@ class AgentRuntime:
         """One supervisor cycle: connect, run tasks, until disconnect."""
         assert self._transport is not None
         assert self._stop_event is not None
-        assert self._heartbeat is not None
         assert self._dispatcher is not None
+        # NB: self._heartbeat may be None in heartbeat-less mode
+        # (Z4J_HEARTBEAT=0); guarded at each use below.
 
         await self._transport.connect()
 
@@ -1222,7 +1353,10 @@ class AgentRuntime:
         # just the first.
         self._last_successful_connect_at = datetime.now(UTC)
 
-        self._heartbeat.set_interval(float(self._transport.heartbeat_interval))
+        if self._heartbeat is not None:
+            self._heartbeat.set_interval(
+                float(self._transport.heartbeat_interval),
+            )
 
         # Reset per-connection ack tracking
         # before the send loop starts on this connection. The
@@ -1235,7 +1369,8 @@ class AgentRuntime:
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._run_send_loop(), name="z4j-send")
-            tg.create_task(self._heartbeat.run(), name="z4j-heartbeat")
+            if self._heartbeat is not None:
+                tg.create_task(self._heartbeat.run(), name="z4j-heartbeat")
             tg.create_task(self._run_receive_loop(), name="z4j-receive")
             tg.create_task(self._ack_watchdog_loop(), name="z4j-ack-watchdog")
             # One "watchdog" task exits when stop_event fires, cancelling the group.
@@ -1248,12 +1383,20 @@ class AgentRuntime:
 
     async def _run_send_loop(self) -> None:
         """Drain the buffer to the transport in batches."""
-        assert self._buffer is not None
         assert self._transport is not None
         assert self._stop_event is not None
+        # Capture the buffer ONCE into a live local (see
+        # ``_ack_watchdog_loop`` for the full rationale): ``stop()`` can
+        # set ``self._buffer = None`` on another thread, and a supervisor
+        # reconnect can start this task afterwards. Hold the reference;
+        # every BufferStore method re-checks ``_closed`` under its own
+        # lock, so calls remain safe no-ops once teardown closes it.
+        buffer = self._buffer
+        if buffer is None:
+            return
 
         while not self._stop_event.is_set():
-            entries = self._buffer.drain(_SEND_BATCH_SIZE)
+            entries = buffer.drain(_SEND_BATCH_SIZE)
             if not entries:
                 await asyncio.sleep(_SEND_IDLE_SLEEP)
                 continue
@@ -1269,12 +1412,12 @@ class AgentRuntime:
                 # batch and let the reconnect loop retry everything.
                 # The brain's ingestor deduplicates by (occurred_at, id)
                 # so replayed events are safe.
-                self._buffer.increment_attempts([e.id for e in entries])
+                buffer.increment_attempts([e.id for e in entries])
                 raise
             except ConnectionError:
                 # Bubble up to the supervisor so it can reconnect.
                 # Mark attempt counts so stuck entries are visible.
-                self._buffer.increment_attempts([e.id for e in entries])
+                buffer.increment_attempts([e.id for e in entries])
                 raise
 
             # Defer ``buffer.confirm`` for event_batch frames until
@@ -1309,7 +1452,7 @@ class AgentRuntime:
                     confirm_now.append(entry.id)
 
             if confirm_now:
-                self._buffer.confirm(confirm_now)
+                buffer.confirm(confirm_now)
             if self._heartbeat is not None and accepted:
                 self._heartbeat.record_flush(now)
 
@@ -1347,7 +1490,18 @@ class AgentRuntime:
         can tear the connection down without a stale task.
         """
         assert self._stop_event is not None
-        assert self._buffer is not None
+        # Capture the buffer ONCE into a local. ``stop()`` may set
+        # ``self._buffer = None`` on another thread during teardown; if a
+        # supervisor reconnect races that (the send loop dropped, the
+        # supervisor spun up a fresh connection task-group) this watchdog
+        # task can start AFTER the buffer was Noned. A bare
+        # ``assert self._buffer is not None`` would then surface an
+        # AssertionError traceback as teardown noise. Hold a live
+        # reference instead - the BufferStore's own in-lock ``_closed``
+        # check makes every operation a safe no-op once it is closed.
+        buffer = self._buffer
+        if buffer is None:
+            return
         while not self._stop_event.is_set():
             try:
                 await asyncio.wait_for(
@@ -1389,7 +1543,7 @@ class AgentRuntime:
                     "(stale_count=%d)",
                     _ACK_DEADLINE_SECONDS, len(stale_ids),
                 )
-                self._buffer.increment_attempts(stale_ids)
+                buffer.increment_attempts(stale_ids)
                 continue
             if self._brain_supports_acks:
                 # First-batch timeout AND we've never seen an ack:
@@ -1404,7 +1558,7 @@ class AgentRuntime:
                     "(stale_count=%d)",
                     _ACK_DEADLINE_SECONDS, len(stale_ids),
                 )
-            self._buffer.confirm(stale_ids)
+            buffer.confirm(stale_ids)
 
     async def _handle_inbound(self, frame: Frame) -> None:
         """Route one verified inbound frame."""

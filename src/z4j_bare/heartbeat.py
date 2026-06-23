@@ -153,6 +153,12 @@ class Heartbeat:
                 self._health_provider,
                 provider_name="health",
             )
+            # Shutdown sentinel from _safe_provider_call: the executor
+            # was torn down during interpreter exit. Skip the dying
+            # tick rather than ship a heartbeat carrying a
+            # ``{"error": "shutting_down"}`` health blob.
+            if adapter_health.get("error") == "shutting_down":
+                return
         frame = HeartbeatFrame(
             id=self._new_id(),
             ts=datetime.now(UTC),
@@ -196,10 +202,13 @@ class Heartbeat:
             self._status_provider,
             provider_name="status",
         )
-        if status.get("error") == "provider timed out":
+        if status.get("error") in ("provider timed out", "shutting_down"):
             # Don't ship a placeholder ``agent_status`` frame; the brain
             # would persist it as a real reading. Skip and let the next
-            # tick try again.
+            # tick try again. ``shutting_down`` additionally avoids
+            # routing the sentinel into ``AgentStatusPayload(**status)``
+            # below, which would raise an invalid-shape error and
+            # re-introduce the very teardown noise this fix removes.
             return
         if not status:
             return
@@ -241,7 +250,42 @@ class Heartbeat:
         timeout (Python has no safe way to cancel a sync call); the
         leak is bounded in practice because the provider that
         triggered it eventually returns or the agent restarts.
+
+        Shutdown-race handling: ``asyncio.to_thread`` dispatches the
+        provider through the loop's default ``ThreadPoolExecutor``.
+        During interpreter teardown of a short-lived process (e.g. a
+        one-shot Django ``manage.py`` command that booted the runtime
+        in a daemon thread), that executor can be shut down by
+        CPython's ``concurrent.futures`` atexit machinery CONCURRENTLY
+        with an in-flight final heartbeat tick. ``submit()`` then
+        raises ``RuntimeError('cannot schedule new futures after
+        shutdown')`` (explicit executor shutdown) or
+        ``'... after interpreter shutdown'`` (CPython tearing the
+        executor down in its own atexit phase) - we match the common
+        ``'cannot schedule new futures'`` prefix to catch both. This is
+        a benign, expected teardown event - the
+        process has already finished its real work and is exiting -
+        so we classify it as a clean stop and log at debug, mirroring
+        the buffer-closed race already handled quietly in
+        ``_enqueue_heartbeat`` / ``_enqueue_agent_status``. Logging it
+        at exception level (the prior behavior) printed a scary 2x
+        traceback at the end of every CLI run and taught operators to
+        ignore z4j ERRORs, which then hides genuine heartbeat failures.
         """
+        # Fix C (narrow the TOCTOU window): re-check the stop signal
+        # immediately before dispatching to the executor. The loop's
+        # outer ``is_set()`` guards (``_enqueue_heartbeat`` /
+        # ``_enqueue_agent_status``) can pass and THEN the executor is
+        # torn down before we reach ``submit()`` below. This re-check
+        # skips the dispatch entirely when shutdown is already
+        # underway. It does NOT fully close the window (the executor
+        # can still die between this check and the submit, and the
+        # pure-daemon-teardown path may never set ``stop_event`` at
+        # all) - the debug-classification below is the guaranteed
+        # noise killer; this is cheap insurance that avoids the
+        # dispatch in the common cooperative-stop case.
+        if self.stop_event.is_set():
+            return {"error": "shutting_down"}
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(provider),
@@ -255,6 +299,42 @@ class Heartbeat:
                 _PROVIDER_TIMEOUT_SECONDS,
             )
             return {"error": "provider timed out"}
+        except RuntimeError as exc:
+            # Fix A (the guaranteed noise killer): shutdown-class
+            # RuntimeErrors from the executor / loop teardown are
+            # expected during interpreter exit, not real provider
+            # failures. Classify and log at debug.
+            msg = str(exc)
+            if (
+                # ThreadPoolExecutor.submit() raises TWO distinct
+                # messages depending on HOW the executor died:
+                #   - explicit shutdown:    "cannot schedule new futures
+                #                            after shutdown"
+                #   - interpreter teardown: "cannot schedule new futures
+                #                            after interpreter shutdown"
+                # Match the common prefix so BOTH are classified as
+                # benign teardown. (The narrow "after shutdown" string
+                # missed the interpreter-teardown variant - the exact
+                # traceback the Flask/FastAPI e2e surfaced when a final
+                # heartbeat tick raced CPython's own atexit executor
+                # teardown.)
+                "cannot schedule new futures" in msg
+                # loop.close() / shutdown_default_executor already ran
+                or "Executor shutdown has been called" in msg
+                or "Event loop is closed" in msg
+            ):
+                logger.debug(
+                    "z4j agent: %s provider skipped during shutdown",
+                    provider_name,
+                )
+                return {"error": "shutting_down"}
+            # A RuntimeError that is NOT shutdown-class is a genuine
+            # provider failure; preserve the loud exception log.
+            logger.exception(
+                "z4j agent: %s provider raised; shipping synthetic error blob",
+                provider_name,
+            )
+            return {"error": "provider raised"}
         except Exception:  # noqa: BLE001
             logger.exception(
                 "z4j agent: %s provider raised; shipping synthetic error blob",

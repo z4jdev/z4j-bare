@@ -371,3 +371,50 @@ class TestDriftRecovery:
             rec for rec in caplog.records if "drifted negative" in rec.message
         ]
         assert len(drift_logs) == 1
+
+
+class TestDrainCloseRace:
+    """Regression for the teardown race surfaced by the 1.6.9 Docker
+    e2e: a short-lived process exiting while the send loop is mid-drain
+    let ``stop()`` close the buffer on another thread between
+    ``drain()``'s pre-lock ``_closed`` check and its ``execute``,
+    raising ``sqlite3.ProgrammingError: Cannot operate on a closed
+    database``. The fix moves the ``_closed`` check INSIDE the lock
+    (matching ``confirm`` / ``size`` / ``byte_size``)."""
+
+    def test_drain_after_close_returns_empty(self, buffer_path: Path) -> None:
+        store = BufferStore(path=buffer_path, max_entries=100, max_bytes=100_000)
+        store.append("event_batch", b'{"events": []}')
+        store.close()
+        # A fully-closed buffer drains to nothing; must never raise.
+        assert store.drain(10) == []
+
+    def test_drain_checks_closed_inside_lock(self, buffer_path: Path) -> None:
+        # Simulate the EXACT interleaving: a concurrent stop() closes the
+        # buffer the moment drain() enters its critical section. With the
+        # old pre-lock check this raised ProgrammingError on the closed
+        # connection; with the in-lock re-check drain() returns [].
+        store = BufferStore(path=buffer_path, max_entries=100, max_bytes=100_000)
+        store.append("event_batch", b'{"events": []}')
+
+        real_lock = store._lock
+        state = {"closed_once": False}
+
+        class _ClosingLock:
+            def __enter__(self) -> object:
+                real_lock.acquire()
+                if not state["closed_once"]:
+                    state["closed_once"] = True
+                    # Mimic stop() closing the buffer from another thread
+                    # right as drain() takes the lock. Done directly (not
+                    # via close(), which would re-acquire and deadlock).
+                    store._closed = True
+                    store._conn.close()
+                return real_lock
+
+            def __exit__(self, *_exc: object) -> bool:
+                real_lock.release()
+                return False
+
+        store._lock = _ClosingLock()  # type: ignore[assignment]
+        assert store.drain(10) == []

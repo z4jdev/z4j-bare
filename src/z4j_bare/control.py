@@ -156,6 +156,58 @@ def install_sighup_handler(runtime: "AgentRuntime") -> bool:
     return True
 
 
+def register_shutdown_atexit(callback: Callable[[], None]) -> str:
+    """Register ``callback`` to run during interpreter teardown, in the
+    phase that runs BEFORE the asyncio default ThreadPoolExecutor is
+    torn down.
+
+    Why this is not just ``atexit.register``: CPython runs teardown in
+    two phases. ``threading._shutdown()`` runs callbacks registered via
+    ``threading._register_atexit`` FIRST; plain ``atexit`` callbacks run
+    AFTER. ``concurrent.futures`` registers its executor teardown
+    (``_python_exit``) via ``threading._register_atexit`` (see the
+    stdlib comment: "used instead of ``atexit.register()`` for
+    non-daemon threads"). So a shutdown hook registered with plain
+    ``atexit.register`` runs AFTER the default executor is already dead.
+
+    The agent's heartbeat dispatches sync health/status providers via
+    ``asyncio.to_thread`` -> ``loop.run_in_executor`` -> the default
+    executor. If our shutdown drains the runtime in the plain-atexit
+    phase, a final in-flight heartbeat tick races a dead executor and
+    raises ``RuntimeError('cannot schedule new futures after
+    shutdown')``. Registering in the ``threading._register_atexit``
+    phase instead means the runtime drains while the executor is still
+    live, making that race structurally impossible (the noise-
+    classification in ``heartbeat._safe_provider_call`` is then pure
+    defense in depth).
+
+    ``threading._register_atexit`` is a private API (underscore) added
+    in Python 3.9. It raises ``RuntimeError`` if called after the
+    interpreter has already started shutting down. We fall back to plain
+    ``atexit.register`` if the private API is missing (future Python
+    removal) or registration comes too late.
+
+    Returns the registration mechanism actually used (``"threading"``
+    or ``"atexit"``) so callers / tests can assert which path was taken.
+    """
+    import atexit as _atexit
+    import threading as _threading
+
+    register = getattr(_threading, "_register_atexit", None)
+    if register is not None:
+        try:
+            register(callback)
+            return "threading"
+        except (RuntimeError, TypeError):
+            # RuntimeError: "can't register atexit after shutdown".
+            # TypeError: signature drift on a future Python. Either way
+            # fall through to the plain-atexit path so the shutdown
+            # still runs (just in the later phase).
+            pass
+    _atexit.register(callback)
+    return "atexit"
+
+
 def send_restart(adapter_id: str) -> tuple[int, str]:
     """Find the agent's pidfile + send SIGHUP. Used by the CLI.
 
@@ -211,6 +263,7 @@ def send_restart(adapter_id: str) -> tuple[int, str]:
 __all__ = [
     "install_sighup_handler",
     "pidfile_path",
+    "register_shutdown_atexit",
     "remove_pidfile",
     "send_restart",
     "write_pidfile",

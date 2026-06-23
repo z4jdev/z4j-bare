@@ -18,13 +18,22 @@ Licensed under Apache License 2.0. See the repository
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
 from z4j_bare.buffer import BufferEntry, BufferStore
 from z4j_bare.framework import BareFrameworkAdapter
 from z4j_bare.install import install_agent
 from z4j_bare.runtime import AgentRuntime, RuntimeState
 from z4j_bare.safety import safe_boundary, safe_call
 
-__version__ = "1.5.0"
+# Report the installed wheel version (drift-proof - tracks the
+# pyproject version automatically). Falls back to the z4j-core
+# protocol version for source checkouts with no installed metadata.
+try:
+    __version__ = _pkg_version("z4j-bare")
+except PackageNotFoundError:
+    from z4j_core.version import __version__  # type: ignore[no-redef]
 
 __all__ = [
     "AgentRuntime",
