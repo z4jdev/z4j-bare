@@ -27,11 +27,11 @@ Probes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import socket
 import ssl
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,7 +40,7 @@ from urllib.parse import urlparse
 from z4j_core.models import Config
 from z4j_core.paths import buffer_root, z4j_home
 
-from z4j_bare.storage import is_writable_dir, primary_buffer_root
+from z4j_bare.storage import is_writable_dir
 
 logger = logging.getLogger("z4j.runtime.diagnostics")
 
@@ -206,10 +206,12 @@ def probe_tls(brain_url: str, timeout: float = 5.0) -> ProbeResult:
         )
     ctx = ssl.create_default_context()
     try:
-        with socket.create_connection((host, port), timeout=timeout) as raw:
-            with ctx.wrap_socket(raw, server_hostname=host) as tls:
-                cert = tls.getpeercert() or {}
-                proto = tls.version()
+        with (
+            socket.create_connection((host, port), timeout=timeout) as raw,
+            ctx.wrap_socket(raw, server_hostname=host) as tls,
+        ):
+            cert = tls.getpeercert() or {}
+            proto = tls.version()
     except ssl.SSLCertVerificationError as exc:
         return ProbeResult(
             name="tls",
@@ -258,13 +260,12 @@ def probe_websocket(config: Config, timeout: float = 5.0) -> ProbeResult:
         )
 
 
-async def _probe_websocket_async(config: Config, timeout: float) -> ProbeResult:
-    from z4j_bare.runtime import AgentRuntime  # local import to avoid cycle
-
+async def _probe_websocket_async(config: Config, timeout: float) -> ProbeResult:  # noqa: ASYNC109  timeout forwarded to asyncio.wait_for
     # We instantiate a transport-only path: build the framework
     # adapter and a no-op engines list so AgentRuntime.start() opens
     # the WS but does nothing else. Then immediately close.
     from z4j_bare.framework import BareFrameworkAdapter
+    from z4j_bare.runtime import AgentRuntime  # local import to avoid cycle
 
     framework = BareFrameworkAdapter(config)
     runtime = AgentRuntime(
@@ -281,17 +282,15 @@ async def _probe_websocket_async(config: Config, timeout: float) -> ProbeResult:
             ok=False,
             message=f"FAIL: ws upgrade did not complete within {timeout}s",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return ProbeResult(
             name="websocket",
             ok=False,
             message=f"FAIL: ws upgrade rejected: {type(exc).__name__}: {exc}",
         )
     finally:
-        try:
+        with contextlib.suppress(Exception):
             runtime.stop()
-        except Exception:  # noqa: BLE001
-            pass
     return ProbeResult(
         name="websocket",
         ok=True,

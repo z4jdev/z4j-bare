@@ -98,6 +98,7 @@ def default_buffer_path() -> Path:
     user don't collide. Used by ``Config.buffer_path`` default factory.
     """
     import os
+
     return ensure_buffer_root_writable() / f"buffer-{os.getpid()}.sqlite"
 
 

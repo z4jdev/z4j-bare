@@ -25,6 +25,7 @@ to keep z4j-bare's dependency footprint minimal.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sqlite3
@@ -45,15 +46,26 @@ logger = logging.getLogger("z4j.runtime.buffer")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT    NOT NULL,
-    payload     BLOB    NOT NULL,
-    created_at  REAL    NOT NULL,
-    attempts    INTEGER NOT NULL DEFAULT 0
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind             TEXT    NOT NULL,
+    payload          BLOB    NOT NULL,
+    created_at       REAL    NOT NULL,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    content_rejects  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_entries_created_at
     ON entries (created_at);
 """
+
+#: ``attempts`` is a general stuck-entry METRIC (incremented by the WS
+#: ack-watchdog on a re-send, and historically by pre-1.7 transport
+#: failures); it must NOT gate any drop. ``content_rejects`` is the
+#: DEDICATED bounded drop budget: only a long-poll per-frame content
+#: rejection (413/415/422) increments it, and only it is consulted by
+#: ``evict_if_exhausted``. Keeping them physically separate stops WS-timeout
+#: (or cross-version pre-1.7) ``attempts`` history from destructively priming
+#: the content-drop budget so a deliverable event is dropped on its FIRST
+#: content reject (R8-H1).
 
 # Pragmas applied to every connection for durability and speed.
 # WAL = write-ahead log (crash-safe + concurrent readers)
@@ -90,7 +102,7 @@ def _warn_if_z4j_home_loose(db_path: Path) -> None:
 
     Fires at most once per process via a module-level guard.
     """
-    global _z4j_home_perms_warned
+    global _z4j_home_perms_warned  # noqa: PLW0603  module-level one-shot warn guard
     if _z4j_home_perms_warned or os.name != "posix":
         return
     parent = db_path.parent
@@ -105,7 +117,9 @@ def _warn_if_z4j_home_loose(db_path: Path) -> None:
             "contains task/event payload bytes (potentially PII). "
             "Run `chmod 700 %s` (or set Z4J_HOME to a private "
             "directory) before the next agent start to harden.",
-            parent, mode, parent,
+            parent,
+            mode,
+            parent,
         )
     _z4j_home_perms_warned = True
 
@@ -146,7 +160,7 @@ def _restrict_buffer_files(db_path: Path) -> None:
     ]
     for target in targets:
         try:
-            os.chmod(target, 0o600)
+            target.chmod(0o600)
         except FileNotFoundError:
             # Sidecar files may not exist until the first write.
             continue
@@ -155,7 +169,8 @@ def _restrict_buffer_files(db_path: Path) -> None:
                 "z4j-bare buffer: chmod 0600 failed on %s: %s "
                 "(buffer may be world-readable; ensure Z4J_HOME "
                 "permissions are tight)",
-                target, exc,
+                target,
+                exc,
             )
 
 
@@ -232,6 +247,7 @@ class BufferStore:
         for pragma in _PRAGMAS:
             self._conn.execute(pragma)
         self._conn.executescript(_SCHEMA)
+        self._migrate_schema()
         self._closed = False
 
         # z4j-bare 1.6.5 (security advisory P1): force private mode
@@ -263,6 +279,22 @@ class BufferStore:
         # BufferStore lifetime. A persistent drift bug would otherwise
         # spam the logs every heartbeat.
         self._drift_warned = False
+
+    def _migrate_schema(self) -> None:
+        """Idempotently add columns absent from an OLDER buffer file.
+
+        ``CREATE TABLE IF NOT EXISTS`` does NOT add a new column to a table
+        an earlier version already created, and the SQLite buffer file
+        survives process restarts / upgrades. ``content_rejects`` (R8-H1)
+        must exist and default 0 so a pre-1.7 entry (which may carry a high
+        ``attempts`` from old transport-failure counting) starts its content-
+        drop budget fresh and is not deleted on its first content reject.
+        """
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(entries)")}
+        if "content_rejects" not in cols:
+            self._conn.execute(
+                "ALTER TABLE entries ADD COLUMN content_rejects INTEGER NOT NULL DEFAULT 0",
+            )
 
     @property
     def path(self) -> Path:
@@ -315,8 +347,7 @@ class BufferStore:
 
         relocated = fallback_root / requested.name
         logger.warning(
-            "z4j buffer: requested %s but the parent dir is not "
-            "writable; using %s instead.",
+            "z4j buffer: requested %s but the parent dir is not writable; using %s instead.",
             requested,
             relocated,
         )
@@ -353,8 +384,7 @@ class BufferStore:
                 raise RuntimeError("BufferStore is closed")
             self._evict_if_needed_locked(incoming_bytes=len(payload))
             cursor = self._conn.execute(
-                "INSERT INTO entries (kind, payload, created_at, attempts) "
-                "VALUES (?, ?, ?, 0)",
+                "INSERT INTO entries (kind, payload, created_at, attempts) VALUES (?, ?, ?, 0)",
                 (kind, payload, now),
             )
             new_id = cursor.lastrowid
@@ -368,16 +398,48 @@ class BufferStore:
     # Reads
     # ------------------------------------------------------------------
 
-    def drain(self, limit: int) -> list[BufferEntry]:
+    def drain(
+        self,
+        limit: int,
+        *,
+        exclude_ids: set[int] | None = None,
+        exclude_kinds: set[str] | None = None,
+    ) -> list[BufferEntry]:
         """Return the oldest ``limit`` entries without removing them.
+
+        ``exclude_kinds`` skips entries of the given kinds. The send loop
+        passes ``exclude_kinds={"event_batch"}`` when it is at the
+        in-flight cap, so it keeps draining control frames (command
+        acks/results, which confirm on send and never become pending)
+        without taking on more un-acked event batches (R7-MED).
 
         Entries are ordered by ``id`` (which corresponds to insertion
         order). The caller is expected to confirm successful delivery
         via :meth:`confirm` - if confirm is never called, the entries
         remain available for a subsequent drain.
 
+        ``exclude_ids`` skips entries currently IN FLIGHT (sent but not
+        yet acked). Without it the send loop re-drains and re-sends the
+        same un-acked entries on every iteration (they are never removed
+        until acked), which both floods the brain and starves any entry
+        beyond the drain window when in-flight entries fill it (R5-M2).
+
+        The exclusion is applied by OVER-FETCHING ``limit + |exclude|``
+        oldest rows and filtering in Python, NOT with a SQL
+        ``NOT IN (...)``. A parameterized ``NOT IN`` would bind one
+        variable per excluded id, and a large in-flight set (the buffer
+        permits up to 100k entries) can exceed SQLite's 32766
+        bound-parameter ceiling and raise ``OperationalError``, which
+        would crash the send loop and (after the supervisor reconnect
+        clears pending state) restore the very re-send storm this
+        exclusion prevents (R6-F5). Over-fetching at most ``limit +
+        |exclude|`` rows guarantees ``limit`` non-excluded rows whenever
+        that many exist, at bounded cost (the runtime also caps the
+        in-flight set, so ``|exclude|`` stays small in practice).
+
         Args:
             limit: Maximum number of entries to return. Must be > 0.
+            exclude_ids: Buffer entry ids to skip (currently in flight).
         """
         if limit <= 0:
             raise ValueError("drain limit must be positive")
@@ -393,15 +455,37 @@ class BufferStore:
             # guard already in ``confirm`` / ``size`` / ``byte_size``.
             if self._closed:
                 return []
-            rows = self._conn.execute(
-                "SELECT id, kind, payload, created_at, attempts "
-                "FROM entries ORDER BY id ASC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [
-            BufferEntry(id=r[0], kind=r[1], payload=r[2], created_at=r[3], attempts=r[4])
-            for r in rows
-        ]
+            # ``exclude_kinds`` is applied at the SQL level (a small,
+            # fixed set of kind strings, well within the parameter
+            # limit) so the ``LIMIT`` counts rows of the WANTED kinds
+            # even when many excluded-kind rows sit ahead of them.
+            # ``exclude_ids`` (potentially large: the in-flight set) is
+            # applied in Python to avoid SQLite's 32766 bound-parameter
+            # ceiling; we over-fetch ``limit + |exclude_ids|`` rows so
+            # ``limit`` survive the Python filter.
+            fetch = limit + (len(exclude_ids) if exclude_ids else 0)
+            if exclude_kinds:
+                kind_ph = ",".join("?" * len(exclude_kinds))
+                rows = self._conn.execute(
+                    f"SELECT id, kind, payload, created_at, attempts FROM entries WHERE kind NOT IN ({kind_ph}) ORDER BY id ASC LIMIT ?",  # noqa: S608  kind_ph is bound '?' params
+                    (*exclude_kinds, fetch),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, kind, payload, created_at, attempts "
+                    "FROM entries ORDER BY id ASC LIMIT ?",
+                    (fetch,),
+                ).fetchall()
+        out: list[BufferEntry] = []
+        for r in rows:
+            if exclude_ids and r[0] in exclude_ids:
+                continue
+            out.append(
+                BufferEntry(id=r[0], kind=r[1], payload=r[2], created_at=r[3], attempts=r[4]),
+            )
+            if len(out) >= limit:
+                break
+        return out
 
     def confirm(self, ids: list[int]) -> None:
         """Delete entries by id after the brain has accepted them.
@@ -418,24 +502,26 @@ class BufferStore:
             # Reduce cached counters by the size of what we're about to
             # delete. Done before DELETE so we don't have to scan twice.
             row = self._conn.execute(
-                f"SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) "
+                f"SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) "  # noqa: S608  placeholders are bound '?' params, ids not user input
                 f"FROM entries WHERE id IN ({placeholders})",
                 ids,
             ).fetchone()
             removed_count, removed_bytes = int(row[0]), int(row[1])
             self._conn.execute(
-                f"DELETE FROM entries WHERE id IN ({placeholders})",
+                f"DELETE FROM entries WHERE id IN ({placeholders})",  # noqa: S608  placeholders are bound '?' params, ids not user input
                 ids,
             )
             self._cached_count -= removed_count
             self._cached_bytes -= removed_bytes
 
     def increment_attempts(self, ids: list[int]) -> None:
-        """Increment the attempts counter for a batch of entries.
+        """Increment the ``attempts`` METRIC counter for a batch of entries.
 
-        Called by the transport when a flush attempt fails and the
-        entries are going to be retried later. Used by metrics to
-        surface entries that are stuck.
+        Called by the WS ack-watchdog when a re-send is due. Used ONLY to
+        surface stuck entries in metrics; it does NOT gate any drop (the
+        content-drop budget is the separate ``content_rejects`` column,
+        R8-H1). Keeping this off the drop path is what makes WS-timeout (or
+        pre-1.7 cross-version) history harmless.
         """
         if not ids:
             return
@@ -444,10 +530,71 @@ class BufferStore:
                 return
             placeholders = ",".join("?" * len(ids))
             self._conn.execute(
-                f"UPDATE entries SET attempts = attempts + 1 "
-                f"WHERE id IN ({placeholders})",
+                f"UPDATE entries SET attempts = attempts + 1 WHERE id IN ({placeholders})",  # noqa: S608  placeholders are bound '?' params, ids not user input
                 ids,
             )
+
+    def increment_content_rejects(self, ids: list[int]) -> None:
+        """Increment the ``content_rejects`` drop-budget counter.
+
+        Called ONLY by the long-poll per-frame content-reject path
+        (413/415/422) once a single frame has been isolated. This is the
+        dedicated bounded budget consulted by :meth:`evict_if_exhausted`;
+        it is physically separate from the ``attempts`` metric so transient
+        WS-timeout history can never destructively prime a drop (R8-H1).
+        """
+        if not ids:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            placeholders = ",".join("?" * len(ids))
+            self._conn.execute(
+                f"UPDATE entries SET content_rejects = content_rejects + 1 WHERE id IN ({placeholders})",  # noqa: S608  placeholders are bound '?' params, ids not user input
+                ids,
+            )
+
+    def evict_if_exhausted(self, ids: list[int], max_rejects: int) -> int:
+        """Drop ONLY the given ids, and only if their ``content_rejects``
+        reached ``max_rejects``.
+
+        The bounded-retry backstop, ID-TARGETED: the caller passes the
+        EXACT buffer entry ids the brain is persistently rejecting on
+        their content (a single frame isolated by batch-size reduction).
+        Only those ids are considered, and only the ones whose dedicated
+        ``content_rejects`` budget is at/over the cap are dropped -- so a
+        request-level rejection can never mass-delete valid siblings
+        (R7-MED), and transient ``attempts`` history never triggers a drop
+        (R8-H1). Returns the number dropped. Logs a WARNING per drop.
+        """
+        if not ids or max_rejects <= 0:
+            return 0
+        with self._lock:
+            if self._closed:
+                return 0
+            placeholders = ",".join("?" * len(ids))
+            row = self._conn.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) FROM entries WHERE content_rejects >= ? AND id IN ({placeholders})",  # noqa: S608  bound '?' params
+                (max_rejects, *ids),
+            ).fetchone()
+            dropped_count, dropped_bytes = int(row[0]), int(row[1])
+            if dropped_count == 0:
+                return 0
+            self._conn.execute(
+                f"DELETE FROM entries WHERE content_rejects >= ? AND id IN ({placeholders})",  # noqa: S608  bound '?' params
+                (max_rejects, *ids),
+            )
+            self._cached_count -= dropped_count
+            self._cached_bytes -= dropped_bytes
+        logger.warning(
+            "z4j agent buffer dropped %d entr%s after %d content "
+            "rejections (brain kept rejecting this specific frame's "
+            "content); events dropped",
+            dropped_count,
+            "y" if dropped_count == 1 else "ies",
+            max_rejects,
+        )
+        return dropped_count
 
     # ------------------------------------------------------------------
     # Introspection
@@ -609,10 +756,8 @@ class BufferStore:
                 # because the count query glitched.
                 count = -1
             self._closed = True
-            try:
+            with contextlib.suppress(sqlite3.Error):  # pragma: no cover
                 self._conn.close()
-            except sqlite3.Error:  # pragma: no cover
-                pass
             # Cleanup happens AFTER close() so we are not unlinking an
             # open file (Windows can't delete a file SQLite still
             # holds, and even on POSIX it's tidier this way).
@@ -623,10 +768,8 @@ class BufferStore:
                 for suffix in ("", "-wal", "-shm"):
                     p = Path(str(self._path) + suffix)
                     if p.exists():
-                        try:
+                        with contextlib.suppress(OSError):
                             p.unlink()
-                        except OSError:
-                            pass
 
 
 __all__ = ["BufferEntry", "BufferStore"]

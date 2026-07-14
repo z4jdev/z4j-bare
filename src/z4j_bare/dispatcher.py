@@ -26,7 +26,6 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-from z4j_bare.orchestrator_detect import detect_orchestrator
 from z4j_core.errors import Z4JError
 from z4j_core.models import CommandResult
 from z4j_core.protocols import QueueEngineAdapter, SchedulerAdapter
@@ -37,6 +36,8 @@ from z4j_core.transport.frames import (
     CommandResultPayload,
     serialize_frame,
 )
+
+from z4j_bare.orchestrator_detect import detect_orchestrator
 
 if TYPE_CHECKING:
     from z4j_bare.buffer import BufferStore
@@ -132,7 +133,7 @@ class CommandDispatcher:
             result = await self._execute(frame)
         except Z4JError as exc:
             result = CommandResult(status="failed", error=f"{exc.code}: {exc.message}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("z4j unexpected dispatcher error for command %s", frame.id)
             result = CommandResult(status="failed", error=f"internal error: {exc}")
 
@@ -206,7 +207,7 @@ class CommandDispatcher:
             )
         try:
             count = await self._resync_schedules("command")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("z4j dispatcher: schedule.resync failed")
             return CommandResult(
                 status="failed",
@@ -244,28 +245,18 @@ class CommandDispatcher:
                 status="failed",
                 error="schedule.fire: task_name required in payload",
             )
-        engine_name = (
-            parameters.get("engine")
-            or target.get("engine")
-            or self._single_engine_name()
-        )
+        engine_name = parameters.get("engine") or target.get("engine") or self._single_engine_name()
         adapter = self.engines.get(engine_name) if engine_name else None
         if adapter is None:
             return CommandResult(
                 status="failed",
-                error=(
-                    f"schedule.fire: no engine adapter registered for "
-                    f"{engine_name!r}"
-                ),
+                error=(f"schedule.fire: no engine adapter registered for {engine_name!r}"),
             )
         method = getattr(adapter, "submit_task", None)
         if method is None:
             return CommandResult(
                 status="failed",
-                error=(
-                    f"schedule.fire: engine {adapter.name!r} does not "
-                    f"implement submit_task"
-                ),
+                error=(f"schedule.fire: engine {adapter.name!r} does not implement submit_task"),
             )
         args = parameters.get("args") or ()
         if isinstance(args, list):
@@ -278,7 +269,7 @@ class CommandDispatcher:
             queue=parameters.get("queue"),
         )
 
-    async def _dispatch_engine(
+    async def _dispatch_engine(  # noqa: PLR0911, PLR0912, PLR0915  flat command dispatch
         self,
         action: str,
         target: dict[str, Any],
@@ -299,7 +290,8 @@ class CommandDispatcher:
             name = parameters.get("name") or target.get("name")
             if not name:
                 return CommandResult(
-                    status="failed", error="submit_task: name required",
+                    status="failed",
+                    error="submit_task: name required",
                 )
             method = getattr(adapter, "submit_task", None)
             if method is None:
@@ -325,14 +317,11 @@ class CommandDispatcher:
         # but never lists it in ``capabilities()`` (which gates UI
         # buttons, not background-worker probes).
         if action == "reconcile_task":
-            task_id = (
-                parameters.get("task_id")
-                or target.get("task_id")
-                or target.get("id")
-            )
+            task_id = parameters.get("task_id") or target.get("task_id") or target.get("id")
             if not task_id:
                 return CommandResult(
-                    status="failed", error="target.task_id required",
+                    status="failed",
+                    error="target.task_id required",
                 )
             method = getattr(adapter, "reconcile_task", None)
             if method is None:
@@ -353,10 +342,7 @@ class CommandDispatcher:
         # the only new privilege is "kill own process" which is DoS-
         # equivalent to what a hijacked agent could already do via
         # broker-credential abuse.
-        if (
-            action == "restart_worker"
-            and "restart_worker" not in adapter.capabilities()
-        ):
+        if action == "restart_worker" and "restart_worker" not in adapter.capabilities():
             return await self._self_exit_restart(parameters)
 
         # Brain-side polyfill bridge: if the brain asked for an
@@ -385,15 +371,9 @@ class CommandDispatcher:
             return await adapter.submit_task(
                 name,
                 args=tuple(
-                    parameters.get("override_args")
-                    or parameters.get("args")
-                    or (),
+                    parameters.get("override_args") or parameters.get("args") or (),
                 ),
-                kwargs=(
-                    parameters.get("override_kwargs")
-                    or parameters.get("kwargs")
-                    or {}
-                ),
+                kwargs=(parameters.get("override_kwargs") or parameters.get("kwargs") or {}),
                 queue=parameters.get("queue"),
                 eta=parameters.get("eta") or parameters.get("eta_seconds"),
                 priority=parameters.get("priority"),
@@ -554,9 +534,7 @@ class CommandDispatcher:
                         max=bounded,
                         override_args=override_args,
                         override_kwargs=(
-                            override_kwargs
-                            if isinstance(override_kwargs, dict)
-                            else None
+                            override_kwargs if isinstance(override_kwargs, dict) else None
                         ),
                     )
                 except TypeError:
@@ -572,7 +550,9 @@ class CommandDispatcher:
             confirm_token = parameters.get("confirm_token")
             force = bool(parameters.get("force", False))
             return await adapter.purge_queue(
-                queue, confirm_token=confirm_token, force=force,
+                queue,
+                confirm_token=confirm_token,
+                force=force,
             )
 
         if action == "requeue_dead_letter":
@@ -641,7 +621,12 @@ class CommandDispatcher:
                     return await adapter.requeue_dead_letter(task_id)
 
         if action == "restart_worker":
-            worker_name = parameters.get("worker_name") or target.get("worker_name") or target.get("worker_id") or target.get("id")
+            worker_name = (
+                parameters.get("worker_name")
+                or target.get("worker_name")
+                or target.get("worker_id")
+                or target.get("id")
+            )
             if not worker_name:
                 return CommandResult(status="failed", error="target.worker_name required")
             return await adapter.restart_worker(worker_name)
@@ -686,16 +671,18 @@ class CommandDispatcher:
                     error="adapter does not support 'rate_limit'",
                 )
             return await method(
-                task_name, rate, worker_name=worker_name,
+                task_name,
+                rate,
+                worker_name=worker_name,
             )
 
         return CommandResult(status="failed", error=f"unrecognized action {action!r}")
 
-    async def _dispatch_scheduler(
+    async def _dispatch_scheduler(  # noqa: PLR0911  flat command dispatch
         self,
         action: str,
         target: dict[str, Any],
-        parameters: dict[str, Any],  # noqa: ARG002
+        parameters: dict[str, Any],
     ) -> CommandResult:
         scheduler_name = target.get("scheduler") or self._single_scheduler_name()
         adapter = self.schedulers.get(scheduler_name) if scheduler_name else None
@@ -769,7 +756,8 @@ class CommandDispatcher:
         self.buffer.append("command_result", serialize_frame(frame))
 
     async def _self_exit_restart(
-        self, parameters: dict[str, Any],
+        self,
+        parameters: dict[str, Any],
     ) -> CommandResult:
         """Graceful self-exit polyfill for ``restart_worker``.
 
@@ -801,11 +789,7 @@ class CommandDispatcher:
             EventBatchPayload,
         )
 
-        worker_name = (
-            parameters.get("worker_name")
-            or parameters.get("worker_id")
-            or "self"
-        )
+        worker_name = parameters.get("worker_name") or parameters.get("worker_id") or "self"
 
         # Orchestration preflight. Refuses when no filesystem-
         # anchored supervisor signal is present - prevents an
@@ -815,8 +799,8 @@ class CommandDispatcher:
         detection = detect_orchestrator()
         if not detection.detected:
             logger.warning(
-                "z4j: restart_worker refused - no supervisor detected "
-                "(worker=%s)", worker_name,
+                "z4j: restart_worker refused - no supervisor detected (worker=%s)",
+                worker_name,
             )
             return CommandResult(
                 status="failed",
@@ -850,7 +834,11 @@ class CommandDispatcher:
         # Best-effort lifecycle event into the buffer.
         try:
             event_frame = EventBatchFrame(
-                id=f"ev_{_secrets.token_hex(6)}",
+                # 128-bit id: event_batch ids key the agent's _pending_acks
+                # map, so a 48-bit (token_hex(6)) collision could let a real
+                # ack for one entry confirm-and-delete a different, unstored
+                # entry (R8-M5). 35 chars, within the 64-char id cap.
+                id=f"ev_{_secrets.token_hex(16)}",
                 ts=datetime.now(UTC),
                 payload=EventBatchPayload(
                     events=[
@@ -869,7 +857,7 @@ class CommandDispatcher:
                 ),
             )
             self.buffer.append("event_batch", serialize_frame(event_frame))
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "z4j: restart self-exit event emit failed; exiting anyway",
             )
@@ -885,7 +873,8 @@ class CommandDispatcher:
             loop.call_later(delay, os._exit, 0)
             logger.info(
                 "z4j: self-exit scheduled in %.2fs (worker=%s)",
-                delay, worker_name,
+                delay,
+                worker_name,
             )
         except RuntimeError:
             # No running loop - exit immediately. The host should be

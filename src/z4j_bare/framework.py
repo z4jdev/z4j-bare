@@ -63,7 +63,7 @@ class BareFrameworkAdapter:
     def on_shutdown(self, hook: Callable[[], None]) -> None:
         self._shutdown_hooks.append(hook)
 
-    def register_admin_view(self, view: Any) -> None:  # noqa: ARG002
+    def register_admin_view(self, view: Any) -> None:
         # No admin surface for bare Python. Intentional no-op.
         return None
 

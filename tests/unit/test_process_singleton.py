@@ -19,7 +19,6 @@ import threading
 from unittest.mock import MagicMock
 
 import pytest
-
 from z4j_bare import _process_singleton
 
 
@@ -45,15 +44,14 @@ class TestBasicRegistration:
         _process_singleton.try_register(first, owner="alpha")
         active = _process_singleton.try_register(second, owner="beta")
         assert active is first, "second caller must get the first runtime"
-        assert active is not second, (
-            "the second runtime must be discarded by the caller"
-        )
+        assert active is not second, "the second runtime must be discarded by the caller"
         assert _process_singleton.current_owner() == "alpha", (
             "owner label must track the winner, not the loser"
         )
 
     def test_skip_is_logged_with_both_owners(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         first = MagicMock(name="first-runtime")
         second = MagicMock(name="second-runtime")
@@ -100,24 +98,20 @@ class TestThreadSafety:
             candidate = MagicMock(name=f"runtime-{i}")
             barrier.wait()
             active = _process_singleton.try_register(
-                candidate, owner=f"worker-{i}",
+                candidate,
+                owner=f"worker-{i}",
             )
             results.append((i, active))
             if active is candidate:
                 winners.append(candidate)
 
-        threads = [
-            threading.Thread(target=worker, args=(i,))
-            for i in range(num_threads)
-        ]
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        assert len(winners) == 1, (
-            f"exactly one thread must win the race, got {len(winners)}"
-        )
+        assert len(winners) == 1, f"exactly one thread must win the race, got {len(winners)}"
         winner = winners[0]
         # Every losing thread must have received the winner back.
         for _, active in results:

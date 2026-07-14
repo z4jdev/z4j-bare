@@ -72,13 +72,13 @@ class TasksFileWatcher:
     """
 
     __slots__ = (
-        "_paths",
-        "_filenames",
-        "_on_change",
         "_debounce_ms",
+        "_filenames",
         "_observer",
-        "_pending_lock",
+        "_on_change",
+        "_paths",
         "_pending",
+        "_pending_lock",
         "_running",
     )
 
@@ -139,7 +139,9 @@ class TasksFileWatcher:
                 if getattr(event, "is_directory", False):
                     return
                 dest = getattr(event, "dest_path", None) or getattr(
-                    event, "src_path", None,
+                    event,
+                    "src_path",
+                    None,
                 )
                 if not dest:
                     return
@@ -149,14 +151,15 @@ class TasksFileWatcher:
         for path in existing:
             try:
                 observer.schedule(_Handler(), str(path), recursive=True)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
-                    "z4j watcher: failed to schedule path %s", path,
+                    "z4j watcher: failed to schedule path %s",
+                    path,
                 )
         try:
             observer.daemon = True
             observer.start()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("z4j watcher: observer.start() failed")
             return False
 
@@ -191,7 +194,7 @@ class TasksFileWatcher:
         try:
             observer.stop()
             observer.join(timeout=2.0)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("z4j watcher: stop failed")
 
     # ------------------------------------------------------------------

@@ -12,14 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
+from z4j_bare.buffer import BufferStore
+from z4j_bare.dispatcher import CommandDispatcher
 from z4j_core.models import (
     CommandResult,
     DiscoveryHints,
     Event,
     Queue,
     Schedule,
-    ScheduleKind,
     Task,
     TaskDefinition,
     TaskRegistryDelta,
@@ -28,11 +28,7 @@ from z4j_core.models import (
 from z4j_core.transport.frames import (
     CommandFrame,
     CommandPayload,
-    parse_frame,
 )
-
-from z4j_bare.buffer import BufferStore
-from z4j_bare.dispatcher import CommandDispatcher
 
 
 class FakeEngine:
@@ -58,7 +54,8 @@ class FakeEngine:
         }
 
     async def discover_tasks(
-        self, hints: DiscoveryHints | None = None,  # noqa: ARG002
+        self,
+        hints: DiscoveryHints | None = None,
     ) -> list[TaskDefinition]:
         return []
 
@@ -76,7 +73,7 @@ class FakeEngine:
     async def list_workers(self) -> list[Worker]:
         return []
 
-    async def get_task(self, task_id: str) -> Task | None:  # noqa: ARG002
+    async def get_task(self, task_id: str) -> Task | None:
         return None
 
     async def retry_task(
@@ -86,7 +83,7 @@ class FakeEngine:
         override_args: tuple | None = None,
         override_kwargs: dict | None = None,
         eta: float | None = None,
-        priority: object = None,  # noqa: ARG002
+        priority: object = None,
     ) -> CommandResult:
         # ``priority`` is accepted but not asserted on by this
         # fake - the real preservation contract is exercised by
@@ -101,7 +98,7 @@ class FakeEngine:
         self.cancel_calls.append(task_id)
         return CommandResult(status="success")
 
-    async def bulk_retry(self, filter: dict, *, max: int = 1000) -> CommandResult:
+    async def bulk_retry(self, filter: dict, *, max: int = 1000) -> CommandResult:  # noqa: A002  mirrors QueueEngineAdapter.bulk_retry signature
         self.bulk_calls.append((filter, max))
         return CommandResult(status="success", result={"retried": 42})
 
@@ -139,13 +136,13 @@ class FakeScheduler:
     async def list_schedules(self) -> list[Schedule]:
         return []
 
-    async def get_schedule(self, schedule_id: str) -> Schedule | None:  # noqa: ARG002
+    async def get_schedule(self, schedule_id: str) -> Schedule | None:
         return None
 
     async def create_schedule(self, spec: Schedule) -> Schedule:
         return spec
 
-    async def update_schedule(self, schedule_id: str, spec: Schedule) -> Schedule:  # noqa: ARG002
+    async def update_schedule(self, schedule_id: str, spec: Schedule) -> Schedule:
         return spec
 
     async def delete_schedule(self, schedule_id: str) -> CommandResult:
@@ -231,7 +228,10 @@ def _decode_frame(raw: bytes) -> dict[str, Any]:
 
 class TestAck:
     async def test_ack_is_queued_before_execute(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
+        buf: BufferStore,
     ) -> None:
         cmd = _make_command(
             action="retry_task",
@@ -250,7 +250,10 @@ class TestAck:
 
 class TestRetryTask:
     async def test_retry_happy_path(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
+        buf: BufferStore,
     ) -> None:
         cmd = _make_command(
             action="retry_task",
@@ -265,7 +268,9 @@ class TestRetryTask:
         assert parsed["payload"]["result"] == {"new_task_id": "new-xyz"}
 
     async def test_retry_with_overrides(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         cmd = _make_command(
             action="retry_task",
@@ -279,18 +284,22 @@ class TestRetryTask:
         assert kwargs == {"k": "v"}
 
     async def test_retry_missing_task_id(
-        self, dispatcher: CommandDispatcher, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        buf: BufferStore,
     ) -> None:
         cmd = _make_command(action="retry_task", target={"engine": "fake"})
         await dispatcher.handle(cmd)
         entries = buf.drain(10)
-        result = [e for e in entries if e.kind == "command_result"][0]
+        result = next(e for e in entries if e.kind == "command_result")
         parsed = _decode_frame(result.payload)
         assert parsed["payload"]["status"] == "failed"
         assert "task_id" in (parsed["payload"]["error"] or "")
 
     async def test_single_engine_default_engine(
-        self, buf: BufferStore, engine: FakeEngine,
+        self,
+        buf: BufferStore,
+        engine: FakeEngine,
     ) -> None:
         dispatcher = CommandDispatcher(
             engines={"fake": engine},
@@ -302,7 +311,9 @@ class TestRetryTask:
         assert engine.retry_calls == [("abc", None, None, None)]
 
     async def test_retry_threads_brain_snapshot_args_kwargs_as_overrides(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         """R7 H-2: when the operator did NOT supply ``override_args`` /
         ``override_kwargs``, the dispatcher MUST forward the brain's
@@ -331,7 +342,9 @@ class TestRetryTask:
         assert kwargs == {"flag": True}
 
     async def test_retry_operator_override_beats_brain_snapshot(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         """When BOTH the operator's overrides AND the brain's snapshot
         are present, the operator wins - that's the whole point of the
@@ -352,7 +365,9 @@ class TestRetryTask:
         assert kwargs == {"operator": True}
 
     async def test_retry_snapshot_kwargs_only_args_missing(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         """Mixed shape: brain only forwarded kwargs (the original task
         had no positional args). Snapshot kwargs still thread through
@@ -370,7 +385,9 @@ class TestRetryTask:
 
 class TestCancelAndOthers:
     async def test_cancel(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         cmd = _make_command(
             action="cancel_task",
@@ -380,7 +397,9 @@ class TestCancelAndOthers:
         assert engine.cancel_calls == ["abc"]
 
     async def test_reconcile_task_calls_adapter_method(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
         buf: BufferStore,
     ) -> None:
         # Patch reconcile_task onto the fake engine for this test -
@@ -412,7 +431,9 @@ class TestCancelAndOthers:
         assert parsed["payload"]["result"]["task_id"] == "stuck-1"
 
     async def test_reconcile_task_missing_method_returns_unknown(
-        self, dispatcher: CommandDispatcher, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        buf: BufferStore,
     ) -> None:
         # FakeEngine doesn't ship with reconcile_task - the dispatcher
         # should detect the absence and return engine_state="unknown"
@@ -429,7 +450,9 @@ class TestCancelAndOthers:
         assert parsed["payload"]["result"]["engine_state"] == "unknown"
 
     async def test_submit_task_routes_to_adapter(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
         buf: BufferStore,
     ) -> None:
         # Add submit_task to FakeEngine for this test (the universal
@@ -437,8 +460,7 @@ class TestCancelAndOthers:
         engine._capabilities.add("submit_task")
         engine.submit_calls: list[tuple] = []  # type: ignore[attr-defined]
 
-        async def fake_submit(name, *, args=(), kwargs=None, queue=None,
-                              eta=None, priority=None):
+        async def fake_submit(name, *, args=(), kwargs=None, queue=None, eta=None, priority=None):
             engine.submit_calls.append((name, args, kwargs, queue))  # type: ignore[attr-defined]
             return CommandResult(
                 status="success",
@@ -467,7 +489,9 @@ class TestCancelAndOthers:
         assert parsed["payload"]["result"]["task_id"] == "new-myapp.send_email"
 
     async def test_restart_worker_native_path_when_capability_present(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         # FakeEngine already advertises restart_worker → the native
         # adapter method runs (no self-exit polyfill).
@@ -479,8 +503,11 @@ class TestCancelAndOthers:
         assert engine.restart_calls == ["celery@hostA"]
 
     async def test_restart_worker_refused_without_supervisor(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
-        buf: BufferStore, monkeypatch,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
+        buf: BufferStore,
+        monkeypatch,
     ) -> None:
         # Strip native restart + force "no orchestrator detected".
         engine._capabilities.discard("restart_worker")
@@ -502,8 +529,11 @@ class TestCancelAndOthers:
         assert not any(e.kind == "event_batch" for e in entries)
 
     async def test_restart_worker_self_exit_polyfill(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
-        buf: BufferStore, monkeypatch,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
+        buf: BufferStore,
+        monkeypatch,
     ) -> None:
         # Strip restart_worker from caps to simulate huey/arq/etc.
         engine._capabilities.discard("restart_worker")
@@ -515,7 +545,8 @@ class TestCancelAndOthers:
         from z4j_bare.orchestrator_detect import OrchestratorDetection
 
         monkeypatch.setattr(
-            _dispatcher_mod, "detect_orchestrator",
+            _dispatcher_mod,
+            "detect_orchestrator",
             lambda: OrchestratorDetection(True, "test-injected"),
         )
         # Bypass the flap guard by backdating the process start.
@@ -524,9 +555,12 @@ class TestCancelAndOthers:
         # Replace os._exit so the test process survives.
         exit_calls: list[int] = []
         import os as _os
-        monkeypatch.setattr(_os, "_exit", lambda code: exit_calls.append(code))
+
+        monkeypatch.setattr(_os, "_exit", exit_calls.append)
         monkeypatch.setattr(
-            CommandDispatcher, "_RESTART_EXIT_DELAY", 0.0,
+            CommandDispatcher,
+            "_RESTART_EXIT_DELAY",
+            0.0,
         )
 
         cmd = _make_command(
@@ -538,6 +572,7 @@ class TestCancelAndOthers:
 
         # Let the call_later(0, os._exit, 0) callback fire.
         import asyncio as _aio
+
         await _aio.sleep(0)
         await _aio.sleep(0)
 
@@ -560,7 +595,9 @@ class TestCancelAndOthers:
         assert exit_calls == [0]
 
     async def test_retry_polyfills_to_submit_task_when_no_native(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
         buf: BufferStore,
     ) -> None:
         # Strip retry_task from caps + add submit_task to simulate a
@@ -569,8 +606,7 @@ class TestCancelAndOthers:
         engine._capabilities.add("submit_task")
         engine.submit_calls: list[tuple] = []  # type: ignore[attr-defined]
 
-        async def fake_submit(name, *, args=(), kwargs=None, queue=None,
-                              eta=None, priority=None):
+        async def fake_submit(name, *, args=(), kwargs=None, queue=None, eta=None, priority=None):
             engine.submit_calls.append((name, args, kwargs))  # type: ignore[attr-defined]
             return CommandResult(
                 status="success",
@@ -601,7 +637,9 @@ class TestCancelAndOthers:
         assert parsed["payload"]["result"]["task_id"] == "polyfill-id"
 
     async def test_bulk_retry(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         cmd = _make_command(
             action="bulk_retry",
@@ -612,7 +650,9 @@ class TestCancelAndOthers:
         assert engine.bulk_calls == [({"state": "failure"}, 500)]
 
     async def test_bulk_retry_forwards_per_task_overrides_in_filter(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         """R7 H-2: per-task overrides ride inside ``filter["overrides"]``
         (a {task_id: {args, kwargs}} map populated by the brain). The
@@ -645,7 +685,8 @@ class TestCancelAndOthers:
         assert forwarded_filter["task_ids"] == ["j1", "j2"]
 
     async def test_bulk_retry_batch_wide_override_fallback_on_old_adapter(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         """The dispatcher forwards batch-wide ``override_args`` /
         ``override_kwargs`` to ``adapter.bulk_retry`` when the brain
@@ -656,7 +697,10 @@ class TestCancelAndOthers:
 
         class OldBulkEngine(FakeEngine):
             async def bulk_retry(
-                self, filter: dict, *, max: int = 1000,  # noqa: A002
+                self,
+                filter: dict,  # noqa: A002  mirrors QueueEngineAdapter.bulk_retry signature
+                *,
+                max: int = 1000,  # noqa: A002
             ) -> CommandResult:
                 # No override_args / override_kwargs kwargs - old shape.
                 self.bulk_calls.append((filter, max))
@@ -664,7 +708,9 @@ class TestCancelAndOthers:
 
         old_engine = OldBulkEngine()
         d = CommandDispatcher(
-            engines={"fake": old_engine}, schedulers={}, buffer=buf,
+            engines={"fake": old_engine},
+            schedulers={},
+            buffer=buf,
         )
         cmd = _make_command(
             action="bulk_retry",
@@ -681,14 +727,14 @@ class TestCancelAndOthers:
         assert old_engine.bulk_calls == [({"task_ids": ["j1"]}, 10)]
         # And the result frame reports success, not a 'unexpected
         # keyword' crash.
-        result_frames = [
-            e for e in buf.drain(10) if e.kind == "command_result"
-        ]
+        result_frames = [e for e in buf.drain(10) if e.kind == "command_result"]
         parsed = _decode_frame(result_frames[0].payload)
         assert parsed["payload"]["status"] == "success"
 
     async def test_purge_queue(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         cmd = _make_command(
             action="purge_queue",
@@ -698,7 +744,9 @@ class TestCancelAndOthers:
         assert engine.purge_calls == ["emails"]
 
     async def test_requeue_dead_letter(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         cmd = _make_command(
             action="requeue_dead_letter",
@@ -710,7 +758,8 @@ class TestCancelAndOthers:
         assert engine.dlq_calls == ["abc"]
 
     async def test_requeue_dead_letter_threads_overrides_to_new_adapter(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         """R7 H-2 (DLQ fallback): when an adapter advertises the H-2
         overload (override_args / override_kwargs kwargs) the dispatcher
@@ -738,7 +787,9 @@ class TestCancelAndOthers:
 
         new_engine = NewDLQEngine()
         d = CommandDispatcher(
-            engines={"fake": new_engine}, schedulers={}, buffer=buf,
+            engines={"fake": new_engine},
+            schedulers={},
+            buffer=buf,
         )
         cmd = _make_command(
             action="requeue_dead_letter",
@@ -754,7 +805,9 @@ class TestCancelAndOthers:
         ]
 
     async def test_restart_worker(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         cmd = _make_command(
             action="restart_worker",
@@ -766,7 +819,9 @@ class TestCancelAndOthers:
 
 class TestUnknownEngine:
     async def test_unknown_engine_fails_cleanly(
-        self, dispatcher: CommandDispatcher, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        buf: BufferStore,
     ) -> None:
         cmd = _make_command(
             action="retry_task",
@@ -781,7 +836,9 @@ class TestUnknownEngine:
 
 class TestScheduleActions:
     async def test_enable_schedule(
-        self, dispatcher: CommandDispatcher, scheduler: FakeScheduler,
+        self,
+        dispatcher: CommandDispatcher,
+        scheduler: FakeScheduler,
     ) -> None:
         cmd = _make_command(
             action="schedule.enable",
@@ -791,7 +848,9 @@ class TestScheduleActions:
         assert scheduler.enable_calls == ["sched-1"]
 
     async def test_disable_schedule(
-        self, dispatcher: CommandDispatcher, scheduler: FakeScheduler,
+        self,
+        dispatcher: CommandDispatcher,
+        scheduler: FakeScheduler,
     ) -> None:
         cmd = _make_command(
             action="schedule.disable",
@@ -801,7 +860,9 @@ class TestScheduleActions:
         assert scheduler.disable_calls == ["sched-1"]
 
     async def test_trigger_now(
-        self, dispatcher: CommandDispatcher, scheduler: FakeScheduler,
+        self,
+        dispatcher: CommandDispatcher,
+        scheduler: FakeScheduler,
     ) -> None:
         cmd = _make_command(
             action="schedule.trigger_now",
@@ -811,7 +872,9 @@ class TestScheduleActions:
         assert scheduler.trigger_calls == ["sched-1"]
 
     async def test_delete_schedule(
-        self, dispatcher: CommandDispatcher, scheduler: FakeScheduler,
+        self,
+        dispatcher: CommandDispatcher,
+        scheduler: FakeScheduler,
     ) -> None:
         cmd = _make_command(
             action="schedule.delete",
@@ -821,7 +884,9 @@ class TestScheduleActions:
         assert scheduler.delete_calls == ["sched-1"]
 
     async def test_missing_schedule_id_fails(
-        self, dispatcher: CommandDispatcher, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        buf: BufferStore,
     ) -> None:
         cmd = _make_command(
             action="schedule.enable",
@@ -844,7 +909,10 @@ class TestScheduleResync:
     """
 
     async def test_resync_invokes_callback_and_reports_count(
-        self, buf: BufferStore, engine: FakeEngine, scheduler: FakeScheduler,
+        self,
+        buf: BufferStore,
+        engine: FakeEngine,
+        scheduler: FakeScheduler,
     ) -> None:
         calls: list[str] = []
 
@@ -869,7 +937,10 @@ class TestScheduleResync:
         assert parsed["payload"]["result"] == {"schedulers_drained": 2}
 
     async def test_resync_without_callback_fails_with_clear_message(
-        self, buf: BufferStore, engine: FakeEngine, scheduler: FakeScheduler,
+        self,
+        buf: BufferStore,
+        engine: FakeEngine,
+        scheduler: FakeScheduler,
     ) -> None:
         """A dispatcher built without ``resync_schedules`` (e.g. an
         old runtime, a hand-built one in tests, or a future op
@@ -891,7 +962,10 @@ class TestScheduleResync:
         assert "1.3.1" in parsed["payload"]["error"]
 
     async def test_resync_callback_exception_becomes_failed_result(
-        self, buf: BufferStore, engine: FakeEngine, scheduler: FakeScheduler,
+        self,
+        buf: BufferStore,
+        engine: FakeEngine,
+        scheduler: FakeScheduler,
     ) -> None:
         async def boom(reason: str) -> int:
             raise RuntimeError("boom")
@@ -914,7 +988,9 @@ class TestScheduleResync:
 
 class TestUnrecognizedAction:
     async def test_unknown_action_fails_cleanly(
-        self, dispatcher: CommandDispatcher, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        buf: BufferStore,
     ) -> None:
         cmd = _make_command(
             action="do_magic",
@@ -942,13 +1018,14 @@ class TestScheduleFire:
     """
 
     async def test_schedule_fire_routes_to_engine_submit_task(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
         buf: BufferStore,
     ) -> None:
         engine.submit_calls: list[tuple] = []  # type: ignore[attr-defined]
 
-        async def fake_submit(name, *, args=(), kwargs=None, queue=None,
-                              eta=None, priority=None):  # noqa: ARG001
+        async def fake_submit(name, *, args=(), kwargs=None, queue=None, eta=None, priority=None):
             engine.submit_calls.append((name, args, kwargs, queue))  # type: ignore[attr-defined]
             return CommandResult(
                 status="success",
@@ -981,13 +1058,14 @@ class TestScheduleFire:
         assert parsed["payload"]["status"] == "success"
 
     async def test_schedule_fire_works_without_scheduler_adapter(
-        self, buf: BufferStore, engine: FakeEngine,
+        self,
+        buf: BufferStore,
+        engine: FakeEngine,
     ) -> None:
         """Celery worker agent has zero SchedulerAdapters, must still fire."""
         engine.submit_called = False  # type: ignore[attr-defined]
 
-        async def fake_submit(name, *, args=(), kwargs=None,  # noqa: ARG001
-                              queue=None, eta=None, priority=None):
+        async def fake_submit(name, *, args=(), kwargs=None, queue=None, eta=None, priority=None):
             engine.submit_called = True  # type: ignore[attr-defined]
             return CommandResult(status="success", result={"task_id": "ok"})
 
@@ -1018,14 +1096,15 @@ class TestScheduleFire:
         assert parsed["payload"]["status"] == "success"
 
     async def test_schedule_fire_falls_back_to_sole_engine(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
         buf: BufferStore,
     ) -> None:
         """If payload omits ``engine``, dispatch to the only registered one."""
         engine.submit_called = False  # type: ignore[attr-defined]
 
-        async def fake_submit(name, *, args=(), kwargs=None,  # noqa: ARG001
-                              queue=None, eta=None, priority=None):
+        async def fake_submit(name, *, args=(), kwargs=None, queue=None, eta=None, priority=None):
             engine.submit_called = True  # type: ignore[attr-defined]
             return CommandResult(status="success", result={"task_id": "ok"})
 
@@ -1040,7 +1119,9 @@ class TestScheduleFire:
         assert engine.submit_called is True  # type: ignore[attr-defined]
 
     async def test_schedule_fire_missing_task_name_fails_cleanly(
-        self, dispatcher: CommandDispatcher, buf: BufferStore,
+        self,
+        dispatcher: CommandDispatcher,
+        buf: BufferStore,
     ) -> None:
         cmd = _make_command(
             action="schedule.fire",
@@ -1056,7 +1137,8 @@ class TestScheduleFire:
 
 class TestCapabilityGating:
     async def test_action_rejected_if_not_in_capabilities(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         class LimitedEngine(FakeEngine):
             def capabilities(self) -> set[str]:
@@ -1106,7 +1188,7 @@ class FakeEngineWithTaskName(FakeEngine):
         override_args: tuple | None = None,
         override_kwargs: dict | None = None,
         eta: float | None = None,
-        priority: object = None,  # noqa: ARG002
+        priority: object = None,
     ) -> CommandResult:
         self.retry_calls.append((task_id, override_args, override_kwargs, eta))
         self.task_name_calls.append(task_name)
@@ -1144,12 +1226,10 @@ class FakeHueyEngine(FakeEngine):
         override_args: tuple | None = None,
         override_kwargs: dict | None = None,
         eta: float | None = None,
-        priority: object = None,  # noqa: ARG002
+        priority: object = None,
     ) -> CommandResult:
         self.retry_calls.append((task_id, override_args, override_kwargs, eta))
-        self.last_override_kwargs = (
-            dict(override_kwargs) if override_kwargs is not None else None
-        )
+        self.last_override_kwargs = dict(override_kwargs) if override_kwargs is not None else None
         return CommandResult(status="success", result={"new_task_id": f"new-{task_id}"})
 
 
@@ -1158,7 +1238,8 @@ class TestR8H1TaskNameThreadThrough:
     adapter signature accepts it (post-1.6.7 z4j-rq shape)."""
 
     async def test_retry_task_threads_task_name_to_modern_adapter(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         engine = FakeEngineWithTaskName()
         dispatcher = CommandDispatcher(
@@ -1179,7 +1260,9 @@ class TestR8H1TaskNameThreadThrough:
         assert engine.task_name_calls == ["myapp.tasks.send_email"]
 
     async def test_retry_task_falls_back_for_legacy_adapter(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         """FakeEngine doesn't accept task_name= kwarg. The dispatcher
         catches the TypeError and falls back to the legacy signature
@@ -1202,7 +1285,8 @@ class TestR8H1TaskNameThreadThrough:
         assert "legacy-1" in task_ids
 
     async def test_dlq_threads_task_name_to_modern_adapter(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         engine = FakeEngineWithTaskName()
         dispatcher = CommandDispatcher(
@@ -1228,7 +1312,8 @@ class TestR8L1HueyInjection:
     for adapters with name == 'huey'. R8 L-1 regression."""
 
     async def test_huey_retry_receives_magic_key_in_override_kwargs(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         engine = FakeHueyEngine()
         dispatcher = CommandDispatcher(
@@ -1248,14 +1333,13 @@ class TestR8L1HueyInjection:
         await dispatcher.handle(cmd)
         assert engine.last_override_kwargs is not None
         # Magic key landed at the path the Huey engine pops from.
-        assert engine.last_override_kwargs.get("__z4j_task_name__") == (
-            "myapp.tasks.send_sms"
-        )
+        assert engine.last_override_kwargs.get("__z4j_task_name__") == ("myapp.tasks.send_sms")
         # Existing operator-supplied kwarg preserved.
         assert engine.last_override_kwargs.get("existing") == "value"
 
     async def test_huey_retry_brain_name_overrides_operator_supplied_magic_key_r9_l1(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         """R9-L1 regression: brain-derived task_name MUST win over an
         operator-supplied ``__z4j_task_name__`` in override_kwargs.
@@ -1288,16 +1372,16 @@ class TestR8L1HueyInjection:
         # silently replaced (not echoed back to the audit trail at
         # this layer; the brain audit log records the operator's
         # retry click separately).
-        assert engine.last_override_kwargs["__z4j_task_name__"] == (
-            "myapp.brain.choice"
-        ), (
+        assert engine.last_override_kwargs["__z4j_task_name__"] == ("myapp.brain.choice"), (
             "R9-L1 regression: dispatcher reverted to setdefault, "
             "letting operator-supplied __z4j_task_name__ slip through "
             "to Huey's registry lookup. Must be direct assignment."
         )
 
     async def test_non_huey_adapter_does_not_get_magic_key_injection(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         """The injection is Huey-specific. Other adapters must NOT
         receive an unexpected __z4j_task_name__ key in their
@@ -1345,7 +1429,7 @@ class FakeLegacyRqEngine(FakeEngine):
         override_args: tuple | None = None,
         override_kwargs: dict | None = None,
         eta: float | None = None,
-        priority: object = None,  # noqa: ARG002
+        priority: object = None,
     ) -> CommandResult:
         # Legacy signature: no task_name kwarg. The dispatcher's
         # try/except on TypeError engages when the new shape is
@@ -1367,7 +1451,8 @@ class TestR9H2RqFailClosed:
     rather than fall back to a signature that re-opens R8-H1."""
 
     async def test_retry_against_legacy_rq_fails_closed_r9_h2(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         engine = FakeLegacyRqEngine()
         dispatcher = CommandDispatcher(
@@ -1409,7 +1494,8 @@ class TestR9H2RqFailClosed:
         )
 
     async def test_dlq_against_legacy_rq_fails_closed_r9_h2(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         engine = FakeLegacyRqEngine()
         dispatcher = CommandDispatcher(
@@ -1445,7 +1531,8 @@ class TestR9H2RqFailClosed:
         )
 
     async def test_retry_against_modern_rq_still_succeeds(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         """Sanity: the R9-H2 fail-closed posture is RQ-specific to
         legacy adapters. A modern z4j-rq 1.6.7+ that accepts task_name
@@ -1475,7 +1562,9 @@ class TestR9H2RqFailClosed:
         )
 
     async def test_retry_against_legacy_non_rq_still_falls_back(
-        self, dispatcher: CommandDispatcher, engine: FakeEngine,
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
     ) -> None:
         """Sanity: the fail-closed posture is RQ-ONLY. Other legacy
         adapters (celery, dramatiq, huey, arq, taskiq) keep the

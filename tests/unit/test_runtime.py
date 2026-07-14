@@ -8,7 +8,6 @@ or websocket connection.
 
 from __future__ import annotations
 
-import asyncio
 import secrets
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,11 +15,9 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr
-
+from z4j_bare.runtime import AgentRuntime, _first
 from z4j_core.errors import AuthenticationError, ProtocolError
 from z4j_core.models import Config
-
-from z4j_bare.runtime import AgentRuntime, _first
 
 
 class FakeFramework:
@@ -50,7 +47,7 @@ class FakeEngine:
     def capabilities(self) -> set[str]:
         return {"retry", "cancel"}
 
-    async def discover_tasks(self, hints: Any = None) -> list[Any]:  # noqa: ARG002
+    async def discover_tasks(self, hints: Any = None) -> list[Any]:
         return []
 
     async def subscribe_registry_changes(self) -> Iterator[Any]:
@@ -108,7 +105,8 @@ def _make_config(
 
 class TestStartGuards:
     def test_refuses_to_start_without_hmac_in_production(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         config = _make_config(tmp_path=tmp_path, dev_mode=False, hmac_secret=None)
         runtime = AgentRuntime(

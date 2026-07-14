@@ -65,8 +65,8 @@ class Heartbeat:
         buffer: BufferStore,
         stop_event: asyncio.Event,
         interval: float = 10.0,
-        health_provider: "Callable[[], dict[str, str]] | None" = None,
-        status_provider: "Callable[[], dict[str, Any]] | None" = None,
+        health_provider: Callable[[], dict[str, str]] | None = None,
+        status_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.buffer = buffer
         self.stop_event = stop_event
@@ -187,7 +187,10 @@ class Heartbeat:
         agents that ship hundreds per host).
         """
         if os.environ.get("Z4J_AGENT_STATUS_DISABLED", "").lower() in (
-            "1", "true", "yes", "on",
+            "1",
+            "true",
+            "yes",
+            "on",
         ):
             return
         if self.stop_event.is_set():
@@ -214,7 +217,7 @@ class Heartbeat:
             return
         try:
             payload = AgentStatusPayload(**status)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("z4j agent: status provider returned invalid shape")
             return
         frame = AgentStatusFrame(
@@ -229,7 +232,7 @@ class Heartbeat:
 
     async def _safe_provider_call(
         self,
-        provider: "Callable[[], dict[str, Any]]",
+        provider: Callable[[], dict[str, Any]],
         *,
         provider_name: str,
     ) -> dict[str, Any]:
@@ -291,10 +294,9 @@ class Heartbeat:
                 asyncio.to_thread(provider),
                 timeout=_PROVIDER_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
-                "z4j agent: %s provider timed out after %.1fs; "
-                "shipping synthetic error blob",
+                "z4j agent: %s provider timed out after %.1fs; shipping synthetic error blob",
                 provider_name,
                 _PROVIDER_TIMEOUT_SECONDS,
             )
@@ -335,7 +337,7 @@ class Heartbeat:
                 provider_name,
             )
             return {"error": "provider raised"}
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "z4j agent: %s provider raised; shipping synthetic error blob",
                 provider_name,
@@ -345,11 +347,13 @@ class Heartbeat:
     @staticmethod
     def _new_id() -> str:
         import secrets as _secrets
+
         return f"hb_{_secrets.token_hex(6)}"
 
     @staticmethod
     def _new_status_id() -> str:
         import secrets as _secrets
+
         return f"as_{_secrets.token_hex(6)}"
 
 

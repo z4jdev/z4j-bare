@@ -24,10 +24,8 @@ import sys
 import threading
 
 import pytest
-
 from z4j_bare.control import register_shutdown_atexit
 from z4j_bare.runtime import _drain_default_executor, _heartbeat_enabled
-
 
 # ---------------------------------------------------------------------------
 # §4: register_shutdown_atexit uses the threading._register_atexit phase
@@ -51,7 +49,8 @@ class TestRegisterShutdownAtexit:
         )
 
     def test_falls_back_to_atexit_if_private_api_missing(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ) -> None:
         """If a future Python removes threading._register_atexit, the
         helper must still register the callback (via plain atexit) so
@@ -61,12 +60,14 @@ class TestRegisterShutdownAtexit:
         assert mechanism == "atexit"
 
     def test_falls_back_when_register_raises_runtimeerror(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ) -> None:
         """threading._register_atexit raises RuntimeError if called
         after interpreter shutdown has begun. The helper must catch it
         and fall back to plain atexit rather than propagating."""
-        def _boom(_cb):  # noqa: ANN001
+
+        def _boom(_cb):
             raise RuntimeError("can't register atexit after shutdown")
 
         monkeypatch.setattr(threading, "_register_atexit", _boom)
@@ -111,16 +112,17 @@ def test_register_atexit_phase_runs_before_executor_teardown() -> None:
     )
     out = subprocess.run(
         [sys.executable, "-c", prog],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
     )
     combined = out.stdout.strip()
     assert "register_atexit:OK" in combined, (
-        "threading._register_atexit phase should still reach a live "
-        f"executor; got: {combined!r}"
+        f"threading._register_atexit phase should still reach a live executor; got: {combined!r}"
     )
     assert "plain_atexit:FAIL" in combined, (
-        "plain atexit phase should hit the dead executor (this IS the "
-        f"z4j bug); got: {combined!r}"
+        f"plain atexit phase should hit the dead executor (this IS the z4j bug); got: {combined!r}"
     )
 
 
@@ -174,10 +176,10 @@ class TestDrainDefaultExecutor:
 
             loop.run_until_complete(_wedge())
 
-            t0 = threading.Event()
             elapsed = {}
 
             import time as _time
+
             start = _time.monotonic()
             _drain_default_executor(loop, deadline_s=0.5)
             elapsed["s"] = _time.monotonic() - start
@@ -206,11 +208,74 @@ class TestHeartbeatEnabledToggle:
     @pytest.mark.parametrize("off", ["0", "false", "no", "off", "OFF", "False", ""])
     def test_falsy_values_disable(self, monkeypatch, off: str) -> None:
         monkeypatch.setenv("Z4J_HEARTBEAT", off)
-        assert _heartbeat_enabled() is False, (
-            f"Z4J_HEARTBEAT={off!r} should disable the heartbeat"
-        )
+        assert _heartbeat_enabled() is False, f"Z4J_HEARTBEAT={off!r} should disable the heartbeat"
 
     @pytest.mark.parametrize("on", ["1", "true", "yes", "on", "anything"])
     def test_truthy_values_enable(self, monkeypatch, on: str) -> None:
         monkeypatch.setenv("Z4J_HEARTBEAT", on)
         assert _heartbeat_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# Bare-Python autostart wires the shutdown hook the framework adapters have.
+# Previously only z4j-django/flask/fastapi registered register_shutdown_atexit;
+# the bare autostart path (install_agent) did not, so bare users got no
+# ordered drain + buffer flush at interpreter exit.
+# ---------------------------------------------------------------------------
+
+
+class TestBareAutostartTeardownWiring:
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        import os
+
+        from z4j_bare._process_singleton import clear_runtime
+
+        for key in [k for k in os.environ if k.startswith("Z4J_")]:
+            monkeypatch.delenv(key, raising=False)
+        clear_runtime()
+        yield
+        clear_runtime()
+
+    def _install(self, monkeypatch, *, autostart):
+        import z4j_bare.control as control
+        from z4j_bare.install import install_agent
+        from z4j_bare.runtime import AgentRuntime
+
+        registered: list = []
+        started: list = []
+        monkeypatch.setattr(
+            AgentRuntime,
+            "start",
+            lambda self: started.append(self),  # noqa: PLW0108  lambda binds self; bare method ref would not receive the instance
+        )
+        monkeypatch.setattr(
+            control,
+            "register_shutdown_atexit",
+            lambda cb: (registered.append(cb), "threading")[1],
+        )
+
+        class _StubEngine:
+            name = "stub"
+
+            def capabilities(self) -> set[str]:
+                return set()
+
+        install_agent(
+            engines=[_StubEngine()],
+            brain_url="http://u",
+            token="t",
+            project_id="p",
+            autostart=autostart,
+        )
+        return registered, started
+
+    def test_autostart_registers_shutdown_hook(self, monkeypatch) -> None:
+        registered, started = self._install(monkeypatch, autostart=True)
+        assert len(started) == 1
+        assert len(registered) == 1
+
+    def test_no_autostart_registers_nothing(self, monkeypatch) -> None:
+        registered, started = self._install(monkeypatch, autostart=False)
+        assert started == []
+        assert registered == []

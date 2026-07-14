@@ -19,7 +19,6 @@ from urllib.parse import urlparse
 import websockets
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
-
 from z4j_core.errors import (
     AuthenticationError,
     InvalidFrameError,
@@ -37,7 +36,9 @@ from z4j_core.transport.frames import (
 )
 from z4j_core.transport.framing import FrameSigner, FrameVerifier
 from z4j_core.transport.versioning import CURRENT_PROTOCOL, check_compatibility
-from z4j_core.version import __version__ as CORE_VERSION
+from z4j_core.version import (
+    __version__ as CORE_VERSION,  # noqa: N812  conventional version constant alias
+)
 
 logger = logging.getLogger("z4j.transport.websocket")
 
@@ -68,7 +69,14 @@ class WebSocketTransport:
     ``logger.info(transport)`` cannot leak it.
     """
 
-    __slots__ = (
+    #: The WebSocket path has a real bidirectional ack channel: the
+    #: brain signs an ``event_batch_ack`` back over the open socket, so
+    #: the runtime defers buffer confirmation until that ack arrives.
+    #: (Contrast ``LongPollTransport.confirm_on_send``.) Class-level so
+    #: it does not consume a ``__slots__`` entry per instance.
+    confirm_on_send: bool = False
+
+    __slots__ = (  # noqa: RUF023  slot order irrelevant; comments group slots by protocol era
         "brain_url",
         "project_id",
         "framework_name",
@@ -78,6 +86,11 @@ class WebSocketTransport:
         "agent_version",
         "agent_name",
         "max_frame_size",
+        # Brain-advertised max outbound frame size (from hello_ack). A
+        # frame that signs larger than this is deterministically
+        # undeliverable (the brain closes the socket with 1009), so we
+        # drop it agent-side rather than resend-loop it forever.
+        "_outbound_max_frame_bytes",
         "_token",
         "_hmac_secret",
         "_ws",
@@ -121,7 +134,7 @@ class WebSocketTransport:
         worker_id: str | None = None,
         worker_role: str | None = None,
         worker_pid: int | None = None,
-        worker_started_at: "datetime | None" = None,
+        worker_started_at: datetime | None = None,
     ) -> None:
         if len(hmac_secret) < 32:
             raise ValueError(
@@ -138,6 +151,10 @@ class WebSocketTransport:
         self.agent_version = agent_version
         self.agent_name = agent_name
         self.max_frame_size = max_frame_size
+        # Set from the brain's hello_ack in connect(); until then, fall
+        # back to our own inbound cap so a pre-handshake caller (there
+        # are none: send_frames refuses before hello_ack) can't crash.
+        self._outbound_max_frame_bytes = max_frame_size
         self._dev_mode = dev_mode
         self.worker_id = worker_id
         self.worker_role = worker_role
@@ -168,9 +185,9 @@ class WebSocketTransport:
         """WebSocket URL derived from the brain base URL."""
         base = self.brain_url.rstrip("/")
         if base.startswith("https://"):
-            base = "wss://" + base[len("https://"):]
+            base = "wss://" + base[len("https://") :]
         elif base.startswith("http://"):
-            base = "ws://" + base[len("http://"):]
+            base = "ws://" + base[len("http://") :]
         return base + "/ws/agent"
 
     @property
@@ -183,7 +200,7 @@ class WebSocketTransport:
         """Current session id, or None if not connected."""
         return self._session_id
 
-    async def connect(self) -> None:
+    async def connect(self) -> None:  # noqa: PLR0912, PLR0915  handshake negotiation
         """Establish the WebSocket + negotiate the ``hello`` handshake.
 
         Raises:
@@ -251,7 +268,7 @@ class WebSocketTransport:
 
         try:
             # ping_interval=60, ping_timeout=60: under sustained
-            # 100 task/s × 10 agent fanout the application-message
+            # 100 task/s x 10 agent fanout the application-message
             # stream can starve the websockets-library internal PING
             # task on either side of the wire for 30+ seconds at a
             # time. The 60s windows tolerate ~2 minutes of cumulative
@@ -341,6 +358,14 @@ class WebSocketTransport:
 
         self._session_id = ack.payload.session_id
         self._heartbeat_interval = ack.payload.heartbeat_interval_seconds
+        # Adopt the brain's advertised outbound frame ceiling. A frame
+        # that signs larger than this is deterministically undeliverable
+        # (the brain's server closes the connection with 1009 "message
+        # too big"), so send_frames() drops it rather than resend it on
+        # every reconnect. Fall back to our own cap if the field is
+        # absent (older brain) or non-positive.
+        advertised_max = int(getattr(ack.payload, "max_frame_size_bytes", 0) or 0)
+        self._outbound_max_frame_bytes = advertised_max or self.max_frame_size
 
         # Phase G: bind identity into ContextVars so every log line
         # emitted from inside this session (transport, runtime,
@@ -353,6 +378,7 @@ class WebSocketTransport:
         # this task only, which is the correct semantic - dying
         # child tasks keep the snapshot they captured.
         from z4j_core.observability import bind as _bind
+
         self._log_context_tokens = _bind(
             agent_id=ack.payload.agent_id,
             session_id=ack.payload.session_id,
@@ -366,7 +392,9 @@ class WebSocketTransport:
         # so dev consoles stay quiet while the brain is unreachable
         # and produce one useful line the moment it comes up.
         logger.info(
-            "z4j agent connected to %s (session=%s)", url, self._session_id,
+            "z4j agent connected to %s (session=%s)",
+            url,
+            self._session_id,
         )
 
         # Protocol v2: every stateful frame carries an envelope HMAC
@@ -419,6 +447,7 @@ class WebSocketTransport:
         # call even if connect() never ran - tokens is None in that case.
         if self._log_context_tokens is not None:
             from z4j_core.observability import clear as _clear
+
             _clear(self._log_context_tokens)  # type: ignore[arg-type]
             self._log_context_tokens = None
         await self._close_ws()
@@ -451,11 +480,15 @@ class WebSocketTransport:
         silently re-send bytes we never authenticated.
 
         On partial failure (some frames sent, then a ``ConnectionClosed``
-        mid-batch) we raise :class:`PartialSendError` carrying the
-        list of indices that *did* make it. The caller is responsible
-        for confirming those before retrying the rest, otherwise the
-        already-sent frames would be re-sent on reconnect and the
-        brain would deduplicate them - wasteful but not incorrect.
+        mid-batch) we raise :class:`PartialSendError` carrying the list of
+        indices that *did* reach the socket. Handing a frame to ``ws.send()``
+        is NOT durable delivery on this deferred-ack transport: an
+        ``event_batch`` is confirmed ONLY by a later ``event_batch_ack``, so
+        the caller must NOT confirm those indices here. The runtime re-raises,
+        reconnects, and re-drains the whole batch next session; the brain
+        deduplicates by frame id any that did land -- wasteful but loss-free.
+        Confirming the sent indices instead would silently drop every event
+        whose batch tail failed mid-send (round-9 doc correction).
         """
         if self._ws is None:
             raise ConnectionError("transport not connected")
@@ -465,18 +498,33 @@ class WebSocketTransport:
             )
 
         accepted: list[int] = []
+        # Indices of frames the agent LOCALLY determined it can never deliver:
+        # unparseable (buffer corruption / schema drift), unsigned (wrong frame
+        # type on the post-handshake stream), or oversize (signs larger than
+        # the brain-advertised ceiling). These are NOT put in ``accepted`` --
+        # a buffered event_batch whose payload is still JSON with an extractable
+        # ``id`` (a schema-drift backlog frame that fails full parse but peeks
+        # to a real frame_id, or a signed-but-oversize frame) would otherwise be
+        # REGISTERED in the runtime's ``_pending_acks`` awaiting an ack that can
+        # never arrive (the frame was never sent), pinning the buffer head
+        # forever (round-8 oversize + round-9 H2). They surface via
+        # UndeliverableFrameError so the runtime force-PURGES them from the
+        # buffer instead (deterministic drop, matching the delivery invariant).
+        drop_indices: list[int] = []
         async with self._send_lock:
             for idx, raw in enumerate(frames):
                 try:
                     parsed = parse_frame(raw)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception(
                         "z4j transport: dropping unparseable buffered frame",
                     )
-                    # Treat as "accepted" so the buffer purges it - a
-                    # frame we cannot parse is a frame we cannot ever
-                    # deliver, retrying will not help.
-                    accepted.append(idx)
+                    # Cannot parse -> cannot ever deliver; force-purge it. Do
+                    # NOT put it in ``accepted``: _peek_frame_id can still
+                    # extract an ``id`` from JSON that fails full frame
+                    # validation, which the runtime would register for a
+                    # phantom ack (round-9 H2).
+                    drop_indices.append(idx)
                     continue
                 if not isinstance(parsed, _SignedFrameBase):
                     logger.error(
@@ -484,14 +532,33 @@ class WebSocketTransport:
                         "on post-handshake stream",
                         getattr(parsed, "type", None),
                     )
-                    accepted.append(idx)
+                    # An event_batch IS a _SignedFrameBase, so this branch
+                    # should never see one -- but force-purge regardless so a
+                    # corrupt buffer entry can never be registered for an ack.
+                    drop_indices.append(idx)
                     continue
                 try:
                     signed = self._signer.sign_and_serialize(parsed)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     raise ConnectionError(
                         f"frame signing failed: {exc}",
                     ) from exc
+                if len(signed) > self._outbound_max_frame_bytes:
+                    # Deterministically undeliverable: the brain would close
+                    # the socket with 1009 "message too big", and on reconnect
+                    # we would re-send the same oversize frame forever. Force-
+                    # purge it (a signed event_batch here has a real frame_id,
+                    # so ``accepted`` would make the runtime DEFER an ack that
+                    # never comes). The rest of the batch still ships this call.
+                    logger.error(
+                        "z4j transport: dropping oversize %s frame "
+                        "(%d bytes > brain max %d); undeliverable, purged",
+                        getattr(parsed, "type", None),
+                        len(signed),
+                        self._outbound_max_frame_bytes,
+                    )
+                    drop_indices.append(idx)
+                    continue
                 try:
                     await self._ws.send(signed)
                 except ConnectionClosed as exc:
@@ -505,6 +572,18 @@ class WebSocketTransport:
                         accepted=accepted,
                     ) from exc
                 accepted.append(idx)
+        if drop_indices:
+            # Some frames shipped (``accepted``) and some are locally
+            # undeliverable (``drop_indices``). Surface both: the runtime
+            # confirms / registers the sent ones normally and force-purges the
+            # undeliverable ones from the buffer, staying on the (healthy)
+            # connection.
+            raise UndeliverableFrameError(
+                f"{len(drop_indices)} frame(s) are undeliverable "
+                "(unparseable, unsigned, or oversize)",
+                accepted=accepted,
+                drop_indices=drop_indices,
+            )
         return accepted
 
     async def receive_frames(
@@ -524,25 +603,23 @@ class WebSocketTransport:
             raise ConnectionError("transport not connected")
         if self._verifier is None:
             raise ConnectionError(
-                "transport cannot receive before hello_ack "
-                "(verifier not built)",
+                "transport cannot receive before hello_ack (verifier not built)",
             )
         try:
             async for raw in self._ws:
                 if isinstance(raw, str):
-                    raw = raw.encode("utf-8")
+                    raw = raw.encode("utf-8")  # noqa: PLW2901  normalized str frame to bytes in-loop
                 try:
                     frame = self._verifier.parse_and_verify(raw)
                 except SignatureError as exc:
-                    logger.error(
-                        "z4j transport: inbound frame failed verification: %s",
-                        exc,
+                    logger.exception(
+                        "z4j transport: inbound frame failed verification",
                     )
                     await self._close_ws()
                     raise ConnectionError(
                         f"inbound frame verification failed: {exc}",
                     ) from exc
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.exception("unexpected error parsing inbound frame")
                     raise InvalidFrameError(
                         f"could not parse inbound frame: {exc}",
@@ -551,7 +628,7 @@ class WebSocketTransport:
                     await on_frame(frame)
                 except Z4JError:
                     logger.exception("z4j error handling inbound frame")
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("unexpected error handling inbound frame")
         except ConnectionClosed as exc:
             logger.info("z4j agent websocket closed: %s", exc)
@@ -565,6 +642,7 @@ class WebSocketTransport:
     @staticmethod
     def _new_frame_id(prefix: str) -> str:
         import secrets as _secrets
+
         return f"{prefix}_{_secrets.token_hex(8)}"
 
 
@@ -572,12 +650,15 @@ class PartialSendError(ConnectionError):
     """Raised when ``send_frames`` fails part-way through a batch.
 
     The ``accepted`` attribute lists the frame indices that the
-    transport successfully handed to the socket before the failure.
-    These frames may or may not have been delivered - the brain
-    deduplicates by frame id, so the safe action is to confirm them
-    in the local buffer and only retry the unsent tail. Subclasses
-    :class:`ConnectionError` so existing callers continue to handle
-    this as a transport failure.
+    transport handed to the socket before the failure. Handing a frame to
+    ``ws.send()`` is NOT durable delivery: on this deferred-ack transport an
+    ``event_batch`` is confirmed only by a later ``event_batch_ack``, so the
+    runtime does NOT confirm these indices -- it re-raises, reconnects, and
+    re-drains the whole batch next session, and the brain deduplicates by
+    frame id any that did land (wasteful but loss-free). ``accepted`` is
+    carried for diagnostics / potential future use, NOT as a confirm list.
+    Subclasses :class:`ConnectionError` so existing callers continue to
+    handle this as a transport failure.
     """
 
     def __init__(self, message: str, *, accepted: list[int]) -> None:
@@ -585,4 +666,41 @@ class PartialSendError(ConnectionError):
         self.accepted: list[int] = list(accepted)
 
 
-__all__ = ["PartialSendError", "WebSocketTransport"]
+class UndeliverableFrameError(Z4JError):
+    """Raised by ``send_frames`` when one or more buffered frames are LOCALLY
+    determined to be undeliverable: unparseable (buffer corruption / schema
+    drift), unsigned (wrong frame type on the post-handshake stream), or
+    oversize (signs larger than the brain-advertised ceiling).
+
+    Such a frame is DETERMINISTICALLY undeliverable, so it must be DROPPED from
+    the buffer -- never retried, and never registered awaiting an
+    ``event_batch_ack`` that cannot arrive (the frame was never sent, so a
+    deferred ack would pin the buffer head and loop forever). Sharing the
+    ``accepted`` return channel is unsafe: the runtime peeks a frame_id out of
+    even schema-invalid JSON and would register it for a phantom ack.
+
+    Deliberately NOT a :class:`ConnectionError` subclass: the socket is
+    healthy, so the runtime purges the offending frames and CONTINUES on the
+    same connection rather than reconnecting (a reconnect would just re-drain
+    and re-raise on the same frame).
+
+    Attributes:
+        accepted: Indices actually sent this call -- confirm / register these
+            normally.
+        drop_indices: Indices of the undeliverable frames to force-purge from
+            the buffer; they were NOT sent.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        accepted: list[int],
+        drop_indices: list[int],
+    ) -> None:
+        super().__init__(message)
+        self.accepted: list[int] = list(accepted)
+        self.drop_indices: list[int] = list(drop_indices)
+
+
+__all__ = ["PartialSendError", "UndeliverableFrameError", "WebSocketTransport"]

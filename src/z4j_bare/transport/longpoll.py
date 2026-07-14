@@ -34,11 +34,9 @@ import asyncio
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
-from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
-
 from z4j_core.errors import (
     AuthenticationError,
     InvalidFrameError,
@@ -51,9 +49,74 @@ from z4j_core.transport.frames import (
     parse_frame,
 )
 from z4j_core.transport.framing import FrameSigner, FrameVerifier
-from z4j_core.version import __version__ as CORE_VERSION
+from z4j_core.version import (
+    __version__ as CORE_VERSION,  # noqa: N812  conventional version constant alias
+)
 
 logger = logging.getLogger("z4j.transport.longpoll")
+
+#: HTTP statuses where the brain looked at the FRAME content and rejected
+#: it as malformed/invalid: 415 (wrong media type) and 422 (body-shape
+#: validation on the frame envelope). Re-sending the identical body loops,
+#: so a SINGLE frame that persistently returns one of these is genuinely
+#: undeliverable and (after batch-size reduction has isolated it) is dropped
+#: after a bounded retry budget; a MULTI-frame batch is reduced/split first
+#: so valid siblings are never co-dropped (R7-MED).
+#:
+#: 400 is deliberately NOT here (R8-M2): the ``/agent/events`` route never
+#: emits a content-based 400 -- body-shape violations are FastAPI/Pydantic
+#: 422, media-type is 415 -- so every 400 reaching a POST is REQUEST-level
+#: (the host-validation middleware rejects a bad Host/Origin BEFORE the body
+#: is read, or an upstream proxy/WAF). Treating it as a per-frame content
+#: reject destroyed deliverable events during an HA allowed-hosts skew or a
+#: mid-session config/WAF change, so 400 now falls through to the retryable
+#: reconnect path with 403/404/405 (routing / WAF / mixed-deploy) and
+#: 3xx/408/425/429/5xx. A TRANSIENT partial store (a 200 storing fewer than
+#: sent) is separate again: retried with backoff, never a drop-budget hit.
+#:
+#: Accepted residual (r11 review): if an INTERMEDIARY WAF/proxy returns 400
+#: keyed to one frame's bytes, that frame reconnect-loops (head-of-line) and
+#: never hits the content-drop budget; it self-clears only via buffer
+#: overflow. Treating 400 as content-drop instead would re-introduce the far
+#: more common host-skew mass-loss, so retryable is the least-bad choice.
+_CONTENT_REJECT_STATUSES: frozenset[int] = frozenset({415, 422})
+
+
+class UploadRetryableError(Exception):
+    """The brain did not durably store every frame, for a TRANSIENT
+    reason (a 200 response reporting fewer stored than sent -- a DB
+    deadlock / pool timeout / transient skip on the brain).
+
+    The whole batch is re-sent after a BACKOFF (the brain dedups
+    already-stored frames by content-derived event_id, so replay is
+    harmless). It must NOT count toward any drop budget: the frames are
+    deliverable, the brain just could not store them this instant
+    (R7-HIGH2). Deliberately NOT a :class:`ConnectionError` (a content
+    round-trip succeeded; no need to tear down the session).
+    """
+
+
+class UploadContentRejectedError(Exception):
+    """The brain rejected the FRAME content as malformed/invalid
+    (HTTP 415 media-type or 422 envelope validation). Re-sending the
+    identical body loops.
+
+    A MULTI-frame batch is reduced/split so valid siblings still deliver;
+    a SINGLE frame that keeps being content-rejected is genuinely
+    undeliverable and is dropped after a bounded retry budget (R7-MED). A
+    bare 400 is NOT a content reject on this route -- it is request-level
+    (host validation / proxy / WAF) and retried, not dropped (R8-M2).
+    """
+
+
+class PayloadTooLargeError(Exception):
+    """A long-poll POST returned HTTP 413 (body exceeded the brain cap).
+
+    The runtime reduces its send batch size and retries; a single frame
+    that still 413s is dropped after a bounded budget (it can never fit),
+    NOT on the first failure (a transient/proxy 413 must not lose a
+    deliverable frame, R7-MED). Not a :class:`ConnectionError`.
+    """
 
 
 class LongPollTransport:
@@ -65,36 +128,50 @@ class LongPollTransport:
     interchangeably.
 
     Per-agent ``FrameSigner`` / ``FrameVerifier`` are constructed
-    on first :meth:`connect`. We use the agent's own
-    ``project_id`` / ``agent_id`` (passed in by the runtime, since
-    long-poll has no ``hello_ack`` to learn them from). The brain
-    pins identical bindings on its side as soon as it sees the
-    first authenticated request from this token.
+    on first :meth:`connect`, bound to the canonical agent/project
+    UUIDs the brain advertises on the probe response
+    (``X-Z4J-Agent-Id`` / ``X-Z4J-Project-Id``, the long-poll
+    analogue of the WebSocket ``hello_ack``). The config-supplied
+    ``project_id`` / ``agent_id`` are only a fallback for brains
+    that predate the headers, and then only when they are real
+    UUIDs (the config's project_id is normally a slug).
     """
 
     __slots__ = (
-        "brain_url",
-        "project_id",
-        "agent_id",
-        "framework_name",
-        "engines",
-        "schedulers",
-        "capabilities",
-        "agent_version",
-        "max_frame_size",
-        "_token",
-        "_hmac_secret",
-        "_dev_mode",
         "_client",
-        "_signer",
-        "_verifier",
+        "_closed",
+        "_dev_mode",
+        "_heartbeat_interval",
+        "_hmac_secret",
+        "_poll_wait_seconds",
+        "_send_lock",
         "_session_id",
         "_session_nonce",
-        "_heartbeat_interval",
-        "_send_lock",
-        "_closed",
-        "_poll_wait_seconds",
+        "_signer",
+        "_token",
+        "_verifier",
+        "agent_id",
+        "agent_version",
+        "brain_url",
+        "capabilities",
+        "engines",
+        "framework_name",
+        "max_frame_size",
+        "project_id",
+        "schedulers",
     )
+
+    #: The brain has no ack channel over long-poll: it never signs an
+    #: ``event_batch_ack`` into the ``GET /commands`` response (that
+    #: route only carries command frames), and the events POST's HTTP
+    #: 200 IS the acknowledgement (the brain dedups by event_id, so a
+    #: replay is harmless). The runtime consults this flag to confirm
+    #: buffered event_batch entries on a successful send instead of
+    #: waiting for an ack frame that never arrives. Without it the send
+    #: loop re-drains every unconfirmed batch each iteration and POSTs
+    #: the same already-ingested events at line rate until the brain
+    #: rate-limits (429), which was itself a loss path pre-fix.
+    confirm_on_send: bool = True
 
     #: Header name shared with brain. Both sides agree on this value
     #: so the brain's per-session signer/verifier registry can key
@@ -236,8 +313,34 @@ class LongPollTransport:
                 f"long-poll probe returned HTTP {r.status_code}",
             )
 
-        agent_uuid = _safe_uuid(self.agent_id)
-        project_uuid = _safe_uuid(self.project_id)
+        # The probe response advertises the canonical agent/project
+        # UUIDs (the long-poll analogue of the WebSocket hello_ack).
+        # Bind THOSE into the signer/verifier: the config's
+        # project_id is a SLUG, and the frame HMAC envelope binds
+        # the project UUID on the brain side, so signing under
+        # anything else fails verification on every frame. Config
+        # values are the fallback for brains that predate the
+        # identity headers (only helps when the operator configured
+        # real UUIDs; a slug there was never able to work).
+        agent_uuid = _uuid_or_none(
+            r.headers.get("x-z4j-agent-id"),
+        ) or _uuid_or_none(self.agent_id)
+        project_uuid = _uuid_or_none(
+            r.headers.get("x-z4j-project-id"),
+        ) or _uuid_or_none(self.project_id)
+        if agent_uuid is None or project_uuid is None:
+            logger.warning(
+                "z4j longpoll: brain sent no identity headers and the "
+                "configured agent_id/project_id are not UUIDs "
+                "(agent_id=%r project_id=%r); frame signatures will "
+                "not verify. Upgrade the brain, or set Z4J_AGENT_ID / "
+                "Z4J_PROJECT_ID to the UUIDs shown on the brain's "
+                "agents page.",
+                self.agent_id,
+                self.project_id,
+            )
+            agent_uuid = agent_uuid or uuid4()
+            project_uuid = project_uuid or uuid4()
 
         # Bind the per-connection session_nonce into the signer/verifier so
         # captured frames from a previous nonce can't be replayed
@@ -281,16 +384,17 @@ class LongPollTransport:
         # Shield the aclose so an agent SIGTERM mid-shutdown doesn't
         # leak the httpx pool.
         try:
-            import asyncio as _asyncio  # noqa: PLC0415
+            import asyncio as _asyncio
+
             await _asyncio.shield(client.aclose())
-        except Exception:  # noqa: BLE001  pragma: no cover
+        except Exception:  # noqa: S110  best-effort httpx pool close on shutdown
             pass
 
     # ------------------------------------------------------------------
     # Send / receive
     # ------------------------------------------------------------------
 
-    async def send_frames(self, frames: list[bytes]) -> list[int]:
+    async def send_frames(self, frames: list[bytes]) -> list[int]:  # noqa: PLR0912  per-frame sign/post branching
         """Sign + POST each buffered frame, return accepted indices.
 
         Mirrors :meth:`WebSocketTransport.send_frames` exactly so
@@ -307,7 +411,7 @@ class LongPollTransport:
         for idx, raw in enumerate(frames):
             try:
                 parsed = parse_frame(raw)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
                     "z4j longpoll: dropping unparseable buffered frame",
                 )
@@ -322,7 +426,7 @@ class LongPollTransport:
                 continue
             try:
                 signed.append((idx, self._signer.sign_and_serialize(parsed).decode("utf-8")))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 raise ConnectionError(
                     f"frame signing failed: {exc}",
                 ) from exc
@@ -347,31 +451,65 @@ class LongPollTransport:
                 "brain rejected agent token mid-session",
                 details={"status": 401},
             )
-        if r.status_code >= 500:
-            raise ConnectionError(
-                f"long-poll send returned HTTP {r.status_code}",
+        if r.status_code == 200:
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+            # Parse the stored-count DEFENSIVELY: confirm (delete) the
+            # POSTed frames ONLY on EXACT equality with the number sent.
+            # A malformed/over-count response (a non-int, a bool, a
+            # negative, or a value greater than what we sent) must NEVER
+            # confirm a frame the brain did not store -- treat anything
+            # but the exact match as "not all stored" and retry (R7-LOW).
+            raw = body.get("accepted") if isinstance(body, dict) else None
+            stored = raw if isinstance(raw, int) and not isinstance(raw, bool) else -1
+            if stored == len(signed):
+                accepted.extend(idx for idx, _ in signed)
+                return accepted
+            # Stored fewer than sent (or a malformed count): the brain
+            # had a TRANSIENT problem storing some frames (a DB deadlock /
+            # pool timeout / transient skip). Confirm NOTHING and re-send
+            # the whole batch after a backoff. The brain dedups the
+            # already-stored frames by content-derived event_id, so
+            # replay is harmless. This is a transient outcome, NOT a
+            # content rejection: it must not consume a drop budget
+            # (R7-HIGH2).
+            raise UploadRetryableError(
+                f"long-poll: brain stored {stored}/{len(signed)} frames "
+                "(transient); re-sending the whole batch after backoff",
             )
-        if r.status_code != 200:
-            # 4xx other than 401 = malformed payload / over quota.
-            # We treat these as accepted so the buffer purges them
-            # rather than retrying forever.
-            logger.warning(
-                "z4j longpoll: send returned HTTP %s; dropping batch",
-                r.status_code,
+        if r.status_code == 413:
+            raise PayloadTooLargeError(
+                "long-poll: POST body too large (HTTP 413)",
             )
-            for idx, _ in signed:
-                accepted.append(idx)
-            return accepted
-
-        body = r.json()
-        accepted_count = int(body.get("accepted", 0)) + int(body.get("rejected", 0))
-        # The brain treats per-frame verify failures as silent
-        # drops; we mark them accepted on our side too so the
-        # buffer doesn't loop on a permanently-bad entry.
-        for i, (idx, _) in enumerate(signed):
-            if i < accepted_count:
-                accepted.append(idx)
-        return accepted
+        if r.status_code in _CONTENT_REJECT_STATUSES:
+            # The brain rejected the FRAME content as malformed/invalid
+            # (415 media-type / 422 envelope validation). Re-sending the
+            # identical body loops. The runtime reduces/splits a multi-frame
+            # batch (valid siblings still deliver) and drops only a SINGLE
+            # persistently-rejected frame after a bounded budget (R7-MED).
+            raise UploadContentRejectedError(
+                f"long-poll: brain rejected the frame content (HTTP {r.status_code})",
+            )
+        # Everything else -- 3xx redirects (follow disabled, so the body
+        # never reached the handler), a bare 400 (request-level host
+        # validation / proxy / WAF, NOT per-frame content, R8-M2),
+        # 403/404/405 (routing/WAF/mixed deploy), transient 408/425/429/5xx,
+        # and any unexpected status -- is treated as transient: keep the
+        # batch unconfirmed and retry after backoff, NEVER counting
+        # toward the quarantine. Honor Retry-After when present.
+        retry_after = r.headers.get("retry-after")
+        if retry_after:
+            try:
+                delay = min(float(retry_after), float(self._poll_wait_seconds))
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            except (ValueError, TypeError):
+                pass
+        raise ConnectionError(
+            f"long-poll send returned HTTP {r.status_code} (retryable)",
+        )
 
     async def receive_frames(
         self,
@@ -425,19 +563,18 @@ class LongPollTransport:
             for raw in payload.get("frames", []):
                 try:
                     frame = self._verifier.parse_and_verify(raw)
-                except SignatureError as exc:
+                except SignatureError:
                     # Session is desynced (brain restart, forged
                     # frame, replay attempt). Don't keep polling
                     # with a poisoned _last_seq cursor - surface
                     # to the supervisor so it reconnects with a
                     # fresh session_nonce. This matches the WS
                     # path's 4403 close behaviour.
-                    logger.error(
-                        "z4j longpoll: command frame failed verification, reconnecting: %s",
-                        exc,
+                    logger.exception(
+                        "z4j longpoll: command frame failed verification, reconnecting",
                     )
                     raise
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.exception(
                         "z4j longpoll: command frame parse failed",
                     )
@@ -450,20 +587,33 @@ class LongPollTransport:
                     logger.exception(
                         "z4j longpoll: command handler raised z4j error",
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception(
                         "z4j longpoll: command handler raised",
                     )
 
 
-def _safe_uuid(value: str | UUID) -> UUID:
-    """Best-effort UUID coercion; FrameSigner accepts str or UUID anyway."""
+def _uuid_or_none(value: str | UUID | None) -> UUID | None:
+    """Parse a UUID, or return None for anything that is not one.
+
+    The pre-1.7 ``_safe_uuid`` this replaces minted a RANDOM uuid4
+    for non-UUID input, which silently bound a garbage project id
+    into the frame HMAC whenever the config carried the documented
+    project SLUG, making every frame fail verification.
+    """
     if isinstance(value, UUID):
         return value
+    if not value:
+        return None
     try:
         return UUID(str(value))
     except (ValueError, AttributeError):
-        return uuid4()
+        return None
 
 
-__all__ = ["LongPollTransport"]
+__all__ = [
+    "LongPollTransport",
+    "PayloadTooLargeError",
+    "UploadContentRejectedError",
+    "UploadRetryableError",
+]

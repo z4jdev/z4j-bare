@@ -49,11 +49,56 @@ class OrchestratorDetection:
     signal: str | None
 
 
+def _detect_filesystem_marker(
+    fs_marker_override: str | None,
+    probe_filesystem: bool,
+) -> str | None:
+    """Return a filesystem-anchored orchestration signal, or ``None``.
+
+    Checks ``/.dockerenv``, ``/proc/1/cgroup`` container-runtime
+    tokens, and the operator-installed ``/etc/z4j-orchestrated``
+    marker, in that order.
+
+    ``fs_marker_override`` lets tests simulate a probe hit without
+    touching the filesystem. ``probe_filesystem=False`` skips the
+    real reads entirely so tests run hermetically -- otherwise a
+    real ``/.dockerenv`` inside CI/containers would defeat a "not
+    orchestrated" assertion.
+    """
+    if fs_marker_override is not None:
+        return fs_marker_override
+    if not probe_filesystem:
+        return None
+
+    try:
+        if Path("/.dockerenv").exists():
+            return "/.dockerenv"
+    except OSError:
+        pass
+
+    try:
+        cgroup_text = Path("/proc/1/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        cgroup_text = ""
+    for token in ("docker", "kubepods", "containerd", "crio"):
+        if token in cgroup_text:
+            return f"cgroup:{token}"
+
+    try:
+        if Path("/etc/z4j-orchestrated").exists():
+            return "/etc/z4j-orchestrated (operator marker)"
+    except OSError:
+        pass
+
+    return None
+
+
 def detect_orchestrator(
     *,
     pid: int | None = None,
     env: dict[str, str] | None = None,
     fs_marker_override: str | None = None,
+    probe_filesystem: bool = True,
 ) -> OrchestratorDetection:
     """Return the first-matching orchestration signal.
 
@@ -63,6 +108,14 @@ def detect_orchestrator(
         fs_marker_override: If not None, pretend the filesystem
             probe returned this label. Tests only - production
             code uses the real filesystem probes below.
+        probe_filesystem: When False, skip the REAL filesystem
+            probes (``/.dockerenv``, ``/proc/1/cgroup``,
+            ``/etc/z4j-orchestrated``) entirely and rely only on
+            ``pid`` / ``env`` / ``fs_marker_override``. Tests set
+            this False so they run hermetically -- otherwise a test
+            asserting "not orchestrated" fails inside CI/containers
+            where a real ``/.dockerenv`` exists. Defaults True in
+            production.
     """
     e = env if env is not None else os.environ
 
@@ -74,7 +127,8 @@ def detect_orchestrator(
         normalized = override.strip().lower()
         if normalized in ("0", "false", "no"):
             return OrchestratorDetection(
-                False, "Z4J_ORCHESTRATED=0 (explicit opt-out)",
+                False,
+                "Z4J_ORCHESTRATED=0 (explicit opt-out)",
             )
 
     # Env-vars alone are spoofable in shared hosting
@@ -96,28 +150,7 @@ def detect_orchestrator(
     # only the installer can create. This prevents an unprivileged
     # env-var-only path.
 
-    fs_signal: str | None = fs_marker_override
-    if fs_signal is None:
-        try:
-            if Path("/.dockerenv").exists():
-                fs_signal = "/.dockerenv"
-        except OSError:
-            pass
-    if fs_signal is None:
-        try:
-            cgroup_text = Path("/proc/1/cgroup").read_text(encoding="utf-8")
-        except OSError:
-            cgroup_text = ""
-        for token in ("docker", "kubepods", "containerd", "crio"):
-            if token in cgroup_text:
-                fs_signal = f"cgroup:{token}"
-                break
-    if fs_signal is None:
-        try:
-            if Path("/etc/z4j-orchestrated").exists():
-                fs_signal = "/etc/z4j-orchestrated (operator marker)"
-        except OSError:
-            pass
+    fs_signal = _detect_filesystem_marker(fs_marker_override, probe_filesystem)
 
     pid_value = pid if pid is not None else os.getpid()
     if pid_value == 1:
@@ -136,13 +169,13 @@ def detect_orchestrator(
     # Require BOTH a filesystem marker AND (either an env signal or
     # the explicit opt-in). Neither on its own is enough.
     explicit_opt_in = override is not None and override.strip().lower() in (
-        "1", "true", "yes",
+        "1",
+        "true",
+        "yes",
     )
 
     if fs_signal is not None and (env_signal is not None or explicit_opt_in):
-        combined = (
-            f"{fs_signal} + {env_signal or 'Z4J_ORCHESTRATED=1'}"
-        )
+        combined = f"{fs_signal} + {env_signal or 'Z4J_ORCHESTRATED=1'}"
         return OrchestratorDetection(True, combined)
 
     # Explicit opt-in without a filesystem marker is declined -

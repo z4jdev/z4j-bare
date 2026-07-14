@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from z4j_bare.buffer import BufferStore
 
 
@@ -104,6 +103,128 @@ class TestAttempts:
     def test_increment_empty_is_noop(self, buf: BufferStore) -> None:
         buf.increment_attempts([])
 
+    def test_evict_if_exhausted_drops_at_cap(self, buf: BufferStore) -> None:
+        """R5-M2 / R7-MED: only the TARGETED id at the cap is dropped."""
+        keep = buf.append("event_batch", b"keep")
+        poison = buf.append("event_batch", b"poison")
+        for _ in range(5):
+            buf.increment_content_rejects([poison])
+        dropped = buf.evict_if_exhausted([poison], 5)
+        assert dropped == 1
+        remaining = buf.drain(10)
+        assert [e.id for e in remaining] == [keep]
+        assert buf.size() == 1
+
+    def test_attempts_metric_never_triggers_eviction(self, buf: BufferStore) -> None:
+        """R8-H1: eviction consults the DEDICATED ``content_rejects`` budget,
+        never the ``attempts`` metric. A WS ack-watchdog (or a pre-1.7
+        cross-version entry) that accumulated many ``attempts`` must NOT be
+        dropped on its first content reject -- it starts the content budget
+        fresh at 0."""
+        e = buf.append("event_batch", b"stuck")
+        for _ in range(50):
+            buf.increment_attempts([e])  # heavy WS-timeout / legacy history
+        # attempts=50 but content_rejects=0, so nothing drops:
+        assert buf.evict_if_exhausted([e], 10) == 0
+        assert buf.size() == 1
+        # One content reject leaves it at 1 -- still below the 10 cap:
+        buf.increment_content_rejects([e])
+        assert buf.evict_if_exhausted([e], 10) == 0
+        assert buf.size() == 1
+
+    def test_evict_if_exhausted_below_cap_keeps(self, buf: BufferStore) -> None:
+        e = buf.append("event_batch", b"a")
+        buf.increment_content_rejects([e])
+        assert buf.evict_if_exhausted([e], 5) == 0
+        assert buf.size() == 1
+
+    def test_evict_if_exhausted_zero_cap_noop(self, buf: BufferStore) -> None:
+        e = buf.append("event_batch", b"a")
+        assert buf.evict_if_exhausted([e], 0) == 0
+        assert buf.size() == 1
+
+    def test_evict_if_exhausted_empty_ids_noop(self, buf: BufferStore) -> None:
+        buf.append("event_batch", b"a")
+        assert buf.evict_if_exhausted([], 5) == 0
+        assert buf.size() == 1
+
+    def test_evict_if_exhausted_only_targets_given_ids(
+        self,
+        buf: BufferStore,
+    ) -> None:
+        """R7-MED: eviction is ID-targeted, never kind- or cap-scoped.
+
+        The attempt counter is shared, so a flaky connection can push a
+        valid sibling (a command_result, or another event_batch) to the
+        cap too. Passing ONLY the isolated offending id must drop that id
+        alone -- every other at-cap entry is left untouched, so a
+        request-level content rejection can never mass-delete valid
+        siblings that merely shared the counter.
+        """
+        offending = buf.append("event_batch", b"eb")
+        sibling_eb = buf.append("event_batch", b"eb2")
+        cmd = buf.append("command_result", b"cmd")
+        for _ in range(5):
+            buf.increment_content_rejects([offending, sibling_eb, cmd])
+        # Only the isolated offending frame is passed.
+        dropped = buf.evict_if_exhausted([offending], 5)
+        assert dropped == 1
+        remaining = {e.id for e in buf.drain(10)}
+        assert offending not in remaining  # the isolated frame is dropped
+        assert sibling_eb in remaining  # at-cap sibling event_batch kept
+        assert cmd in remaining  # at-cap control frame kept
+
+
+class TestDrainExcludeInFlight:
+    def test_drain_large_exclude_no_param_error(self, buffer_path: Path) -> None:
+        """R6-F5: a large in-flight exclude set must not raise SQLite's
+        bound-parameter OperationalError.
+
+        A SQL ``NOT IN (?, ?, ...)`` with 33k ids exceeds SQLite's 32766
+        variable ceiling and crashed the send loop. drain() now filters
+        in Python, so any size is safe.
+        """
+        buf = BufferStore(path=buffer_path, max_entries=100_000, max_bytes=10**9)
+        try:
+            wanted = [buf.append("event_batch", str(i).encode()) for i in range(5)]
+            # An exclude set far larger than SQLite's 32766 param limit.
+            huge_exclude = set(range(1_000_000, 1_000_000 + 40_000))
+            entries = buf.drain(5, exclude_ids=huge_exclude)
+            assert [e.id for e in entries] == wanted
+        finally:
+            buf.close()
+
+    def test_drain_excludes_in_flight_ids(self, buf: BufferStore) -> None:
+        """R5-M2: in-flight (sent, awaiting ack) entries are skipped so
+        the send loop advances to fresh entries instead of re-sending."""
+        a = buf.append("event_batch", b"a")
+        b = buf.append("event_batch", b"b")
+        c = buf.append("event_batch", b"c")
+        # a + b are 'in flight'; the next drain must return only c.
+        entries = buf.drain(10, exclude_ids={a, b})
+        assert [e.id for e in entries] == [c]
+
+    def test_drain_exclude_none_returns_all(self, buf: BufferStore) -> None:
+        buf.append("event_batch", b"a")
+        buf.append("event_batch", b"b")
+        assert len(buf.drain(10, exclude_ids=None)) == 2
+        assert len(buf.drain(10, exclude_ids=set())) == 2
+
+    def test_drain_exclude_does_not_starve_beyond_window(
+        self,
+        buffer_path: Path,
+    ) -> None:
+        """With a full in-flight window, drain still reaches later entries
+        (the pre-fix loop spun on the in-flight prefix forever)."""
+        buf = BufferStore(path=buffer_path, max_entries=100, max_bytes=100_000_000)
+        try:
+            ids = [buf.append("event_batch", str(i).encode()) for i in range(10)]
+            in_flight = set(ids[:5])
+            entries = buf.drain(3, exclude_ids=in_flight)
+            assert [e.id for e in entries] == ids[5:8]
+        finally:
+            buf.close()
+
 
 class TestEviction:
     def test_entry_count_limit(self, buffer_path: Path) -> None:
@@ -114,9 +235,7 @@ class TestEviction:
             assert buf.size() <= 5
             # The LAST 5 should have survived.
             remaining = buf.drain(10)
-            assert [e.payload for e in remaining] == [
-                str(i).encode() for i in range(5, 10)
-            ]
+            assert [e.payload for e in remaining] == [str(i).encode() for i in range(5, 10)]
         finally:
             buf.close()
 
@@ -145,6 +264,43 @@ class TestPersistence:
             assert entries[0].payload == b"survived"
         finally:
             buf2.close()
+
+    def test_migrates_pre_1_7_db_without_content_rejects(self, buffer_path: Path) -> None:
+        """R8-H1: a pre-1.7 buffer file has no ``content_rejects`` column and
+        may carry a high ``attempts`` (old transport-failure counting). On
+        open, the migration adds ``content_rejects`` DEFAULT 0 so the entry
+        starts its content-drop budget fresh and is NOT deleted on its first
+        content reject.
+        """
+        import sqlite3
+
+        # Hand-build the OLD schema (no content_rejects) with a high-attempts
+        # entry, exactly as a 1.6.9 buffer would leave on disk.
+        conn = sqlite3.connect(str(buffer_path), isolation_level=None)
+        conn.executescript(
+            """
+            CREATE TABLE entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO entries (kind, payload, created_at, attempts)
+            VALUES ('event_batch', X'6f6c64', 1.0, 50);
+            """
+        )
+        conn.close()
+
+        buf = BufferStore(path=buffer_path)
+        try:
+            (eid,) = (e.id for e in buf.drain(10))
+            # attempts carried over (50) but the fresh content_rejects=0 means
+            # a content-reject-budget check does not drop it:
+            assert buf.evict_if_exhausted([eid], 10) == 0
+            assert buf.size() == 1
+        finally:
+            buf.close()
 
 
 class TestClosedStore:
@@ -175,9 +331,9 @@ class TestSecurityP1FilePermissions:
         reason="POSIX-only test (no chmod on Windows)",
     )
     def test_buffer_db_is_0600_after_create(
-        self, buffer_path: Path,
+        self,
+        buffer_path: Path,
     ) -> None:
-        import os
         import stat
 
         buf = BufferStore(path=buffer_path)
@@ -192,7 +348,7 @@ class TestSecurityP1FilePermissions:
             buf.close()
 
         # Primary DB file: must be owner-only.
-        db_mode = stat.S_IMODE(os.stat(buffer_path).st_mode)
+        db_mode = stat.S_IMODE(buffer_path.stat().st_mode)
         assert db_mode == 0o600, (
             f"1.6.5 P1 regression: buffer DB {buffer_path} has "
             f"mode 0{db_mode:o}, expected 0600. "
@@ -203,19 +359,17 @@ class TestSecurityP1FilePermissions:
         # WAL sidecar (created on first write since WAL is enabled).
         wal_path = buffer_path.with_suffix(buffer_path.suffix + "-wal")
         if wal_path.exists():
-            wal_mode = stat.S_IMODE(os.stat(wal_path).st_mode)
+            wal_mode = stat.S_IMODE(wal_path.stat().st_mode)
             assert wal_mode == 0o600, (
-                f"1.6.5 P1 regression: WAL sidecar {wal_path} has "
-                f"mode 0{wal_mode:o}, expected 0600"
+                f"1.6.5 P1 regression: WAL sidecar {wal_path} has mode 0{wal_mode:o}, expected 0600"
             )
 
         # SHM sidecar (memory-mapped index for the WAL).
         shm_path = buffer_path.with_suffix(buffer_path.suffix + "-shm")
         if shm_path.exists():
-            shm_mode = stat.S_IMODE(os.stat(shm_path).st_mode)
+            shm_mode = stat.S_IMODE(shm_path.stat().st_mode)
             assert shm_mode == 0o600, (
-                f"1.6.5 P1 regression: SHM sidecar {shm_path} has "
-                f"mode 0{shm_mode:o}, expected 0600"
+                f"1.6.5 P1 regression: SHM sidecar {shm_path} has mode 0{shm_mode:o}, expected 0600"
             )
 
     @pytest.mark.skipif(
@@ -223,14 +377,15 @@ class TestSecurityP1FilePermissions:
         reason="POSIX-only test",
     )
     def test_loose_z4j_home_emits_warning(
-        self, buffer_path: Path, caplog,
+        self,
+        buffer_path: Path,
+        caplog,
     ) -> None:
         """When the buffer's parent directory is group/world
         accessible, BufferStore startup MUST log a WARN naming the
         path + the remediation command. Operators on multi-tenant
         hosts need this signal."""
         import logging
-        import os
 
         # Reset the one-shot guard so this test always exercises the
         # check, even when run after another test that triggered it.
@@ -241,7 +396,7 @@ class TestSecurityP1FilePermissions:
         # Make the parent dir group-readable (0o755 inclusive of
         # group/world read bits) -- this is the bit pattern the
         # warning is supposed to flag.
-        os.chmod(buffer_path.parent, 0o755)
+        buffer_path.parent.chmod(0o755)
 
         with caplog.at_level(logging.WARNING, logger="z4j.runtime.buffer"):
             buf = BufferStore(path=buffer_path)
@@ -322,32 +477,36 @@ class TestDriftRecovery:
     """
 
     def test_size_clamps_to_zero_when_cache_goes_negative(
-        self, buf: BufferStore, caplog: pytest.LogCaptureFixture,
+        self,
+        buf: BufferStore,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         # Simulate the drift observed in production.
-        buf._cached_count = -12  # noqa: SLF001 - deliberate drift
+        buf._cached_count = -12
         with caplog.at_level("WARNING", logger="z4j.runtime.buffer"):
             assert buf.size() == 0
-        assert any(
-            "drifted negative" in rec.message for rec in caplog.records
-        ), "expected WARNING about drifted counters"
+        assert any("drifted negative" in rec.message for rec in caplog.records), (
+            "expected WARNING about drifted counters"
+        )
 
     def test_byte_size_clamps_to_zero_when_cache_goes_negative(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
-        buf._cached_bytes = -4096  # noqa: SLF001
+        buf._cached_bytes = -4096
         assert buf.byte_size() == 0
 
     def test_reconcile_uses_disk_truth(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         # Seed real entries, then corrupt the cache; the
         # reconcile path must return the disk-truth value, not
         # the clamped zero.
         for i in range(7):
             buf.append("event_batch", f"row-{i}".encode())
-        buf._cached_count = -99  # noqa: SLF001
-        buf._cached_bytes = -99  # noqa: SLF001
+        buf._cached_count = -99
+        buf._cached_bytes = -99
         assert buf.size() == 7
         # Reconcile also fixes byte_size - next call returns the
         # real disk-sourced bytes total, no longer clamped.
@@ -355,21 +514,21 @@ class TestDriftRecovery:
         assert buf.byte_size() == real_bytes
 
     def test_drift_warning_fires_only_once_per_instance(
-        self, buf: BufferStore, caplog: pytest.LogCaptureFixture,
+        self,
+        buf: BufferStore,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         # A persistent bug would otherwise spam the log every
         # heartbeat (10s cadence). One warning per BufferStore
         # lifetime is enough signal for operators.
         with caplog.at_level("WARNING", logger="z4j.runtime.buffer"):
-            buf._cached_count = -1  # noqa: SLF001
+            buf._cached_count = -1
             buf.size()
-            buf._cached_count = -5  # noqa: SLF001
+            buf._cached_count = -5
             buf.size()
-            buf._cached_count = -42  # noqa: SLF001
+            buf._cached_count = -42
             buf.size()
-        drift_logs = [
-            rec for rec in caplog.records if "drifted negative" in rec.message
-        ]
+        drift_logs = [rec for rec in caplog.records if "drifted negative" in rec.message]
         assert len(drift_logs) == 1
 
 

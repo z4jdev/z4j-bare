@@ -33,7 +33,6 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-
 from z4j_core.celerybeat_compat import (
     ScheduleSpec,
     parse_celery_beat_entries,
@@ -106,8 +105,7 @@ def _z4j_native_schedules_to_specs(
     for name, entry in schedules.items():
         if not isinstance(entry, dict):
             logger.warning(
-                "z4j declarative: Z4J_SCHEDULES entry %r is not a dict, "
-                "skipping",
+                "z4j declarative: Z4J_SCHEDULES entry %r is not a dict, skipping",
                 name,
             )
             continue
@@ -116,13 +114,13 @@ def _z4j_native_schedules_to_specs(
         expression = entry.get("expression") or entry.get("schedule")
         if not task:
             logger.warning(
-                "z4j declarative: entry %r missing 'task', skipping", name,
+                "z4j declarative: entry %r missing 'task', skipping",
+                name,
             )
             continue
         if not kind or not expression:
             logger.warning(
-                "z4j declarative: entry %r missing 'kind' or 'expression', "
-                "skipping",
+                "z4j declarative: entry %r missing 'kind' or 'expression', skipping",
                 name,
             )
             continue
@@ -293,7 +291,10 @@ class ScheduleReconciler:
         return {
             "schedules": [
                 _spec_to_brain_payload(
-                    s, engine=engine, scheduler=scheduler, source=source,
+                    s,
+                    engine=engine,
+                    scheduler=scheduler,
+                    source=source,
                 )
                 for s in specs
             ],
@@ -324,7 +325,10 @@ class ScheduleReconciler:
             celery_beat_schedules=celery_beat_schedules,
         )
         body = self._build_request_body(
-            specs, engine=engine, scheduler=scheduler, source=source,
+            specs,
+            engine=engine,
+            scheduler=scheduler,
+            source=source,
         )
 
         if dry_run:
@@ -358,7 +362,8 @@ class ScheduleReconciler:
         if r.status_code >= 400:
             logger.error(
                 "z4j declarative: brain rejected import: status=%s body=%s",
-                r.status_code, _redact_response_body(r.text),
+                r.status_code,
+                _redact_response_body(r.text),
             )
             return ReconcileResult(failed=len(body["schedules"]))
         data = r.json()
@@ -389,9 +394,9 @@ class ScheduleReconciler:
             )
         if r.status_code >= 400:
             logger.error(
-                "z4j declarative dry-run: brain rejected diff: "
-                "status=%s body=%s",
-                r.status_code, _redact_response_body(r.text),
+                "z4j declarative dry-run: brain rejected diff: status=%s body=%s",
+                r.status_code,
+                _redact_response_body(r.text),
             )
             return ReconcileResult(failed=len(body["schedules"]), dry_run=True)
         data = r.json()

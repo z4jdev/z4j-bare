@@ -34,14 +34,19 @@ when ``--engine=celery``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import logging
 import signal
 import sys
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from z4j_bare.install import install_agent
 from z4j_bare.runtime import AgentRuntime
+
+if TYPE_CHECKING:
+    from z4j_core.models import Config
 
 logger = logging.getLogger("z4j.runtime.cli")
 
@@ -72,8 +77,7 @@ EngineLoader = Callable[[str | None], Any]
 def _load_celery(app_path: str | None) -> Any:
     if not app_path:
         raise ImportError(
-            "--app is required when --engine=celery "
-            "(e.g. --app myproject.celery:app)",
+            "--app is required when --engine=celery (e.g. --app myproject.celery:app)",
         )
     celery_app = _import_object(app_path)
     try:
@@ -155,8 +159,11 @@ def make_engine_main(
 
         # z4j_celery/cli.py
         from z4j_bare.cli import make_engine_main
+
         main = make_engine_main(
-            "celery", upstream_package="celery", broker_env="CELERY_BROKER_URL",
+            "celery",
+            upstream_package="celery",
+            broker_env="CELERY_BROKER_URL",
         )
     """
 
@@ -188,10 +195,11 @@ def make_engine_main(
         if args.subcommand == "version":
             try:
                 import importlib.metadata as _md
+
                 print(_md.version(f"z4j-{engine_id}"))  # noqa: T201
                 return 0
-            except Exception as exc:  # noqa: BLE001
-                print(f"z4j-{engine_id} version: {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"z4j-{engine_id} version: {exc}", file=sys.stderr)  # noqa: T201  CLI output
                 return 1
 
         # doctor / check / status all share the import probes.
@@ -244,6 +252,7 @@ def make_engine_main(
         # Probe 3: broker URL (if applicable)
         if broker_env is not None:
             import os as _os
+
             url = _os.environ.get(broker_env)
             if url:
                 results.append(
@@ -264,9 +273,7 @@ def make_engine_main(
                 )
 
         if args.subcommand == "status":
-            short = ", ".join(
-                f"{n}={'OK' if ok else 'FAIL'}" for n, ok, _ in results
-            )
+            short = ", ".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok, _ in results)
             print(f"z4j-{engine_id} status: {short}")  # noqa: T201
             return 0 if all(ok for _, ok, _ in results) else 1
 
@@ -291,6 +298,7 @@ def make_main_for_adapter(adapter_id: str) -> Callable[[list[str] | None], int]:
 
         # z4j_flask/cli.py
         from z4j_bare.cli import make_main_for_adapter
+
         main = make_main_for_adapter("flask")
 
     What this does:
@@ -309,15 +317,19 @@ def make_main_for_adapter(adapter_id: str) -> Callable[[list[str] | None], int]:
         # restart" routes to the django pidfile, not the generic
         # bare one. Operator can still override with explicit
         # --adapter X if they really want to signal a sibling.
-        if argv and argv[0] in ("restart", "reload"):
-            if "--adapter" not in argv and "-a" not in argv:
-                argv = [argv[0], "--adapter", adapter_id, *argv[1:]]
+        if (
+            argv
+            and argv[0] in ("restart", "reload")
+            and "--adapter" not in argv
+            and "-a" not in argv
+        ):
+            argv = [argv[0], "--adapter", adapter_id, *argv[1:]]
         return main(argv, prog=f"z4j-{adapter_id}")
 
     return _adapter_main
 
 
-def main(argv: list[str] | None = None, prog: str | None = None) -> int:
+def main(argv: list[str] | None = None, prog: str | None = None) -> int:  # noqa: PLR0911  flat CLI dispatch
     """CLI entry point. Returns a shell exit code."""
     parser = _build_parser(prog=prog)
     args = parser.parse_args(argv)
@@ -336,7 +348,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         return _cmd_check(args)
     if args.subcommand == "status":
         return _cmd_status(args)
-    if args.subcommand == "restart" or args.subcommand == "reload":
+    if args.subcommand in {"restart", "reload"}:
         return _cmd_restart(args)
 
     parser.print_help()
@@ -481,11 +493,14 @@ def _build_parser(prog: str | None = None) -> argparse.ArgumentParser:
 
 
 def _cmd_version() -> int:
+    from z4j_core.version import PROTOCOL_VERSION
+    from z4j_core.version import __version__ as core_version
+
     from z4j_bare import __version__ as bare_version
-    from z4j_core.version import PROTOCOL_VERSION, __version__ as core_version
-    print(f"z4j-bare {bare_version}")
-    print(f"z4j-core {core_version}")
-    print(f"protocol {PROTOCOL_VERSION}")
+
+    print(f"z4j-bare {bare_version}")  # noqa: T201  CLI output
+    print(f"z4j-core {core_version}")  # noqa: T201  CLI output
+    print(f"protocol {PROTOCOL_VERSION}")  # noqa: T201  CLI output
     return 0
 
 
@@ -502,7 +517,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     try:
         engine = _load_engine(args.engine, app_path)
     except ImportError as exc:
-        print(f"z4j: failed to load engine adapter: {exc}", file=sys.stderr)
+        print(f"z4j: failed to load engine adapter: {exc}", file=sys.stderr)  # noqa: T201  CLI output
         return 2
 
     try:
@@ -513,8 +528,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             project_id=args.project_id,
             autostart=True,
         )
-    except Exception as exc:  # noqa: BLE001
-        print(f"z4j: failed to install agent: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"z4j: failed to install agent: {exc}", file=sys.stderr)  # noqa: T201  CLI output
         return 1
 
     logger.info("z4j agent running (ctrl-c to stop)")
@@ -577,15 +592,13 @@ def _wait_for_shutdown(runtime: AgentRuntime) -> None:
     """Block until SIGINT/SIGTERM, then stop the runtime cleanly."""
     stop_requested = False
 
-    def _handle(signum: int, frame: object) -> None:  # noqa: ARG001
+    def _handle(signum: int, frame: object) -> None:
         nonlocal stop_requested
         stop_requested = True
 
     signal.signal(signal.SIGINT, _handle)
-    try:
+    with contextlib.suppress(AttributeError, ValueError):  # pragma: no cover  (Windows)
         signal.signal(signal.SIGTERM, _handle)
-    except (AttributeError, ValueError):  # pragma: no cover  (Windows)
-        pass
 
     # Simple wait loop - pause() would block forever even after signal
     # handler runs, so we use a small sleep and check the flag.
@@ -598,7 +611,7 @@ def _wait_for_shutdown(runtime: AgentRuntime) -> None:
     runtime.stop(timeout=10.0)
 
 
-def _load_doctor_config(args: argparse.Namespace) -> "Config":
+def _load_doctor_config(args: argparse.Namespace) -> Config:
     """Build a probe-ready Config from CLI args + Z4J_* env vars.
 
     Shared by the doctor and check commands. Raises ``ValueError``
@@ -607,20 +620,12 @@ def _load_doctor_config(args: argparse.Namespace) -> "Config":
     """
     import os as _os
 
-    from z4j_core.errors import ConfigError
     from z4j_core.models import Config
 
-    brain_url = (
-        getattr(args, "brain_url", None) or _os.environ.get("Z4J_BRAIN_URL")
-    )
+    brain_url = getattr(args, "brain_url", None) or _os.environ.get("Z4J_BRAIN_URL")
     token = getattr(args, "token", None) or _os.environ.get("Z4J_TOKEN")
-    project_id = (
-        getattr(args, "project_id", None) or _os.environ.get("Z4J_PROJECT_ID")
-    )
-    hmac_secret = (
-        getattr(args, "hmac_secret", None)
-        or _os.environ.get("Z4J_HMAC_SECRET")
-    )
+    project_id = getattr(args, "project_id", None) or _os.environ.get("Z4J_PROJECT_ID")
+    hmac_secret = getattr(args, "hmac_secret", None) or _os.environ.get("Z4J_HMAC_SECRET")
 
     missing = [
         name
@@ -651,20 +656,25 @@ def _load_doctor_config(args: argparse.Namespace) -> "Config":
         # '='); we accept anything that decodes to >= 32 bytes.
         try:
             import base64 as _base64
+
             padded = hmac_secret + "=" * (-len(hmac_secret) % 4)
             decoded = _base64.urlsafe_b64decode(padded)
-            if len(decoded) < 32:
-                raise ValueError(
-                    f"hmac_secret decodes to {len(decoded)} bytes; "
-                    f"the brain expects >= 32 bytes. Re-mint the agent "
-                    f"and copy the value from the brain's response."
-                )
         except (ValueError, _base64.binascii.Error) as exc:  # type: ignore[attr-defined]
             raise ValueError(
                 f"Z4J_HMAC_SECRET is malformed: {exc}. The value should "
                 f"be the urlsafe-base64 string the brain returned at "
                 f"agent-mint time.",
             ) from None
+        # Length check OUTSIDE the decode try/except: a structurally
+        # valid but too-short secret used to fall into the "malformed"
+        # rewrap above and report both messages concatenated. Distinct
+        # failure, distinct message.
+        if len(decoded) < 32:
+            raise ValueError(
+                f"Z4J_HMAC_SECRET decodes to {len(decoded)} bytes; "
+                f"the brain expects >= 32 bytes. Re-mint the agent "
+                f"and copy the value from the brain's response."
+            )
         config_kwargs["hmac_secret"] = hmac_secret
     return Config(**config_kwargs)
 
@@ -688,9 +698,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         config = _load_doctor_config(args)
     except (ConfigError, ValueError) as exc:
         if args.json:
-            print(json.dumps({"ok": False, "stage": "config", "error": str(exc)}, indent=2))
+            print(json.dumps({"ok": False, "stage": "config", "error": str(exc)}, indent=2))  # noqa: T201  CLI output
         else:
-            print(f"z4j-doctor: {exc}", file=sys.stderr)
+            print(f"z4j-doctor: {exc}", file=sys.stderr)  # noqa: T201  CLI output
         return 1
 
     results = []
@@ -723,18 +733,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 for r in results
             ],
         }
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(payload, indent=2))  # noqa: T201  CLI output
     else:
-        print("z4j-doctor (bare)")
-        print("=================")
-        print(f"  brain_url:   {config.brain_url}")
-        print(f"  project_id:  {config.project_id}")
-        print(f"  buffer_path: {config.buffer_path}")
-        print(f"  transport:   {config.transport}")
-        print()
+        print("z4j-doctor (bare)")  # noqa: T201  CLI output
+        print("=================")  # noqa: T201  CLI output
+        print(f"  brain_url:   {config.brain_url}")  # noqa: T201  CLI output
+        print(f"  project_id:  {config.project_id}")  # noqa: T201  CLI output
+        print(f"  buffer_path: {config.buffer_path}")  # noqa: T201  CLI output
+        print(f"  transport:   {config.transport}")  # noqa: T201  CLI output
+        print()  # noqa: T201  CLI output
         for r in results:
             tag = "[OK]  " if r.ok else "[FAIL]"
-            print(f"  {tag} {r.name:12s} {r.message}")
+            print(f"  {tag} {r.name:12s} {r.message}")  # noqa: T201  CLI output
     return 0 if all(r.ok for r in results) else 1
 
 
@@ -746,13 +756,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
     style monitors. ``-v`` flag (TODO) would re-emit doctor's full
     output on failure.
     """
+
     from z4j_bare import diagnostics
-    from z4j_core.models import Config
 
     try:
         config = _load_doctor_config(args)
-    except Exception as exc:  # noqa: BLE001
-        print(f"z4j-bare check: config: FAIL ({exc})", file=sys.stderr)
+    except Exception as exc:
+        print(f"z4j-bare check: config: FAIL ({exc})", file=sys.stderr)  # noqa: T201  CLI output
         return 1
 
     results = [diagnostics.probe_buffer_path(config.buffer_path)]
@@ -769,13 +779,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
     fails = [r for r in results if not r.ok]
     if fails:
         for r in fails:
-            print(f"z4j-bare check: {r.name}: FAIL ({r.message})")
+            print(f"z4j-bare check: {r.name}: FAIL ({r.message})")  # noqa: T201  CLI output
         return 1
-    print(f"z4j-bare check: all green ({len(results)} probes)")
+    print(f"z4j-bare check: all green ({len(results)} probes)")  # noqa: T201  CLI output
     return 0
 
 
-def _cmd_status(args: argparse.Namespace) -> int:  # noqa: ARG001
+def _cmd_status(args: argparse.Namespace) -> int:
     """One-line status: is an agent running on this host? Where?
 
     Reads the pidfile registry under ``$Z4J_HOME`` (default
@@ -785,22 +795,23 @@ def _cmd_status(args: argparse.Namespace) -> int:  # noqa: ARG001
     Exit 0 even if no agents are running (status is informational,
     not pass/fail; use ``check`` for that).
     """
-    from z4j_bare.control import _runtime_dir, pidfile_path  # noqa: PLC0415
+    from z4j_bare.control import _runtime_dir
 
     rd = _runtime_dir()
     pidfiles = sorted(rd.glob("agent-*.pid"))
     if not pidfiles:
-        print(f"z4j-bare status: no running agents under {rd}")
+        print(f"z4j-bare status: no running agents under {rd}")  # noqa: T201  CLI output
         return 0
 
-    print(f"z4j-bare status: agents under {rd}")
+    print(f"z4j-bare status: agents under {rd}")  # noqa: T201  CLI output
     import os as _os
+
     for pf in pidfiles:
         adapter = pf.stem.removeprefix("agent-")
         try:
             pid = int(pf.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
-            print(f"  z4j-{adapter:12s}  pidfile unreadable: {pf}")
+            print(f"  z4j-{adapter:12s}  pidfile unreadable: {pf}")  # noqa: T201  CLI output
             continue
         try:
             _os.kill(pid, 0)  # signal 0 = liveness probe, no signal sent
@@ -811,7 +822,7 @@ def _cmd_status(args: argparse.Namespace) -> int:  # noqa: ARG001
             alive = "running (different user)"
         except OSError as exc:
             alive = f"unknown ({exc})"
-        print(f"  z4j-{adapter:12s}  pid={pid}  {alive}")
+        print(f"  z4j-{adapter:12s}  pid={pid}  {alive}")  # noqa: T201  CLI output
     return 0
 
 
@@ -828,9 +839,9 @@ def _cmd_restart(args: argparse.Namespace) -> int:
     adapter = getattr(args, "adapter", "bare")
     rc, msg = send_restart(adapter)
     if rc == 0:
-        print(msg)
+        print(msg)  # noqa: T201  CLI output
     else:
-        print(f"z4j-bare restart: {msg}", file=sys.stderr)
+        print(f"z4j-bare restart: {msg}", file=sys.stderr)  # noqa: T201  CLI output
     return rc
 
 

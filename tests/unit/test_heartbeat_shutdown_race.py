@@ -39,7 +39,9 @@ from z4j_bare.heartbeat import Heartbeat
 @pytest.fixture
 def buf(tmp_path: Path) -> BufferStore:
     store = BufferStore(
-        path=tmp_path / "buf.sqlite", max_entries=100, max_bytes=100_000,
+        path=tmp_path / "buf.sqlite",
+        max_entries=100,
+        max_bytes=100_000,
     )
     yield store
     store.close()
@@ -81,7 +83,10 @@ class TestShutdownClassRuntimeErrorIsQuiet:
         ],
     )
     async def test_shutdown_runtimeerror_logs_at_debug(
-        self, buf: BufferStore, caplog, shutdown_msg: str,
+        self,
+        buf: BufferStore,
+        caplog,
+        shutdown_msg: str,
     ) -> None:
         def _provider() -> dict[str, str]:
             raise RuntimeError(shutdown_msg)
@@ -90,16 +95,15 @@ class TestShutdownClassRuntimeErrorIsQuiet:
 
         with caplog.at_level(logging.DEBUG, logger="z4j.runtime.heartbeat"):
             result = await hb._safe_provider_call(
-                _provider, provider_name="health",
+                _provider,
+                provider_name="health",
             )
 
         # Sentinel, not the loud blob.
         assert result == {"error": "shutting_down"}
 
         # No ERROR / exception-level record for this teardown event.
-        error_records = [
-            r for r in caplog.records if r.levelno >= logging.ERROR
-        ]
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert error_records == [], (
             "shutdown-class RuntimeError must NOT log at ERROR level - "
             f"got {[r.getMessage() for r in error_records]}"
@@ -107,12 +111,9 @@ class TestShutdownClassRuntimeErrorIsQuiet:
 
         # And it IS recorded at debug (so it's still observable).
         debug_records = [
-            r for r in caplog.records
-            if r.levelno == logging.DEBUG and "shutdown" in r.getMessage()
+            r for r in caplog.records if r.levelno == logging.DEBUG and "shutdown" in r.getMessage()
         ]
-        assert debug_records, (
-            "shutdown-class RuntimeError should leave a debug breadcrumb"
-        )
+        assert debug_records, "shutdown-class RuntimeError should leave a debug breadcrumb"
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +124,9 @@ class TestShutdownClassRuntimeErrorIsQuiet:
 class TestGenuineFailuresStayLoud:
     @pytest.mark.asyncio
     async def test_non_shutdown_runtimeerror_still_logs_exception(
-        self, buf: BufferStore, caplog,
+        self,
+        buf: BufferStore,
+        caplog,
     ) -> None:
         def _provider() -> dict[str, str]:
             raise RuntimeError("the broker exploded for real")
@@ -132,14 +135,13 @@ class TestGenuineFailuresStayLoud:
 
         with caplog.at_level(logging.DEBUG, logger="z4j.runtime.heartbeat"):
             result = await hb._safe_provider_call(
-                _provider, provider_name="health",
+                _provider,
+                provider_name="health",
             )
 
         assert result == {"error": "provider raised"}
         # A non-shutdown RuntimeError is a real failure -> exception level.
-        error_records = [
-            r for r in caplog.records if r.levelno >= logging.ERROR
-        ]
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert error_records, (
             "a genuine (non-shutdown) RuntimeError must still surface at "
             "exception level - the fix must not silence real failures"
@@ -147,7 +149,9 @@ class TestGenuineFailuresStayLoud:
 
     @pytest.mark.asyncio
     async def test_value_error_still_logs_exception(
-        self, buf: BufferStore, caplog,
+        self,
+        buf: BufferStore,
+        caplog,
     ) -> None:
         def _provider() -> dict[str, str]:
             raise ValueError("malformed provider output")
@@ -156,7 +160,8 @@ class TestGenuineFailuresStayLoud:
 
         with caplog.at_level(logging.DEBUG, logger="z4j.runtime.heartbeat"):
             result = await hb._safe_provider_call(
-                _provider, provider_name="status",
+                _provider,
+                provider_name="status",
             )
 
         assert result == {"error": "provider raised"}
@@ -173,7 +178,8 @@ class TestGenuineFailuresStayLoud:
 class TestFixCStopRecheck:
     @pytest.mark.asyncio
     async def test_stop_set_skips_dispatch_entirely(
-        self, buf: BufferStore,
+        self,
+        buf: BufferStore,
     ) -> None:
         calls = {"n": 0}
 
@@ -186,7 +192,8 @@ class TestFixCStopRecheck:
         hb.stop_event.set()
 
         result = await hb._safe_provider_call(
-            _provider, provider_name="health",
+            _provider,
+            provider_name="health",
         )
 
         assert result == {"error": "shutting_down"}
@@ -204,12 +211,15 @@ class TestFixCStopRecheck:
 class TestSentinelDoesNotReintroduceNoise:
     @pytest.mark.asyncio
     async def test_status_shutdown_sentinel_skips_payload_construction(
-        self, buf: BufferStore, caplog,
+        self,
+        buf: BufferStore,
+        caplog,
     ) -> None:
         """A status provider that hits the shutdown race must NOT route
         ``{"error": "shutting_down"}`` into AgentStatusPayload(**status),
         which would raise an invalid-shape error logged at exception
         level - re-creating the very noise we removed."""
+
         def _status_provider() -> dict[str, Any]:
             raise RuntimeError("cannot schedule new futures after shutdown")
 
@@ -220,9 +230,9 @@ class TestSentinelDoesNotReintroduceNoise:
 
         # No "returned invalid shape" exception-level record.
         invalid_shape = [
-            r for r in caplog.records
-            if r.levelno >= logging.ERROR
-            and "invalid shape" in r.getMessage()
+            r
+            for r in caplog.records
+            if r.levelno >= logging.ERROR and "invalid shape" in r.getMessage()
         ]
         assert invalid_shape == [], (
             "shutting_down sentinel leaked into AgentStatusPayload "
@@ -234,11 +244,14 @@ class TestSentinelDoesNotReintroduceNoise:
 
     @pytest.mark.asyncio
     async def test_health_shutdown_sentinel_skips_heartbeat_append(
-        self, buf: BufferStore, caplog,
+        self,
+        buf: BufferStore,
+        caplog,
     ) -> None:
         """A health provider that hits the shutdown race must skip the
         heartbeat append rather than ship a dying tick carrying the
         sentinel as its health blob."""
+
         def _health_provider() -> dict[str, str]:
             raise RuntimeError("cannot schedule new futures after shutdown")
 
@@ -247,9 +260,7 @@ class TestSentinelDoesNotReintroduceNoise:
         with caplog.at_level(logging.DEBUG, logger="z4j.runtime.heartbeat"):
             await hb._enqueue_heartbeat()
 
-        error_records = [
-            r for r in caplog.records if r.levelno >= logging.ERROR
-        ]
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert error_records == []
         # The dying heartbeat tick was skipped; nothing buffered.
         assert buf.size() == 0

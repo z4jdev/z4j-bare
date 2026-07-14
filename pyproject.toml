@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.6.9"
+version = "1.7.0"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,20 +22,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Audit fix CRIT-3 (1.2.2 eighth-pass): floor bumped to
-    # 1.2.2 because ``z4j_bare/declarative.py`` imports
-    # ``z4j_core.celerybeat_compat`` which only ships in
-    # z4j-core 1.2.2+. An install with z4j-core 1.1.x would
-    # ImportError on the declarative reconciler module
-    # (which every framework adapter, z4j-django, z4j-flask,
-    # z4j-fastapi, depends on). Pre-1.2.2 the dispatcher
-    # path needed CommandPayload from 1.1.0; that floor is
-    # subsumed by the 1.2.2 floor here.
-    # z4j-core >=1.3.1: needed for the SCHEDULE_SNAPSHOT EventKind
-    # the runtime emits at boot / on the periodic timer / on the
-    # ``schedule.resync`` command. Pre-1.3.1 the kind doesn't exist;
-    # the brain would log "unknown event kind" and ignore the snapshot.
-    "z4j-core>=1.4.0,<2",
+    # Intra-z4j floor policy: every z4j package in a release wave
+    # is tested together, so intra-z4j floors track the wave version.
+    # Mixed-version installs are refused rather than half-supported
+    # (a 1.6.x mixed-dispatcher install was an RCE re-open, R9-H2).
+    "z4j-core>=1.7.0,<2",
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]

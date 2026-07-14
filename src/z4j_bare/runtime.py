@@ -23,7 +23,7 @@ they call :func:`z4j_bare.install.install_agent`.
 from __future__ import annotations
 
 import asyncio
-import base64
+import contextlib
 import logging
 import os
 import random
@@ -31,7 +31,7 @@ import sys
 import threading
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from z4j_core.errors import (
     AuthenticationError,
@@ -53,8 +53,17 @@ from z4j_bare.buffer import BufferStore
 from z4j_bare.dispatcher import CommandDispatcher
 from z4j_bare.heartbeat import Heartbeat
 from z4j_bare.safety import safe_call
-from z4j_bare.transport.longpoll import LongPollTransport
-from z4j_bare.transport.websocket import PartialSendError, WebSocketTransport
+from z4j_bare.transport.longpoll import (
+    LongPollTransport,
+    PayloadTooLargeError,
+    UploadContentRejectedError,
+    UploadRetryableError,
+)
+from z4j_bare.transport.websocket import (
+    PartialSendError,
+    UndeliverableFrameError,
+    WebSocketTransport,
+)
 
 if TYPE_CHECKING:
     from z4j_core.models import Config
@@ -128,15 +137,15 @@ def _drain_default_executor(loop: asyncio.AbstractEventLoop, *, deadline_s: floa
             done.set()
 
     threading.Thread(
-        target=_join, name="z4j-exec-drain", daemon=True,
+        target=_join,
+        name="z4j-exec-drain",
+        daemon=True,
     ).start()
     if not done.wait(deadline_s):
         # Wedged provider thread; abandon the wait. The pool threads
         # are daemon and will be reaped at interpreter exit.
-        try:
+        with contextlib.suppress(Exception):
             executor.shutdown(wait=False)
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _heartbeat_enabled() -> bool:
@@ -162,31 +171,56 @@ def _heartbeat_enabled() -> bool:
     return val.strip().lower() not in ("0", "false", "no", "off", "")
 
 
-def _peek_frame_id(payload: bytes) -> str | None:
-    """Cheap extraction of the ``id`` field from a serialized frame.
+def _peek_frame_meta(payload: bytes) -> tuple[str | None, str | None]:
+    """Cheap extraction of the ``id`` and ``type`` fields from a serialized
+    frame, without a full Pydantic parse.
 
-    The send loop hands the buffer the pre-serialized frame bytes;
-    to correlate the brain's ``event_batch_ack`` to the buffer entry
-    that produced the batch, we need the frame.id at send time
-    without paying for a full Pydantic parse on every entry. JSON
-    parsing of a few hundred bytes is single-digit microseconds and
-    runs only at send time (not for every event).
+    The send loop hands the buffer the pre-serialized frame bytes; to correlate
+    the brain's ``event_batch_ack`` to the buffer entry that produced the batch
+    we need the frame.id at send time. We ALSO read the wire ``type`` so the
+    ack-deferral decision keys off what the frame ACTUALLY is, not the buffer
+    entry's ``kind`` metadata -- a mislabelled entry (kind="event_batch" over a
+    heartbeat payload, from buffer corruption / a bad migration) would otherwise
+    be registered for an ``event_batch_ack`` the brain never emits (round-10
+    external LOW). JSON parsing of a few hundred bytes is single-digit
+    microseconds and runs only at send time (not for every event).
 
-    Returns ``None`` if parsing fails. Caller falls back to the
-    legacy "confirm immediately" path for that entry, so a
-    pathologically corrupt payload doesn't pin the buffer.
+    Returns ``(None, None)`` if parsing fails. The caller falls back to the
+    "confirm immediately" path for that entry, so a pathologically corrupt
+    payload doesn't pin the buffer.
     """
     import json as _json
 
     try:
         decoded = _json.loads(payload)
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception:
+        return None, None
     if isinstance(decoded, dict):
         fid = decoded.get("id")
-        if isinstance(fid, str):
-            return fid
-    return None
+        ftype = decoded.get("type")
+        return (
+            fid if isinstance(fid, str) else None,
+            ftype if isinstance(ftype, str) else None,
+        )
+    return None, None
+
+
+def _entry_is_event_batch(entry) -> bool:
+    """True if a buffer entry's PARSED WIRE type is ``event_batch`` (falling back
+    to the stored ``kind`` metadata only when the payload cannot be peeked).
+
+    The ack-deferral (``_confirm_or_register``) and the backpressure cap
+    (``_cap_event_batch_entries`` + the at-cap drain filter) must agree on what
+    counts as an event_batch. Keying only on the buffer ``kind`` metadata let a
+    mislabelled entry (a real event_batch stored under kind="heartbeat" via
+    corruption / a bad migration) slip past the in-flight cap -- registered for
+    an ack yet never counted against ``_MAX_IN_FLIGHT_BATCHES`` (round-12
+    external LOW). Deciding by the wire type here keeps the two consistent.
+    """
+    _fid, ftype = _peek_frame_meta(getattr(entry, "payload", None))
+    if ftype is not None:
+        return ftype == "event_batch"
+    return getattr(entry, "kind", None) == "event_batch"
 
 
 class RuntimeState(StrEnum):
@@ -202,24 +236,72 @@ class RuntimeState(StrEnum):
 # changing them requires thinking about the buffer contract and the
 # brain's ingest rate.
 _SEND_BATCH_SIZE = 500
+#: Floor for the adaptive send-batch size: on a long-poll 413 (body too
+#: large) the batch is halved down to this so an oversized frame is
+#: isolated to a batch of one, where it can be dropped precisely
+#: (R7-MED) rather than pinning valid siblings behind it.
+_MIN_SEND_BATCH = 1
 _SEND_IDLE_SLEEP = 0.05
 _RECONNECT_INITIAL = 1.0
 _RECONNECT_MAX = 30.0
 _RECONNECT_JITTER = 0.3
 
-#: How long an event_batch frame can sit in
-#: ``_pending_acks`` before the watchdog evicts it. First eviction
-#: also flips ``_brain_supports_acks`` to False (legacy-mode
-#: fallback). 90s is generous to allow first-batch drain under
-#: heavy fanout (brain ingest is bounded around 80
-#: events/s/connection); going lower thrashes legacy-mode under
-#: load and silently undermines the per-batch ack delivery
-#: guarantee.
+#: How long an event_batch frame can sit in ``_pending_acks`` before
+#: the watchdog RE-SENDS it (it is never confirmed or dropped there,
+#: only re-queued for another send). 90s is generous to allow
+#: first-batch drain under heavy fanout (brain ingest is bounded around
+#: 80 events/s/connection); going lower re-sends healthy-but-slow
+#: batches needlessly (the brain dedups, so it is only wasteful).
 _ACK_DEADLINE_SECONDS = 90.0
 #: Watchdog poll cadence. Sleeps this long between sweeps. Aim for
 #: the fastest cadence that doesn't burn CPU while keeping eviction
 #: precise to within a few seconds.
 _ACK_WATCHDOG_INTERVAL_SECONDS = 2.0
+#: Bounded-retry cap: after this many CONTENT-rejection cycles (the
+#: brain is reachable and speaks acks but keeps rejecting this specific
+#: batch, or a long-poll upload keeps returning a content-error status)
+#: the entry is quarantined (dropped, logged). Only content rejections
+#: count -- a flaky connection or a transient 5xx never increments this,
+#: so a deliverable batch is never dropped (R6-F4). At the 90s WS ack
+#: deadline this is ~15 minutes of active rejection before a genuinely
+#: undeliverable event_batch is dropped.
+_MAX_SEND_ATTEMPTS = 10
+#: Backpressure cap on concurrent un-acked event_batch frames (WS
+#: deferred-ack mode). Bounds ``_pending_acks`` and therefore the
+#: ``exclude_ids`` set passed to ``buffer.drain`` well under SQLite's
+#: 32766-bound-parameter ceiling (R6-F5), and stops the agent piling
+#: unbounded un-acked batches on a slow/stalled brain.
+_MAX_IN_FLIGHT_BATCHES = 256
+#: Long-poll TRANSIENT-retry backoff (seconds): a transient partial
+#: store sleeps this long (doubling per consecutive failure, capped)
+#: before re-sending the whole batch, so a struggling brain is not
+#: hammered (R7-HIGH2). Capped LOW (5s, not 30s): the brain now drops-
+#: and-acks every deterministic failure at source, so a partial store is
+#: always a genuine transient that self-heals within a few rounds; a 30s
+#: cap only slowed recovery and lengthened the window a real outage held
+#: the single-threaded send loop (R8).
+_SEND_BACKOFF_INITIAL = 0.5
+_SEND_BACKOFF_MAX = 5.0
+#: Fixed inter-attempt delay (seconds) on the long-poll CONTENT-reject
+#: path (413 / 415 / 422; a bare 400 is request-level and retried, R8-M2).
+#: Deliberately SMALL and NON-growing so
+#: bisection + the bounded per-frame drop clear a poison frame within a
+#: couple of seconds instead of the ~150s a growing backoff took, which
+#: starved every control frame queued behind the poison (R8: the R7 code
+#: shared the growing transient backoff here and blocked the head of the
+#: oldest-first queue for minutes).
+_CONTENT_REJECT_DELAY = 0.1
+#: After this many CONSECUTIVE long-poll partial-store retries that made
+#: ZERO confirmed progress, force a reconnect (fresh session_nonce) instead
+#: of re-POSTing the identical bytes forever. A normal transient (deadlock /
+#: pool blip) self-heals in 1-2 rounds and never approaches this. A
+#: PERSISTENT partial-200 that the retry-backoff alone cannot resolve --
+#: a send-side session/identity SignatureError (only a reconnect rebuilds
+#: the session binding), or a protocol-version skew during a rolling upgrade
+#: -- otherwise wedges the send loop forever because only the RECEIVE loop
+#: reconnects on its own error. ~20 x 5s cap = ~100s before re-establishing;
+#: no frame is dropped (reconnect preserves the buffer), R9.
+_MAX_CONSECUTIVE_RETRYABLE = 20
 
 # Auth-error backoff schedule. AuthenticationError indicates the
 # brain rejected the agent's bearer token (mismatched HMAC, revoked
@@ -242,32 +324,16 @@ _PROTOCOL_RECONNECT_MAX = 60.0
 def _decode_hmac_secret(value: str) -> bytes:
     """Decode the configured ``hmac_secret`` string into raw bytes.
 
-    The brain returns the per-project secret as
-    ``base64.urlsafe_b64encode(raw_32_bytes)`` on agent mint
-    (see ``z4j_brain.api.agents.CreateAgentResponse.hmac_secret``).
-    The operator pastes that string into ``Z4J_HMAC_SECRET`` /
-    ``settings.Z4J["hmac_secret"]`` and the agent must decode it
-    back to the same 32 bytes the brain uses for HMAC.
-
-    Padding is added if missing (urlsafe-base64 is sometimes
-    written without trailing ``=`` for shell ergonomics). On a
-    decode failure we raise ``ValueError`` rather than silently
-    falling back to UTF-8 encoding - the latter would mismatch
-    the brain's signature and produce a confusing
-    ``SignatureError`` at first frame instead of a clear config
-    error at start-up.
+    Thin wrapper over :func:`z4j_core.transport.hmac.decode_agent_hmac_secret`
+    -- the single source of truth for this decode, shared with the
+    ``purge_queue`` confirm-token path so frame signing and the purge
+    token always key on the identical bytes.
     """
-    candidate = value.strip()
-    if not candidate:
-        raise ValueError("hmac_secret is empty")
-    padded = candidate + "=" * (-len(candidate) % 4)
-    try:
-        return base64.urlsafe_b64decode(padded)
-    except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-        raise ValueError(
-            "hmac_secret must be urlsafe-base64 (the value the brain "
-            "returns from POST /agents); got an undecodable string",
-        ) from exc
+    from z4j_core.transport.hmac import (
+        decode_agent_hmac_secret,
+    )
+
+    return decode_agent_hmac_secret(value)
 
 
 class AgentRuntime:
@@ -296,9 +362,7 @@ class AgentRuntime:
         self.config = config
         self.framework = framework
         self.engines: dict[str, QueueEngineAdapter] = {e.name: e for e in engines}
-        self.schedulers: dict[str, SchedulerAdapter] = {
-            s.name: s for s in (schedulers or [])
-        }
+        self.schedulers: dict[str, SchedulerAdapter] = {s.name: s for s in (schedulers or [])}
 
         self._state = RuntimeState.STOPPED
         self._state_lock = threading.Lock()
@@ -352,22 +416,31 @@ class AgentRuntime:
         # so backpressure is via the buffer cap, not unbounded
         # growth here.
         self._pending_acks: dict[str, tuple[int, datetime]] = {}
-        # Whether the brain we're talking to speaks the v1.5 ack
-        # protocol. True at the start of each session. The watchdog
-        # flips it to False ONLY if a batch ages out without ever
-        # seeing an ack AND we have not observed any ack from this
-        # brain yet (``_brain_acks_observed`` below). Once we see
-        # one ack we know the brain is 1.5+ and never fall back -
-        # a missing ack thereafter means a poison batch the brain
-        # rejected, NOT a legacy brain, and the agent must let the
-        # buffer entry stay un-confirmed so the next reconnect
-        # re-sends it.
-        self._brain_supports_acks: bool = True
-        # Sticky "we've seen at least one ack from this brain" flag.
-        # Set on first ``EventBatchAckFrame`` arrival; reset only on
-        # ``_connect_and_run`` cycle (the brain may have changed
-        # versions across reconnect).
-        self._brain_acks_observed: bool = False
+        # Frame ids the brain acked BEFORE the send loop registered them
+        # in ``_pending_acks``. The receive loop can process an
+        # ``event_batch_ack`` while the send loop is still awaiting the
+        # send that produced it; without this, that ack would pop nothing
+        # and the entry would sit un-confirmed until the 90s watchdog
+        # (R6-F7). The send loop consults this set at registration time
+        # and confirms immediately if the ack already arrived. Bounded;
+        # cleared on reconnect.
+        self._acks_seen_early: set[str] = set()
+        # Current long-poll retry backoff (seconds), grown on consecutive
+        # retryable outcomes (transient partial store, content reject,
+        # 413) and reset on a successful send. Gives a genuinely-poison
+        # frame a real backoff instead of a 50ms hot-loop (R7-HIGH2).
+        self._send_backoff: float = _SEND_BACKOFF_INITIAL
+        # Consecutive long-poll partial-store retries with zero confirmed
+        # progress. Reset on any successful send and on reconnect; when it
+        # crosses ``_MAX_CONSECUTIVE_RETRYABLE`` the send loop forces a
+        # reconnect so a persistent session/version skew is not re-POSTed
+        # forever (R9).
+        self._consecutive_retryable: int = 0
+        # Current per-send batch size. Starts at ``_SEND_BATCH_SIZE`` and
+        # is halved on an HTTP 413 (long-poll body too large) down to a
+        # floor of 1, so an agent behind a small server body cap adapts
+        # instead of looping on an oversized POST (R6-F6).
+        self._send_batch_size: int = _SEND_BATCH_SIZE
 
         # Reconnect-now event. set() by the SIGHUP handler from
         # z4j_bare.control.install_sighup_handler. The supervisor
@@ -485,13 +558,11 @@ class AgentRuntime:
             # was delayed past the timeout. Tear down so the runtime
             # is left in a clean STOPPED state.
             logger.error(
-                "z4j agent runtime: background loop did not become ready "
-                "within 5s; tearing down",
+                "z4j agent runtime: background loop did not become ready within 5s; tearing down",
             )
             self._abort_start()
             raise RuntimeError(
-                "z4j agent runtime failed to start: background loop did "
-                "not become ready",
+                "z4j agent runtime failed to start: background loop did not become ready",
             )
 
         with self._state_lock:
@@ -522,7 +593,7 @@ class AgentRuntime:
                     adapter_id,
                 )
             install_sighup_handler(self)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "z4j agent: failed to set up control surface "
                 "(pidfile + SIGHUP). Runtime is unaffected.",
@@ -539,7 +610,7 @@ class AgentRuntime:
         if self._buffer is not None:
             try:
                 self._buffer.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("error closing buffer during start abort")
             self._buffer = None
         # Wait briefly for the thread to exit on its own; daemon=True
@@ -578,7 +649,7 @@ class AgentRuntime:
             from z4j_bare.control import remove_pidfile
 
             remove_pidfile(self.framework.name if self.framework else "bare")
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: S110  best-effort pidfile cleanup on stop
             pass
 
         with self._state_lock:
@@ -619,8 +690,12 @@ class AgentRuntime:
         self-contained and easy to confirm individually.
         """
         import secrets as _secrets
+
         frame = EventBatchFrame(
-            id=f"ev_{_secrets.token_hex(6)}",
+            # 128-bit id: event_batch ids key _pending_acks, so a 48-bit
+            # collision could let a real ack for one entry delete a different
+            # unstored entry (R8-M5). 35 chars, within the 64-char id cap.
+            id=f"ev_{_secrets.token_hex(16)}",
             ts=datetime.now(UTC),
             payload=EventBatchPayload(
                 events=[
@@ -670,7 +745,7 @@ class AgentRuntime:
             self._loop = loop
             self._stop_event = asyncio.Event()
             self._reconnect_now = asyncio.Event()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("z4j agent failed to create asyncio loop")
             self._loop_ready.set()  # unblock the caller's wait()
             return
@@ -680,7 +755,7 @@ class AgentRuntime:
 
         try:
             loop.run_until_complete(self._main())
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("z4j agent runtime loop crashed")
         finally:
             # Deterministic executor drain BEFORE close (the "Fix B"
@@ -694,19 +769,15 @@ class AgentRuntime:
             # thread (the ``inspector.stats()`` BRPOP case the
             # heartbeat defends against) can never hang teardown -
             # the daemon thread is the ultimate net.
-            try:
+            # Drain is best-effort hardening; never let it block
+            # or crash the close path below.
+            with contextlib.suppress(Exception):
                 _drain_default_executor(loop, deadline_s=2.0)
-            except Exception:  # noqa: BLE001
-                # Drain is best-effort hardening; never let it block
-                # or crash the close path below.
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 loop.close()
-            except Exception:  # noqa: BLE001
-                pass
             self._loop = None
 
-    async def _main(self) -> None:
+    async def _main(self) -> None:  # noqa: PLR0912, PLR0915  asyncio main orchestration
         """The actual asyncio main - runs transport, send loop, heartbeat."""
         assert self._buffer is not None
         assert self._stop_event is not None
@@ -737,6 +808,7 @@ class AgentRuntime:
             buffer=self._buffer,
             resync_schedules=self.resync_schedules_now,
         )
+
         def _collect_engine_health() -> dict[str, str]:
             """Aggregate health from all engine adapters for the heartbeat."""
             import json as _json
@@ -753,11 +825,12 @@ class AgentRuntime:
                             # stay as strings.
                             if isinstance(v, (dict, list)):
                                 result[f"{name}.{k}"] = _json.dumps(
-                                    v, default=str,
+                                    v,
+                                    default=str,
                                 )
                             else:
                                 result[f"{name}.{k}"] = str(v)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         result[f"{name}.error"] = "health check failed"
             return result
 
@@ -771,14 +844,13 @@ class AgentRuntime:
             )
             from z4j_core.version import __version__ as _agent_ver
 
-            buffer_depth = (
-                self._buffer.size() if self._buffer is not None else 0
-            )
+            buffer_depth = self._buffer.size() if self._buffer is not None else 0
             session_age: float | None = None
             last_connect: datetime | None = self._last_successful_connect_at
             if last_connect is not None:
                 session_age = max(
-                    (datetime.now(UTC) - last_connect).total_seconds(), 0.0,
+                    (datetime.now(UTC) - last_connect).total_seconds(),
+                    0.0,
                 )
             return {
                 "auth_failure_streak": self._auth_error_count,
@@ -808,8 +880,7 @@ class AgentRuntime:
             # the executor teardown on a boot-then-exit process.
             self._heartbeat = None
             logger.debug(
-                "z4j agent heartbeat disabled (Z4J_HEARTBEAT=0); "
-                "running heartbeat-less",
+                "z4j agent heartbeat disabled (Z4J_HEARTBEAT=0); running heartbeat-less",
             )
 
         # CRIT #1: wire engine + scheduler signal handlers. Without this
@@ -839,9 +910,10 @@ class AgentRuntime:
                     # is what fixes the previous "everything reports
                     # as celery-beat" bug.
                     scheduler_name = scheduler.name
-                    def _sink(action: str, schedule: object,
-                              _name: str = scheduler_name) -> None:
+
+                    def _sink(action: str, schedule: object, _name: str = scheduler_name) -> None:
                         self._scheduler_sink(_name, action, schedule)
+
                     connect(sink=_sink)
                 connected_schedulers.append(scheduler)
 
@@ -881,10 +953,12 @@ class AgentRuntime:
             # doesn't block the rest of the agent's startup.
             schedule_inventory_tasks: list[asyncio.Task[None]] = []
             for scheduler in connected_schedulers:
-                schedule_inventory_tasks.append(asyncio.create_task(
-                    self._emit_schedule_snapshot(scheduler, reason="boot"),
-                    name=f"z4j-schedule-inventory-{getattr(scheduler, 'name', 'unknown')}",
-                ))
+                schedule_inventory_tasks.append(
+                    asyncio.create_task(
+                        self._emit_schedule_snapshot(scheduler, reason="boot"),
+                        name=f"z4j-schedule-inventory-{getattr(scheduler, 'name', 'unknown')}",
+                    )
+                )
 
             # 1.3.3 - Phase B: periodic schedule resync.
             # A long-lived task that drains ``list_schedules()`` on
@@ -916,10 +990,8 @@ class AgentRuntime:
             for task in engine_consumer_tasks:
                 task.cancel()
             for task in engine_consumer_tasks:
-                try:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
 
             # Disconnect in reverse order, swallowing per-adapter errors
             # so one failing adapter cannot strand another's signals.
@@ -928,7 +1000,7 @@ class AgentRuntime:
                 if callable(disconnect):
                     try:
                         disconnect()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.exception(
                             "z4j agent: scheduler %s disconnect_signals raised",
                             getattr(scheduler, "name", scheduler),
@@ -939,7 +1011,7 @@ class AgentRuntime:
                 if callable(disconnect):
                     try:
                         disconnect()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.exception(
                             "z4j agent: engine %s disconnect_signals raised",
                             getattr(engine, "name", engine),
@@ -964,7 +1036,7 @@ class AgentRuntime:
                 self.record_event(event)
         except asyncio.CancelledError:
             return
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "z4j agent: engine %s event consumer crashed",
                 getattr(engine, "name", engine),
@@ -1003,10 +1075,11 @@ class AgentRuntime:
         scheduler_name = getattr(scheduler, "name", "unknown")
         try:
             schedules = await scheduler.list_schedules()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "z4j agent: scheduler %s list_schedules failed (reason=%s)",
-                scheduler_name, reason,
+                scheduler_name,
+                reason,
             )
             return
 
@@ -1020,10 +1093,9 @@ class AgentRuntime:
                 continue
             try:
                 schedules_payload.append(dump(mode="json"))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
-                    "z4j agent: scheduler %s yielded a Schedule that "
-                    "failed model_dump",
+                    "z4j agent: scheduler %s yielded a Schedule that failed model_dump",
                     scheduler_name,
                 )
                 continue
@@ -1046,7 +1118,9 @@ class AgentRuntime:
         self.record_event(event)
         logger.info(
             "z4j agent: scheduler %s snapshot emitted (count=%d, reason=%s)",
-            scheduler_name, len(schedules_payload), reason,
+            scheduler_name,
+            len(schedules_payload),
+            reason,
         )
 
     async def _periodic_schedule_resync(
@@ -1066,18 +1140,20 @@ class AgentRuntime:
         while not self._stop_event.is_set():
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=interval,
+                    self._stop_event.wait(),
+                    timeout=interval,
                 )
                 # Stop signalled - exit cleanly.
                 return
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Normal tick - drain every scheduler.
                 pass
             for scheduler in schedulers:
                 if self._stop_event.is_set():
                     return
                 await self._emit_schedule_snapshot(
-                    scheduler, reason="periodic",
+                    scheduler,
+                    reason="periodic",
                 )
 
     async def resync_schedules_now(self, reason: str = "command") -> int:
@@ -1095,7 +1171,10 @@ class AgentRuntime:
         return len(schedulers)
 
     def _scheduler_sink(
-        self, scheduler_name: str, action: str, schedule: object,
+        self,
+        scheduler_name: str,
+        action: str,
+        schedule: object,
     ) -> None:
         """Sink passed to scheduler adapters' ``connect_signals``.
 
@@ -1132,7 +1211,7 @@ class AgentRuntime:
             if callable(dump):
                 try:
                     schedule_dict = dump(mode="json")
-                except Exception:  # noqa: BLE001
+                except Exception:
                     schedule_dict = {}
             placeholder = uuid4()
             event = Event(
@@ -1149,7 +1228,7 @@ class AgentRuntime:
 
         safe_call(_build_and_record)
 
-    async def _supervise(self) -> None:
+    async def _supervise(self) -> None:  # noqa: PLR0912, PLR0915  supervisor reconnect loop
         """Supervisor: connect → run tasks → on disconnect, reconnect.
 
         Forever-retry contract (1.1.2+): every error class except
@@ -1229,7 +1308,7 @@ class AgentRuntime:
                 error_class = "connection"
                 err = _first(eg)
                 self._connection_error_count += 1
-            except* Exception as eg:  # noqa: BLE001
+            except* Exception as eg:
                 # Unknown failure class. Treat as connection-class
                 # for backoff purposes; log full traceback so future
                 # categorisation is possible. Never fatal.
@@ -1246,8 +1325,10 @@ class AgentRuntime:
 
             if err is not None:
                 count = (
-                    self._auth_error_count if error_class == "auth"
-                    else self._protocol_error_count if error_class == "protocol"
+                    self._auth_error_count
+                    if error_class == "auth"
+                    else self._protocol_error_count
+                    if error_class == "protocol"
                     else self._connection_error_count
                 )
                 _log_disconnect(error_class, err, count)
@@ -1269,7 +1350,7 @@ class AgentRuntime:
                 jitter = _RECONNECT_JITTER
                 cap = _RECONNECT_MAX
 
-            sleep_for = base + random.uniform(0, base * jitter)
+            sleep_for = base + random.uniform(0, base * jitter)  # noqa: S311  non-security reconnect jitter
             # Wake either on stop (clean exit) or reconnect_now
             # (SIGHUP from z4j-<adapter> restart). On reconnect_now
             # we clear the event and skip straight to the next
@@ -1292,8 +1373,7 @@ class AgentRuntime:
                 if reconnect_task in done:
                     self._reconnect_now.clear()
                     logger.info(
-                        "z4j agent reconnect requested via SIGHUP; "
-                        "skipping remaining backoff",
+                        "z4j agent reconnect requested via SIGHUP; skipping remaining backoff",
                     )
             finally:
                 # Defensively cancel any task that survived the
@@ -1333,9 +1413,7 @@ class AgentRuntime:
         # would still be pinned at the 30s/60s/600s cap on its next
         # disconnect, which is worse than starting at 1s/1s/10s.
         prior_failures = (
-            self._connection_error_count
-            + self._protocol_error_count
-            + self._auth_error_count
+            self._connection_error_count + self._protocol_error_count + self._auth_error_count
         )
         if prior_failures > 0:
             logger.info(
@@ -1358,14 +1436,23 @@ class AgentRuntime:
                 float(self._transport.heartbeat_interval),
             )
 
-        # Reset per-connection ack tracking
-        # before the send loop starts on this connection. The
-        # ``_brain_supports_acks`` probe re-runs on every connect so
-        # an operator who restarts a 1.5+ brain after a 1.4 brain
-        # picks up ack mode again without restarting agents.
+        # Reset per-connection ack tracking before the send loop starts
+        # on this connection. Un-acked entries from the previous
+        # connection re-drain and re-send (the brain dedups any that
+        # landed); nothing is confirmed or dropped on reconnect.
         self._pending_acks.clear()
-        self._brain_supports_acks = True
-        self._brain_acks_observed = False
+        self._acks_seen_early.clear()
+        # Restore the full send batch size on a fresh connection: a 413
+        # that shrank it may have been a per-connection proxy limit that
+        # no longer applies (R6-F6). If the new brain still 413s, it
+        # shrinks again.
+        self._send_batch_size = _SEND_BATCH_SIZE
+        # Reset the retryable-outcome backoff too, so a backoff grown on a
+        # dying session does not throttle the first sends of a fresh one.
+        self._send_backoff = _SEND_BACKOFF_INITIAL
+        # Fresh session -> the persistent-retryable reconnect counter starts
+        # over (R9).
+        self._consecutive_retryable = 0
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._run_send_loop(), name="z4j-send")
@@ -1381,7 +1468,32 @@ class AgentRuntime:
         await self._stop_event.wait()
         raise _StopRequested()
 
-    async def _run_send_loop(self) -> None:
+    @staticmethod
+    def _cap_event_batch_entries(entries: list, max_event_batch: int) -> list:
+        """Keep every non-event_batch entry plus the OLDEST ``max_event_batch``
+        event_batch entries (order preserved).
+
+        The excess event_batch entries stay in the buffer (drain is a
+        non-destructive SELECT), so they re-drain once acks free in-flight
+        slots -- bounding the WS ``_pending_acks`` window at the cap without
+        starving control frames or losing any event (R8-M4).
+        """
+        if max_event_batch <= 0:
+            # Not expected in the below-cap branch (remaining >= 1 there), but
+            # be safe: send only control frames this pass. Decide by WIRE type,
+            # not the stored ``kind`` (round-12 external LOW).
+            return [e for e in entries if not _entry_is_event_batch(e)]
+        kept: list = []
+        eb_count = 0
+        for e in entries:
+            if _entry_is_event_batch(e):
+                if eb_count >= max_event_batch:
+                    continue
+                eb_count += 1
+            kept.append(e)
+        return kept
+
+    async def _run_send_loop(self) -> None:  # noqa: PLR0912  central send-outcome dispatch (one branch per transport outcome)
         """Drain the buffer to the transport in batches."""
         assert self._transport is not None
         assert self._stop_event is not None
@@ -1396,7 +1508,46 @@ class AgentRuntime:
             return
 
         while not self._stop_event.is_set():
-            entries = buffer.drain(_SEND_BATCH_SIZE)
+            # Exclude entries already sent-and-awaiting-ack. Without this
+            # the same un-acked event_batch entries re-drain every
+            # iteration and re-send at line rate (they are only removed
+            # on ack), flooding the brain and starving fresh entries
+            # behind a full in-flight window (R5-M2). The excluded set is
+            # the buffer-entry ids currently in ``_pending_acks``.
+            in_flight = {entry_id for entry_id, _sent_at in self._pending_acks.values()}
+            # Backpressure: STRICTLY cap concurrent un-acked event_batch
+            # frames. When at the cap, keep draining CONTROL frames
+            # (command acks/results confirm on send and never become
+            # pending, so they must not be starved) but exclude
+            # event_batch so ``_pending_acks`` never grows past the cap
+            # (R7-MED). Below the cap, drain everything.
+            if len(self._pending_acks) >= _MAX_IN_FLIGHT_BATCHES:
+                entries = buffer.drain(
+                    self._send_batch_size,
+                    exclude_ids=in_flight or None,
+                    exclude_kinds={"event_batch"},
+                )
+                # The SQL exclude is on the stored ``kind``; also drop any entry
+                # whose PARSED WIRE type is event_batch (a mislabelled one that
+                # the kind-based exclude missed) so a corrupt kind cannot slip an
+                # event_batch past the in-flight cap and register for an ack
+                # (round-12 external LOW). The drained set here is only control
+                # frames + any mislabelled ones, so the extra peek is cheap.
+                entries = [e for e in entries if not _entry_is_event_batch(e)]
+            else:
+                entries = buffer.drain(self._send_batch_size, exclude_ids=in_flight or None)
+                # Below the cap, still trim event_batch entries to the
+                # REMAINING in-flight slots on a defer-acks (WS) transport. The
+                # cap check above only fires once ALREADY at/over the cap, so a
+                # single drain of up to _SEND_BATCH_SIZE starting from e.g. 255
+                # pending could register 500 more and overshoot to 755 (R8-M4).
+                # Control frames are never trimmed (they confirm on send and
+                # never become pending). Not applied to long-poll
+                # (confirm_on_send: _pending_acks stays 0, so an unconditional
+                # cap would throttle its 500-frame drain to the cap).
+                if not getattr(self._transport, "confirm_on_send", False):
+                    remaining = _MAX_IN_FLIGHT_BATCHES - len(self._pending_acks)
+                    entries = self._cap_event_batch_entries(entries, remaining)
             if not entries:
                 await asyncio.sleep(_SEND_IDLE_SLEEP)
                 continue
@@ -1404,57 +1555,294 @@ class AgentRuntime:
             frames = [e.payload for e in entries]
             try:
                 accepted = await self._transport.send_frames(frames)
-            except PartialSendError:
-                # The socket dropped mid-batch. We do NOT confirm any
-                # frames because "sent to socket" doesn't guarantee the
-                # brain received them (the TCP connection may have died
-                # mid-flight). Instead, increment attempts on the entire
-                # batch and let the reconnect loop retry everything.
-                # The brain's ingestor deduplicates by (occurred_at, id)
-                # so replayed events are safe.
-                buffer.increment_attempts([e.id for e in entries])
+            except UndeliverableFrameError as exc:
+                # One or more buffered frames are locally undeliverable
+                # (unparseable / unsigned / oversize): DETERMINISTIC. The
+                # socket is healthy, so stay connected -- confirm/register the
+                # frames that DID ship and force-purge the undeliverable ones.
+                self._handle_undeliverable_drop(buffer, entries, exc)
+                continue
+            except (PartialSendError, ConnectionError):
+                # TRANSPORT failure (socket dropped mid-batch, connection
+                # error, retryable HTTP status like 3xx/5xx/429). The
+                # batch was not delivered. We do NOT confirm anything, and
+                # we do NOT increment any drop counter: a flaky connection
+                # is not the batch's fault (R6-F4/R7). Re-raise so the
+                # supervisor reconnects; the batch re-drains next session
+                # (the brain dedups any that did land).
                 raise
-            except ConnectionError:
-                # Bubble up to the supervisor so it can reconnect.
-                # Mark attempt counts so stuck entries are visible.
-                buffer.increment_attempts([e.id for e in entries])
-                raise
+            except UploadRetryableError:
+                # Long-poll TRANSIENT partial store (a 200 that stored
+                # fewer than sent: a brain-side DB deadlock / pool timeout
+                # / transient skip). The frames ARE deliverable; the brain
+                # just could not store them this instant, and it now drops-
+                # and-acks every DETERMINISTIC failure at source, so a
+                # partial store is ALWAYS a genuine transient that recovers
+                # within a few rounds. Re-send the whole batch after a
+                # MODEST capped backoff (never counts toward any drop
+                # budget, R7-HIGH2). Blocking here is harmless: during a
+                # real transient outage nothing can be stored anyway, so no
+                # deliverable frame is being starved. The brain dedups
+                # already-stored frames on replay.
+                #
+                # But a FEW partial-store causes are not resolved by the
+                # backoff alone -- a send-side session/identity signature
+                # failure (only a fresh session_nonce rebuilds the binding)
+                # or a protocol-version skew during a rolling upgrade. Only
+                # the RECEIVE loop reconnects on its own error, so after
+                # ``_MAX_CONSECUTIVE_RETRYABLE`` zero-progress retries force a
+                # reconnect here too (loss-free: the buffer is preserved).
+                self._consecutive_retryable += 1
+                if self._consecutive_retryable >= _MAX_CONSECUTIVE_RETRYABLE:
+                    raise ConnectionError(
+                        "long-poll made no confirmed progress across "
+                        f"{self._consecutive_retryable} partial-store retries; "
+                        "reconnecting for a fresh session",
+                    ) from None
+                await self._backoff_retry()
+                continue
+            except (PayloadTooLargeError, UploadContentRejectedError) as exc:
+                # Long-poll CONTENT problem: 413 (too large) or 400/415/422
+                # (malformed). Reduce/split a multi-frame batch so valid
+                # siblings still deliver; drop only a SINGLE frame that
+                # persistently fails, after a bounded budget (R7-MED). Use a
+                # SMALL FIXED delay (not the growing transient backoff) so an
+                # isolated poison frame at the buffer HEAD is isolated and
+                # dropped within seconds and does not starve control frames
+                # queued behind it for minutes (R8: head-of-line fix).
+                self._handle_content_reject(buffer, entries, exc)
+                await asyncio.sleep(_CONTENT_REJECT_DELAY)
+                continue
+
+            # A successful send resets the transient retry backoff. It does
+            # NOT restore ``_send_batch_size`` -- a 413 shrink is undone only
+            # when the oversized frame is dropped (``_handle_content_reject``)
+            # or on reconnect, so a still-oversized batch is not immediately
+            # re-sent full and re-413'd.
+            self._reset_send_backoff()
 
             # Defer ``buffer.confirm`` for event_batch frames until
             # the matching ``event_batch_ack`` arrives from the
             # brain. Without the application-level ack, confirming
             # on ws-layer ``send()`` success would silently lose
             # events whenever the brain dropped the batch (deadlock,
-            # restart mid-batch, ingest queue full).
-            #
-            # Bidi compat: an old brain (pre-1.5) does NOT send acks.
-            # The watchdog (_ack_watchdog_loop) detects stale entries
-            # and sets ``_brain_supports_acks = False`` after the
-            # first ack-window expires unanswered; subsequent batches
-            # then confirm immediately (legacy mode). One round-trip
-            # of latency per agent on the first batch is the cost of
-            # the safe negotiation - acceptable.
+            # restart mid-batch, ingest queue full, transient skip).
+            # A WS event_batch is confirmed ONLY by a real ack; if the
+            # ack never comes, the watchdog re-sends (never confirms,
+            # never drops on a counter).
             #
             # Heartbeat / agent_status / command_ack / command_result
             # frames don't need acks (they're observability + control,
             # not data); confirm those immediately regardless of mode.
             now = datetime.now(UTC)
-            confirm_now: list[int] = []
-            for i in accepted:
-                entry = entries[i]
-                if entry.kind == "event_batch" and self._brain_supports_acks:
-                    frame_id = _peek_frame_id(entry.payload)
-                    if frame_id is None:
-                        confirm_now.append(entry.id)
-                    else:
-                        self._pending_acks[frame_id] = (entry.id, now)
-                else:
-                    confirm_now.append(entry.id)
-
+            # A transport that confirms on send (long-poll: the HTTP 200
+            # IS the ack, there is no ack frame coming) confirms
+            # event_batch entries immediately; every other transport
+            # (WebSocket) DEFERS confirmation until the brain's
+            # ``event_batch_ack`` arrives. There is no "legacy pre-1.5
+            # brain" fallback that confirms on socket-write: that path
+            # deleted un-acked events whenever a modern brain merely
+            # withheld an ack for a transient DB skip (R7-HIGH1). On WS,
+            # an event_batch is confirmed ONLY by a real ack.
+            defer_acks = not getattr(self._transport, "confirm_on_send", False)
+            confirm_now = self._confirm_or_register(entries, accepted, defer_acks, now)
             if confirm_now:
                 buffer.confirm(confirm_now)
             if self._heartbeat is not None and accepted:
                 self._heartbeat.record_flush(now)
+
+    def _confirm_or_register(
+        self,
+        entries: list,
+        accepted: list[int],
+        defer_acks: bool,
+        now: datetime,
+    ) -> list[int]:
+        """Decide which just-sent entries to confirm now vs. defer to ack.
+
+        For a ``defer_acks`` transport (WebSocket), a frame whose parsed WIRE
+        type is ``event_batch`` goes into ``_pending_acks`` to await its
+        ``event_batch_ack`` -- unless the ack ALREADY arrived during the send
+        await (recorded in ``_acks_seen_early``, R6-F7), in which case confirm
+        it now. Everything else (control frames, and every frame on a
+        confirm-on-send transport) confirms immediately. The decision keys off
+        the parsed wire type, NOT the buffer entry's ``kind`` metadata, so
+        neither mislabel direction can drop an ack or await one that never
+        comes (round-10 + round-11 external).
+        """
+        confirm_now: list[int] = []
+        for i in accepted:
+            entry = entries[i]
+            # On a confirm-on-send transport (long-poll) the HTTP 200 IS the
+            # ack, so every frame confirms now. Only a defer-acks transport (WS)
+            # awaits a per-frame ack.
+            if not defer_acks:
+                confirm_now.append(entry.id)
+                continue
+            # Trust the parsed WIRE type over the buffer entry's ``kind``
+            # metadata, and inspect EVERY accepted entry (do NOT pre-gate on
+            # ``kind``). Both mislabel directions must be handled (round-10 +
+            # round-11 external): a real event_batch mislabelled kind="heartbeat"
+            # must still be DEFERRED (else it is confirmed on socket-write and
+            # SILENTLY LOST if the brain restarts / rejects / drops the ack),
+            # and a heartbeat mislabelled kind="event_batch" must be confirmed
+            # now (it will never receive an event_batch_ack). Defer solely when
+            # the wire type is event_batch with a usable id.
+            frame_id, frame_type = _peek_frame_meta(entry.payload)
+            if frame_id is None or frame_type != "event_batch":
+                confirm_now.append(entry.id)
+            elif frame_id in self._acks_seen_early:
+                # The ack for this frame already arrived while we were
+                # awaiting the send, before we could register it. Confirm
+                # now instead of registering it for a deadline that has
+                # already passed (R6-F7).
+                self._acks_seen_early.discard(frame_id)
+                confirm_now.append(entry.id)
+            elif frame_id not in self._pending_acks:
+                # First send of this frame. Record sent_at ONCE. The
+                # in-flight drain filter means we should not re-send a
+                # pending frame, but guard the overwrite anyway so a
+                # re-send can never slide the watchdog deadline (that was
+                # the mechanism by which the deadline was never reached,
+                # R5-M2).
+                self._pending_acks[frame_id] = (entry.id, now)
+        return confirm_now
+
+    def _handle_undeliverable_drop(
+        self,
+        buffer: BufferStore,
+        entries: list,
+        exc: UndeliverableFrameError,
+    ) -> None:
+        """Purge frames the transport reported as locally undeliverable.
+
+        The transport shipped ``exc.accepted`` and rejected ``exc.drop_indices``
+        (unparseable / unsigned / oversize). Confirm / register the sent frames
+        exactly as a normal send would, then FORCE-PURGE the undeliverable ones
+        directly. The purge must bypass :meth:`_confirm_or_register`: an
+        undeliverable ``event_batch`` can still peek to a real frame_id, so
+        registering it would defer an ``event_batch_ack`` that never arrives and
+        pin the buffer head forever -- the exact loop this drop exists to
+        eliminate.
+        """
+        now = datetime.now(UTC)
+        # A partial ship is forward progress; reset the transient backoff.
+        self._reset_send_backoff()
+        defer_acks = not getattr(self._transport, "confirm_on_send", False)
+        confirm_now = self._confirm_or_register(entries, exc.accepted, defer_acks, now)
+        purge = confirm_now + [entries[i].id for i in exc.drop_indices]
+        if purge:
+            buffer.confirm(purge)
+        if self._heartbeat is not None and exc.accepted:
+            self._heartbeat.record_flush(now)
+
+    async def _backoff_retry(self) -> None:
+        """Sleep the current TRANSIENT-retry backoff, then grow it.
+
+        Called ONLY on a long-poll transient partial store
+        (``UploadRetryableError``). The delay doubles per consecutive
+        failure up to ``_SEND_BACKOFF_MAX`` (5s) so a struggling brain is
+        not hammered while it recovers (R7-HIGH2); a successful send
+        resets it via :meth:`_reset_send_backoff`. The CONTENT-reject path
+        does NOT use this -- it uses a small fixed ``_CONTENT_REJECT_DELAY``
+        so an isolated poison frame is dropped fast instead of starving
+        frames behind it (R8).
+        """
+        await asyncio.sleep(self._send_backoff)
+        self._send_backoff = min(self._send_backoff * 2, _SEND_BACKOFF_MAX)
+
+    def _reset_send_backoff(self) -> None:
+        """Reset the retryable-outcome backoff + progress counter after a
+        successful send.
+
+        The backoff and the ``_consecutive_retryable`` reconnect counter are
+        reset (a successful send is confirmed forward progress, R9). The
+        adaptive ``_send_batch_size`` is deliberately left where a 413 shrank
+        it (it is restored to the full ``_SEND_BATCH_SIZE`` on reconnect):
+        growing it back mid connection would oscillate straight into the same
+        413 on the next oversized frame.
+        """
+        self._send_backoff = _SEND_BACKOFF_INITIAL
+        self._consecutive_retryable = 0
+
+    def _handle_content_reject(
+        self,
+        buffer: BufferStore,
+        entries: list,
+        exc: Exception,
+    ) -> None:
+        """React to a long-poll CONTENT rejection (413 / 415 / 422).
+
+        The batch was reachable and the brain answered -- it just will
+        not store THIS content. Two cases:
+
+        * **Multi-frame batch** -- one frame is (probably) the culprit
+          but we don't know which. Halve ``_send_batch_size`` (floor
+          ``_MIN_SEND_BATCH``) so the next drain pulls a smaller batch;
+          repeated rejections bisect down to the single offending frame,
+          while valid siblings keep delivering (R7-MED). Nothing is
+          dropped here.
+        * **Single-frame batch** -- the culprit is isolated. An
+          ``event_batch`` frame gets its attempt counter bumped and is
+          dropped ONLY once it crosses ``_MAX_SEND_ATTEMPTS`` (bounded,
+          logged). A control frame (command_result / command_ack /
+          agent_status / heartbeat) cannot be re-batched or bisected and
+          would pin the queue forever, so it is dropped immediately with
+          a warning -- losing it merely times the command out server
+          side, which is recoverable, whereas pinning the queue loses
+          everything behind it (R7-MED).
+
+        Once the isolated offender is actually DROPPED, ``_send_batch_size``
+        is restored to the full ``_SEND_BATCH_SIZE`` (R8): the shrink only
+        existed to isolate that frame, so the remaining (valid) buffer must
+        ship at full width again rather than dribble one frame per POST for
+        the rest of the connection.
+        """
+        if len(entries) > 1:
+            new_size = max(self._send_batch_size // 2, _MIN_SEND_BATCH)
+            if new_size != self._send_batch_size:
+                self._send_batch_size = new_size
+            logger.warning(
+                "content-reject on %d-frame batch (%s); shrinking "
+                "send batch size to %d to isolate the offending frame",
+                len(entries),
+                type(exc).__name__,
+                self._send_batch_size,
+            )
+            return
+
+        # Single frame: the culprit is isolated. Bump the DEDICATED
+        # content-reject budget (not the shared ``attempts`` metric, R8-H1)
+        # and drop only once THAT budget is exhausted.
+        entry = entries[0]
+        if entry.kind == "event_batch":
+            buffer.increment_content_rejects([entry.id])
+            dropped = buffer.evict_if_exhausted([entry.id], _MAX_SEND_ATTEMPTS)
+            if dropped:
+                logger.error(
+                    "dropping event_batch entry %d after %d content "
+                    "rejections (%s); frame is undeliverable",
+                    entry.id,
+                    _MAX_SEND_ATTEMPTS,
+                    type(exc).__name__,
+                )
+                # Offender gone -- restore full width so the rest of the
+                # buffer stops dribbling one frame per POST (R8).
+                self._send_batch_size = _SEND_BATCH_SIZE
+            return
+
+        # An isolated CONTROL frame cannot be split or re-batched and
+        # would pin the send queue indefinitely. Drop it now (confirm =
+        # delete) so data frames behind it keep flowing.
+        logger.error(
+            "dropping undeliverable %s control frame (entry %d): %s",
+            entry.kind,
+            entry.id,
+            type(exc).__name__,
+        )
+        buffer.confirm([entry.id])
+        # Offender gone -- restore full width (R8).
+        self._send_batch_size = _SEND_BATCH_SIZE
 
     async def _run_receive_loop(self) -> None:
         """Read inbound frames and dispatch commands.
@@ -1470,21 +1858,15 @@ class AgentRuntime:
         await self._transport.receive_frames(on_frame)
 
     async def _ack_watchdog_loop(self) -> None:
-        """Bug A.2: evict ``_pending_acks`` entries past their deadline.
+        """Re-send WS event_batch entries whose ack has not arrived.
 
-        Two responsibilities:
-
-        1. Detect a brain that doesn't speak the v1.5 ack protocol.
-           If any pending entry ages past ``_ACK_DEADLINE_SECONDS``
-           we flip ``_brain_supports_acks`` to False so subsequent
-           batches confirm immediately (legacy mode). The first
-           batch on a fresh connect pays at most one deadline of
-           latency before legacy mode kicks in - acceptable.
-        2. Evict the now-stale pending entries by confirming them
-           in the buffer (so they don't pin the buffer indefinitely
-           after legacy-mode is engaged). Safe: the brain dedupes
-           replays via the content-derived event_id (Bug X-B fix),
-           so evicted-then-re-shipped events collapse to one row.
+        Any ``_pending_acks`` entry older than ``_ACK_DEADLINE_SECONDS``
+        is removed from the pending map so the send loop re-drains and
+        re-sends it. It is NEVER confirmed (deleted) and NEVER dropped
+        here: an event_batch is confirmed only by a real ack (positive
+        proof of storage) or by the buffer's size overflow eviction. The
+        brain dedups a re-sent-but-already-stored batch by its
+        content-derived event_id, so replay collapses to one row.
 
         Exits cleanly when ``stop_event`` is set so the supervisor
         can tear the connection down without a stale task.
@@ -1509,7 +1891,7 @@ class AgentRuntime:
                     timeout=_ACK_WATCHDOG_INTERVAL_SECONDS,
                 )
                 return
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 pass
             now = datetime.now(UTC)
             stale_ids: list[int] = []
@@ -1521,44 +1903,35 @@ class AgentRuntime:
                 stale_ids.append(entry_id)
             if not stale_ids:
                 continue
+            # An event_batch not acked within the deadline is NEITHER
+            # confirmed NOR dropped: we only remove its pending-ack
+            # tracking so it re-drains and re-sends on the next send-loop
+            # pass. The brain dedups the re-send by content-derived
+            # event_id, so a batch that WAS stored but whose ack was lost
+            # collapses to one row. An event_batch is deleted ONLY by a
+            # real ack (positive proof of storage) or by the buffer's
+            # size/byte overflow eviction (oldest-first, logged) -- never
+            # by a retry counter. This removes the two 1.7.0 loss paths:
+            # the "assume pre-1.5 brain -> confirm on socket write"
+            # legacy flip (which deleted un-acked events when a modern
+            # brain merely withheld an ack for a transient DB skip) and
+            # the attempt-count quarantine (which dropped a deliverable
+            # batch after ~15 min of a socket/DB outage or a persistent
+            # transient rejection). Retry is unbounded in count and
+            # bounded only by the buffer size (R7-HIGH1).
             for k in stale_keys:
                 self._pending_acks.pop(k, None)
-            if self._brain_acks_observed:
-                # We've seen at least one ack from this brain in this
-                # session, so it's a 1.5+ build. A missing ack here
-                # means the brain rejected the batch (poison events,
-                # transient DB error, etc.). Re-increment the buffer
-                # entries' attempt counter and DO NOT confirm - the
-                # next reconnect cycle re-sends them, and the brain's
-                # content-derived event_id collapses any
-                # duplicate-with-prior-success that was committed.
-                # Bounded retries via the buffer's attempt counter
-                # eventually evict a true poison entry; the operator
-                # sees the elevated drop counter in the next
-                # heartbeat.
-                logger.warning(
-                    "z4j agent: brain did not ack event_batch within "
-                    "%.0fs; brain previously acked so treating as "
-                    "rejected batch, will re-send on reconnect "
-                    "(stale_count=%d)",
-                    _ACK_DEADLINE_SECONDS, len(stale_ids),
-                )
-                buffer.increment_attempts(stale_ids)
-                continue
-            if self._brain_supports_acks:
-                # First-batch timeout AND we've never seen an ack:
-                # the brain is pre-1.5 and never sends acks. Fall
-                # back to legacy "confirm immediately" mode for this
-                # session.
-                self._brain_supports_acks = False
-                logger.warning(
-                    "z4j agent: brain did not ack event_batch within %.0fs "
-                    "and no prior ack observed; assuming pre-1.5 brain "
-                    "and switching to legacy mode for this session "
-                    "(stale_count=%d)",
-                    _ACK_DEADLINE_SECONDS, len(stale_ids),
-                )
-            buffer.confirm(stale_ids)
+            # increment_attempts is kept for the operator-visible
+            # stuck-entry metric only; nothing evicts on it for WS.
+            buffer.increment_attempts(stale_ids)
+            logger.warning(
+                "z4j agent: brain did not ack %d event_batch frame(s) "
+                "within %.0fs; re-sending (the brain dedups any that "
+                "landed). Entries are retried until acked; only the "
+                "buffer size cap bounds this.",
+                len(stale_ids),
+                _ACK_DEADLINE_SECONDS,
+            )
 
     async def _handle_inbound(self, frame: Frame) -> None:
         """Route one verified inbound frame."""
@@ -1571,33 +1944,33 @@ class AgentRuntime:
             return
         logger.debug("z4j agent received %s frame", frame.type)
 
-    def _handle_event_batch_ack(self, frame: "EventBatchAckFrame") -> None:
+    def _handle_event_batch_ack(self, frame: EventBatchAckFrame) -> None:
         """Confirm-and-evict the buffer entry matching the ack.
 
         Brain emits one ``event_batch_ack`` per committed
         ``event_batch`` carrying ``payload.acked_id = original
         event_batch.id``. We look up the entry id we deferred when
-        sending and tell the buffer to drop it. The first ack
-        received also confirms the brain speaks the v1.5 ack-aware
-        protocol.
+        sending and tell the buffer to drop it. An ack is the ONLY
+        thing that confirms (deletes) an event_batch entry on the WS
+        path -- positive proof the brain durably stored it.
         """
         assert self._buffer is not None
-        # First ack pins the brain as "speaks the v1.5 ack protocol".
-        # The watchdog must NOT flip to legacy mode after this point;
-        # any subsequent missing ack means the brain rejected the
-        # batch (poison events, DB outage), not a legacy brain.
-        self._brain_acks_observed = True
         acked_id = frame.payload.acked_id
         if not acked_id:
             # Brain sent ack without correlation id (some pre-release
             # or 1.5.x spec drift). Nothing safe to confirm against;
-            # the watchdog handles eviction.
+            # the entry stays pending and the watchdog re-sends it.
             return
         pending = self._pending_acks.pop(acked_id, None)
         if pending is None:
-            # Could be a duplicate ack (network retry) or an ack for a
-            # batch that already aged out via the watchdog. Safe to
-            # ignore.
+            # Either a duplicate/aged-out ack (safe to ignore), OR an ack
+            # that arrived while the send loop was still awaiting the send
+            # that produced this frame and had not yet registered it in
+            # ``_pending_acks``. Record it so the send loop confirms it at
+            # registration time instead of leaving it to the 90s watchdog
+            # (R6-F7). Bounded: in normal operation this set is ~empty.
+            if len(self._acks_seen_early) < _MAX_IN_FLIGHT_BATCHES * 4:
+                self._acks_seen_early.add(acked_id)
             return
         entry_id, _sent_at = pending
         self._buffer.confirm([entry_id])
@@ -1607,7 +1980,8 @@ class AgentRuntime:
     # ------------------------------------------------------------------
 
     def _build_transport(
-        self, hmac_secret: bytes,
+        self,
+        hmac_secret: bytes,
     ) -> WebSocketTransport | LongPollTransport:
         """Construct the transport based on the configured mode.
 
@@ -1664,10 +2038,7 @@ class AgentRuntime:
         from datetime import UTC, datetime
 
         worker_started_at = datetime.now(UTC)
-        worker_id = (
-            f"{self.framework.name}-{_os.getpid()}-"
-            f"{int(_time.time() * 1000)}"
-        )
+        worker_id = f"{self.framework.name}-{_os.getpid()}-{int(_time.time() * 1000)}"
 
         # worker_role: explicit operator config takes precedence;
         # adapter default if it declared one (1.2.0+ adapter API);
@@ -1680,7 +2051,7 @@ class AgentRuntime:
         if callable(worker_role):
             try:
                 worker_role = worker_role()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 worker_role = None
 
         return WebSocketTransport(
@@ -1701,7 +2072,7 @@ class AgentRuntime:
         )
 
 
-class _StopRequested(Z4JError):
+class _StopRequested(Z4JError):  # noqa: N818  internal control-flow sentinel, not a user-facing error
     """Internal sentinel used to cancel the asyncio TaskGroup on stop."""
 
     code = "stop_requested"
@@ -1714,7 +2085,7 @@ async def safe_close(transport: WebSocketTransport) -> None:
     """Close the transport, swallowing any error."""
     try:
         await transport.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("error while closing transport")
 
 
@@ -1743,7 +2114,9 @@ _LOG_SUMMARY_EVERY = 10
 
 
 def _log_disconnect(
-    error_class: str | None, err: BaseException, count: int,
+    error_class: str | None,
+    err: BaseException,
+    count: int,
 ) -> None:
     """Tiered logging for supervisor disconnects.
 
@@ -1794,7 +2167,9 @@ def _log_disconnect(
         # still alive. Class is part of the message so the message
         # is also useful when piped through a log aggregator.
         logger.info(
-            "z4j agent: still disconnected (#%d %s)", count, error_class,
+            "z4j agent: still disconnected (#%d %s)",
+            count,
+            error_class,
         )
     else:
         # Suppressed mid-streak failure. DEBUG keeps the per-attempt
@@ -1802,7 +2177,9 @@ def _log_disconnect(
         # surfacing in the default-level host log.
         logger.debug(
             "z4j agent disconnect retry #%d (%s): %s",
-            count, error_class, err,
+            count,
+            error_class,
+            err,
         )
 
 

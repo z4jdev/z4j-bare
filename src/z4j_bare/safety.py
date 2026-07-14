@@ -17,6 +17,7 @@ most bugs." We trap unconditionally at the boundary.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 from collections.abc import Callable
@@ -48,7 +49,7 @@ def safe_call(func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R | No
         # them prevents clean shutdown (SIGTERM → SystemExit) and
         # blocks Ctrl-C in dev. See audit v2 finding #3.
         raise
-    except BaseException as exc:  # noqa: BLE001
+    except BaseException as exc:
         _log_suppressed(func, exc)
         return None
 
@@ -65,6 +66,7 @@ def safe_boundary(func: Callable[P, R]) -> Callable[P, R | None]:
     Example::
 
         from z4j_bare.safety import safe_boundary
+
 
         @safe_boundary
         def handle_task_prerun(sender, task_id, task, **kwargs):
@@ -105,17 +107,14 @@ def _log_suppressed(func: Callable[..., Any], exc: BaseException) -> None:
             exc_type,
             exc_info=True,
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         # If even logging fails (e.g. a broken logging configuration in
         # the host app), fall back to writing to stderr directly. We
         # still do not include the exception message - only the type.
-        try:
+        with contextlib.suppress(Exception):
             sys.stderr.write(
-                f"z4j agent boundary suppressed exception in {name}: "
-                f"{exc_type}\n",
+                f"z4j agent boundary suppressed exception in {name}: {exc_type}\n",
             )
-        except Exception:  # noqa: BLE001
-            pass
 
 
 # Stdlib ``logging.LogRecord`` reserved attribute names. If any of
@@ -128,11 +127,29 @@ def _log_suppressed(func: Callable[..., Any], exc: BaseException) -> None:
 # specific arrival timing.
 _LOGRECORD_RESERVED: frozenset[str] = frozenset(
     {
-        "name", "msg", "args", "levelname", "levelno", "pathname",
-        "filename", "module", "exc_info", "exc_text", "stack_info",
-        "lineno", "funcName", "created", "msecs", "relativeCreated",
-        "thread", "threadName", "processName", "process", "message",
-        "asctime", "taskName",
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "message",
+        "asctime",
+        "taskName",
     },
 )
 

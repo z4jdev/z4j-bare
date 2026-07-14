@@ -19,11 +19,9 @@ from __future__ import annotations
 import os
 
 import pytest
-
-from z4j_core.errors import ConfigError
-
 from z4j_bare._process_singleton import clear_runtime
 from z4j_bare.install import install_agent
+from z4j_core.errors import ConfigError
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +52,7 @@ def _fake_engine() -> object:
     at the top of the function - the stub never gets exercised
     beyond the resolver.
     """
+
     class _StubEngine:
         name = "stub"
 

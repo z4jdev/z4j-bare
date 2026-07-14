@@ -10,16 +10,14 @@ own installation paths that eventually call through to the same
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from z4j_core.errors import ConfigError
-from z4j_core.models import Config
 from z4j_core.paths import reject_deprecated_path_env
 from z4j_core.protocols import FrameworkAdapter, QueueEngineAdapter, SchedulerAdapter
 
-from z4j_bare._process_singleton import try_register
+from z4j_bare._process_singleton import clear_runtime, try_register
 from z4j_bare.framework import BareFrameworkAdapter
 from z4j_bare.runtime import AgentRuntime
 
@@ -157,6 +155,25 @@ def install_agent(
         return active
     if config.autostart:
         runtime.start()
+        # Wire graceful teardown for the bare-Python autostart path the
+        # same way the framework adapters (Django/Flask/FastAPI) do -- the
+        # one piece of teardown wiring the bare path was missing, so bare
+        # autostart users previously got no buffer flush + no ordered
+        # drain at interpreter exit. We only reach here as the singleton
+        # WINNER (the loser returned above), so exactly one hook is
+        # registered. Registering in the threading._register_atexit phase
+        # drains the runtime while the default executor is still live,
+        # making the heartbeat shutdown-race structurally impossible.
+        # Best-effort; stop()/clear_runtime() are both idempotent.
+        from z4j_bare.control import register_shutdown_atexit
+
+        def _shutdown_bare() -> None:
+            try:
+                runtime.stop(timeout=5.0)
+            finally:
+                clear_runtime()
+
+        register_shutdown_atexit(_shutdown_bare)
     return runtime
 
 

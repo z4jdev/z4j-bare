@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 
 import pytest
-
 from z4j_bare.safety import safe_boundary, safe_call
 
 
@@ -49,7 +48,8 @@ class TestSafeCall:
             safe_call(boom)
 
     def test_logs_exception_type_not_message(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         caplog.set_level(logging.ERROR, logger="z4j.runtime.safety")
 
@@ -63,9 +63,7 @@ class TestSafeCall:
         # code). The traceback IS attached via exc_info, but the
         # message-line itself stays clean.
         assert any("RuntimeError" in rec.message for rec in caplog.records)
-        assert not any(
-            "sk_live_secret_value" in rec.message for rec in caplog.records
-        )
+        assert not any("sk_live_secret_value" in rec.message for rec in caplog.records)
 
 
 class TestSafeBoundaryDecorator:

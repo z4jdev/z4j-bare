@@ -48,13 +48,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger("z4j.runtime.singleton")
 
 _lock = threading.Lock()
-_runtime: "AgentRuntime | None" = None
+_runtime: AgentRuntime | None = None
 _owner: str | None = None
 
 
 def try_register(
-    runtime: "AgentRuntime", *, owner: str,
-) -> "AgentRuntime":
+    runtime: AgentRuntime,
+    *,
+    owner: str,
+) -> AgentRuntime:
     """Atomically register ``runtime`` as the process singleton.
 
     If no runtime is registered, ``runtime`` becomes the active
@@ -76,7 +78,7 @@ def try_register(
         existing one. Callers should always use the returned value;
         their ``runtime`` argument may have been discarded.
     """
-    global _runtime, _owner
+    global _runtime, _owner  # noqa: PLW0603  module-level singleton lazy-init
     with _lock:
         if _runtime is None:
             _runtime = runtime
@@ -93,7 +95,7 @@ def try_register(
         return _runtime
 
 
-def current_runtime() -> "AgentRuntime | None":
+def current_runtime() -> AgentRuntime | None:
     """Return the currently-registered runtime, or ``None``."""
     with _lock:
         return _runtime
@@ -113,7 +115,7 @@ def clear_runtime() -> None:
     (rare - usually only happens in tests) can register a fresh
     runtime. Idempotent.
     """
-    global _runtime, _owner
+    global _runtime, _owner  # noqa: PLW0603  module-level singleton lazy-init
     with _lock:
         _runtime = None
         _owner = None

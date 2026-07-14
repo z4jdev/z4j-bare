@@ -13,7 +13,7 @@ Public API:
   for advanced users who want to inspect the queue).
 
 Licensed under Apache License 2.0. See the repository
-``LICENSE-APACHE``.
+``LICENSE`` file.
 """
 
 from __future__ import annotations

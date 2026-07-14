@@ -42,14 +42,16 @@ deprecated ``Z4J_RUNTIME_DIR`` hard-fails at startup (see
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
-from z4j_core.paths import ensure_z4j_home, z4j_home
+from z4j_core.paths import ensure_z4j_home
 
 if TYPE_CHECKING:
     from z4j_bare.runtime import AgentRuntime
@@ -92,19 +94,17 @@ def write_pidfile(adapter_id: str) -> Path:
     target = pidfile_path(adapter_id)
     tmp = target.with_suffix(".pid.tmp")
     tmp.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    os.replace(tmp, target)
+    tmp.replace(target)
     return target
 
 
 def remove_pidfile(adapter_id: str) -> None:
     """Best-effort pidfile cleanup. Never raises."""
-    try:
+    with contextlib.suppress(OSError):
         pidfile_path(adapter_id).unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
-def install_sighup_handler(runtime: "AgentRuntime") -> bool:
+def install_sighup_handler(runtime: AgentRuntime) -> bool:
     """Wire ``SIGHUP`` to ``runtime.request_reconnect``.
 
     Returns ``True`` if the handler was installed, ``False`` on
@@ -119,8 +119,7 @@ def install_sighup_handler(runtime: "AgentRuntime") -> bool:
     """
     if sys.platform == "win32" or not hasattr(signal, "SIGHUP"):
         logger.debug(
-            "z4j agent: SIGHUP handler not installed "
-            "(unsupported on this platform)",
+            "z4j agent: SIGHUP handler not installed (unsupported on this platform)",
         )
         return False
     try:
@@ -128,7 +127,7 @@ def install_sighup_handler(runtime: "AgentRuntime") -> bool:
     except (ValueError, OSError):
         previous = None
 
-    def _handler(signum: int, frame: object) -> None:  # noqa: ARG001
+    def _handler(signum: int, frame: object) -> None:
         logger.info("z4j agent: SIGHUP received, requesting reconnect")
         runtime.request_reconnect()
         # Chain to any prior handler (gunicorn's graceful-reload,
@@ -139,7 +138,7 @@ def install_sighup_handler(runtime: "AgentRuntime") -> bool:
         ):
             try:
                 previous(signum, frame)  # type: ignore[misc]
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
                     "z4j agent: chained SIGHUP handler raised",
                 )
