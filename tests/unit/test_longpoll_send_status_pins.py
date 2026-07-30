@@ -38,7 +38,7 @@ from z4j_bare.transport.longpoll import (
     UploadContentRejectedError,
     UploadRetryableError,
 )
-from z4j_core.errors import AuthenticationError
+from z4j_core.errors import AuthenticationError, ProtocolError
 from z4j_core.transport.frames import (
     EventBatchFrame,
     EventBatchPayload,
@@ -185,7 +185,7 @@ async def test_retry_after_header_is_honored(fake_httpx, monkeypatch) -> None:
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 async def test_redirects_are_retryable_not_purged(fake_httpx, status: int) -> None:
-    """R5-M3: 3xx must not purge.
+    """3xx must not purge.
 
     follow_redirects is disabled on the client, so a redirect means the
     POST body never reached the events handler. Pre-fix every non-200
@@ -205,7 +205,7 @@ async def test_unexpected_status_is_retryable_not_purged(
     fake_httpx,
     status: int,
 ) -> None:
-    """R5-M3: an unexpected/ambiguous status defaults to retry, not purge.
+    """An unexpected/ambiguous status defaults to retry, not purge.
 
     Only an explicit allowlist of genuinely-permanent validation
     failures may purge; anything else keeps the batch for retry.
@@ -222,7 +222,7 @@ async def test_content_reject_statuses_raise_content_rejected(
     fake_httpx,
     status: int,
 ) -> None:
-    """R6-F6 / R7-MED: a per-FRAME content-validation status is a CONTENT
+    """A per-FRAME content-validation status is a CONTENT
     reject.
 
     415 (media type) / 422 (envelope validation) mean the brain looked at
@@ -231,7 +231,7 @@ async def test_content_reject_statuses_raise_content_rejected(
     reduces/splits a multi-frame batch so valid siblings still deliver, and
     drops only a SINGLE persistently-rejected frame after a bounded budget.
     They do NOT confirm (delete) the batch; nothing is dropped on the first
-    failure. 400 is NOT here (R8-M2): see the routing test below.
+    failure. 400 is NOT here: see the routing test below.
     """
     fake_httpx.post_response = _FakeResponse(status_code=status)
     t = await _connected_transport()
@@ -245,7 +245,7 @@ async def test_routing_statuses_are_retryable_not_permanent(
     fake_httpx,
     status: int,
 ) -> None:
-    """R6-F6 / R8-M2: 400/403/404/405 are request-level routing / host-
+    """400/403/404/405 are request-level routing / host-
     validation / WAF / deploy outcomes, NOT proof of bad frame content, so
     they retry (a transient 404 during a deploy, or a host-validation 400
     from an HA allowed-hosts skew, must not lose data). The /agent/events
@@ -260,7 +260,7 @@ async def test_routing_statuses_are_retryable_not_permanent(
 
 
 async def test_413_raises_payload_too_large(fake_httpx) -> None:
-    """R6-F6: 413 must not purge; it signals the batch is too big so the
+    """413 must not purge; it signals the batch is too big so the
     runtime can reduce batch size (or drop a single oversized frame)."""
     fake_httpx.post_response = _FakeResponse(status_code=413)
     t = await _connected_transport()
@@ -293,7 +293,7 @@ async def test_5xx_raises_connection_error(fake_httpx, status: int) -> None:
 
 
 async def test_200_confirms_only_when_all_frames_stored(fake_httpx) -> None:
-    """R6-F1 / R7-HIGH2: a 200 confirms the batch ONLY when the brain
+    """A 200 confirms the batch ONLY when the brain
     durably stored EVERY frame it was sent.
 
     Pre-fix the client confirmed ``accepted + rejected`` indices, so a
@@ -322,7 +322,7 @@ async def test_200_confirms_only_when_all_frames_stored(fake_httpx) -> None:
     with pytest.raises(UploadRetryableError):
         await t.send_frames([_event_batch_bytes("evb_a"), _event_batch_bytes("evb_b")])
 
-    # Nothing stored -> retry whole (the reproduced R6-F1 case:
+    # Nothing stored -> retry whole (the reproduced case:
     # {accepted:0, rejected:1} previously returned index [0] = deleted).
     fake_httpx.post_response = _FakeResponse(
         status_code=200,
@@ -330,4 +330,22 @@ async def test_200_confirms_only_when_all_frames_stored(fake_httpx) -> None:
     )
     with pytest.raises(UploadRetryableError):
         await t.send_frames([_event_batch_bytes("evb_c")])
+    await t.close()
+
+
+async def test_200_schedule_upgrade_requirement_is_typed_and_unconfirmed(
+    fake_httpx,
+) -> None:
+    fake_httpx.post_response = _FakeResponse(
+        status_code=200,
+        body={
+            "accepted": 0,
+            "rejected": 1,
+            "errors": ["scheduler adapter upgrade required"],
+            "error_code": "scheduler_upgrade_required",
+        },
+    )
+    t = await _connected_transport()
+    with pytest.raises(ProtocolError, match="Boundary-D"):
+        await t.send_frames([_event_batch_bytes()])
     await t.close()

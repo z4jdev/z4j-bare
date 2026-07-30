@@ -298,7 +298,7 @@ async def test_unacked_event_batch_survives_reconnect_and_watchdog(
 class _CountingNoAckTransport:
     """Accepts one send, never acks, counts every send_frames call.
 
-    Models the R5-M2 storm scenario: a single unacked event_batch. With
+    Models the storm scenario: a single unacked event_batch. With
     the in-flight drain filter the send loop must send it ONCE and then
     stop re-draining it (the entry is in _pending_acks), so send_frames
     is called exactly once, not hundreds of times per second.
@@ -329,7 +329,7 @@ async def test_unacked_batch_is_sent_once_not_stormed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R5-M2: an in-flight (sent, unacked) entry is not re-drained.
+    """An in-flight (sent, unacked) entry is not re-drained.
 
     Pre-fix the non-destructive drain + no in-flight filter re-sent the
     same entry every loop iteration (367 sends in 80ms observed live).

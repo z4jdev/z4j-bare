@@ -40,10 +40,12 @@ import httpx
 from z4j_core.errors import (
     AuthenticationError,
     InvalidFrameError,
+    ProtocolError,
     SignatureError,
     Z4JError,
 )
 from z4j_core.transport.frames import (
+    RETRY_BY_REFERENCE_CAPABILITY,
     Frame,
     _SignedFrameBase,
     parse_frame,
@@ -53,6 +55,8 @@ from z4j_core.version import (
     __version__ as CORE_VERSION,  # noqa: N812  conventional version constant alias
 )
 
+from z4j_bare.transport.websocket import AGENT_RUNTIME_FEATURES
+
 logger = logging.getLogger("z4j.transport.longpoll")
 
 #: HTTP statuses where the brain looked at the FRAME content and rejected
@@ -61,9 +65,9 @@ logger = logging.getLogger("z4j.transport.longpoll")
 #: so a SINGLE frame that persistently returns one of these is genuinely
 #: undeliverable and (after batch-size reduction has isolated it) is dropped
 #: after a bounded retry budget; a MULTI-frame batch is reduced/split first
-#: so valid siblings are never co-dropped (R7-MED).
+#: so valid siblings are never co-dropped.
 #:
-#: 400 is deliberately NOT here (R8-M2): the ``/agent/events`` route never
+#: 400 is deliberately NOT here: the ``/agent/events`` route never
 #: emits a content-based 400 -- body-shape violations are FastAPI/Pydantic
 #: 422, media-type is 415 -- so every 400 reaching a POST is REQUEST-level
 #: (the host-validation middleware rejects a bad Host/Origin BEFORE the body
@@ -91,7 +95,7 @@ class UploadRetryableError(Exception):
     already-stored frames by content-derived event_id, so replay is
     harmless). It must NOT count toward any drop budget: the frames are
     deliverable, the brain just could not store them this instant
-    (R7-HIGH2). Deliberately NOT a :class:`ConnectionError` (a content
+    Deliberately NOT a:class:`ConnectionError` (a content
     round-trip succeeded; no need to tear down the session).
     """
 
@@ -103,9 +107,9 @@ class UploadContentRejectedError(Exception):
 
     A MULTI-frame batch is reduced/split so valid siblings still deliver;
     a SINGLE frame that keeps being content-rejected is genuinely
-    undeliverable and is dropped after a bounded retry budget (R7-MED). A
+    undeliverable and is dropped after a bounded retry budget. A
     bare 400 is NOT a content reject on this route -- it is request-level
-    (host validation / proxy / WAF) and retried, not dropped (R8-M2).
+    (host validation / proxy / WAF) and retried, not dropped.
     """
 
 
@@ -115,7 +119,7 @@ class PayloadTooLargeError(Exception):
     The runtime reduces its send batch size and retries; a single frame
     that still 413s is dropped after a bounded budget (it can never fit),
     NOT on the first failure (a transient/proxy 413 must not lose a
-    deliverable frame, R7-MED). Not a :class:`ConnectionError`.
+    deliverable frame). Not a:class:`ConnectionError`.
     """
 
 
@@ -181,6 +185,9 @@ class LongPollTransport:
     #: previous session's seq counter, and an attacker who lands a
     #: forged max-seq frame can only DoS their own (unknown) nonce.
     _SESSION_HEADER = "X-Z4J-Session-Nonce"
+    #: Long-poll analogue of WebSocket runtime-feature observability.
+    _RUNTIME_FEATURES_HEADER = "X-Z4J-Runtime-Features"
+    _RETRY_CONTRACTS_HEADER = "X-Z4J-Retry-Contracts"
 
     def __init__(
         self,
@@ -228,6 +235,15 @@ class LongPollTransport:
         # to keep proxies that idle-timeout connections at 60 s
         # happy with no extra work on the operator's side.
         self._poll_wait_seconds = max(1, min(int(poll_wait_seconds), 60))
+
+    def _retry_contracts_header(self) -> str:
+        """Compact adapter-derived contracts sent on every command poll."""
+        engines = sorted(
+            name
+            for name, advertised in self.capabilities.items()
+            if RETRY_BY_REFERENCE_CAPABILITY in advertised
+        )
+        return ",".join(f"{name}=1" for name in engines)
 
     def __repr__(self) -> str:
         return (
@@ -282,22 +298,47 @@ class LongPollTransport:
             headers={
                 "Authorization": f"Bearer {self._token}",
                 self._SESSION_HEADER: self._session_nonce,
+                # Runtime-wide feature observability. This is deliberately
+                # distinct from the adapter-derived contract header below.
+                self._RUNTIME_FEATURES_HEADER: ",".join(AGENT_RUNTIME_FEATURES),
+                # Boundary A: unlike the advisory runtime feature above, this
+                # is derived from the loaded adapter objects and checked only
+                # for the exact long-poll request that claims a retry.
+                self._RETRY_CONTRACTS_HEADER: self._retry_contracts_header(),
             },
             timeout=httpx.Timeout(15.0, read=None),
             http2=False,
             follow_redirects=False,
         )
 
-        # Probe the bearer token + reachability with a short wait
-        # poll. 401 immediately tells us the token is bad; 200 with
-        # an empty list confirms the agent row exists, the brain
-        # is up, and our auth works.
-        try:
-            r = await self._client.get(
+        # Probe the bearer token + reachability.: use max_frames=0, the
+        # brain's NON-CLAIMING liveness/identity mode -- 401 tells us the token is
+        # bad; 200 confirms the agent row exists, the brain is up, our auth works,
+        # and the X-Z4J-Agent/Project-Id headers carry the canonical UUIDs. The old
+        # max_frames=1 probe CLAIMED (marked DISPATCHED) the oldest pending command
+        # and discarded the body, permanently stranding a queued DESTRUCTIVE
+        # command (non-redeliverable, so never re-sent) until it timed out.
+        #
+        # (N-1): a pre-1.7.1 brain declares ``max_frames`` as ``ge=1``, so
+        # it 422s max_frames=0 in FastAPI's query validation BEFORE the handler
+        # runs -- returning no identity headers and, without a fallback, making a
+        # 1.7.1 agent unable to connect to a 1.7.0 brain at all. On a 422 we fall
+        # back to max_frames=1, which a 1.7.0 brain accepts; that merely reproduces
+        # that older brain's OWN connect-probe behaviour (it claims the oldest
+        # pending command), so it is no regression versus a 1.7.0 agent talking to
+        # the same brain. A 1.7.1 brain never 422s max_frames=0, so the fallback
+        # only ever runs against a genuinely older brain.
+        async def _probe(max_frames_val: int) -> httpx.Response:
+            return await self._client.get(
                 "/api/v1/agent/commands",
-                params={"wait": 0, "max_frames": 1},
+                params={"wait": 0, "max_frames": max_frames_val},
                 timeout=10.0,
             )
+
+        try:
+            r = await _probe(0)
+            if r.status_code == 422:
+                r = await _probe(1)
         except httpx.HTTPError as exc:
             await self._close_client()
             raise ConnectionError(f"long-poll probe failed: {exc}") from exc
@@ -394,7 +435,10 @@ class LongPollTransport:
     # Send / receive
     # ------------------------------------------------------------------
 
-    async def send_frames(self, frames: list[bytes]) -> list[int]:  # noqa: PLR0912  per-frame sign/post branching
+    async def send_frames(  # noqa: PLR0912, PLR0915  per-frame sign/post branching
+        self,
+        frames: list[bytes],
+    ) -> list[int]:
         """Sign + POST each buffered frame, return accepted indices.
 
         Mirrors :meth:`WebSocketTransport.send_frames` exactly so
@@ -456,12 +500,16 @@ class LongPollTransport:
                 body = r.json()
             except Exception:
                 body = {}
+            if isinstance(body, dict) and body.get("error_code") == "scheduler_upgrade_required":
+                raise ProtocolError(
+                    "brain requires a current Boundary-D scheduler adapter",
+                )
             # Parse the stored-count DEFENSIVELY: confirm (delete) the
             # POSTed frames ONLY on EXACT equality with the number sent.
             # A malformed/over-count response (a non-int, a bool, a
             # negative, or a value greater than what we sent) must NEVER
             # confirm a frame the brain did not store -- treat anything
-            # but the exact match as "not all stored" and retry (R7-LOW).
+            # but the exact match as "not all stored" and retry.
             raw = body.get("accepted") if isinstance(body, dict) else None
             stored = raw if isinstance(raw, int) and not isinstance(raw, bool) else -1
             if stored == len(signed):
@@ -474,7 +522,6 @@ class LongPollTransport:
             # already-stored frames by content-derived event_id, so
             # replay is harmless. This is a transient outcome, NOT a
             # content rejection: it must not consume a drop budget
-            # (R7-HIGH2).
             raise UploadRetryableError(
                 f"long-poll: brain stored {stored}/{len(signed)} frames "
                 "(transient); re-sending the whole batch after backoff",
@@ -488,13 +535,13 @@ class LongPollTransport:
             # (415 media-type / 422 envelope validation). Re-sending the
             # identical body loops. The runtime reduces/splits a multi-frame
             # batch (valid siblings still deliver) and drops only a SINGLE
-            # persistently-rejected frame after a bounded budget (R7-MED).
+            # persistently-rejected frame after a bounded budget.
             raise UploadContentRejectedError(
                 f"long-poll: brain rejected the frame content (HTTP {r.status_code})",
             )
         # Everything else -- 3xx redirects (follow disabled, so the body
         # never reached the handler), a bare 400 (request-level host
-        # validation / proxy / WAF, NOT per-frame content, R8-M2),
+        # validation / proxy / WAF, NOT per-frame content),
         # 403/404/405 (routing/WAF/mixed deploy), transient 408/425/429/5xx,
         # and any unexpected status -- is treated as transient: keep the
         # batch unconfirmed and retry after backoff, NEVER counting

@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.7.0"
+version = "1.8.0"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,7 +26,7 @@ dependencies = [
     # is tested together, so intra-z4j floors track the wave version.
     # Mixed-version installs are refused rather than half-supported
     # (a 1.6.x mixed-dispatcher install was an RCE re-open, R9-H2).
-    "z4j-core>=1.7.0,<2",
+    "z4j-core>=1.8.0,<2",
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]

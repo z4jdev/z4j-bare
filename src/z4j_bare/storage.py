@@ -44,7 +44,11 @@ def is_writable_dir(path: Path) -> bool:
     don't collide.
     """
     try:
-        path.mkdir(parents=True, exist_ok=True)
+        # 0o700 at CREATE time only (existing dirs keep their bits):
+        # every caller probes candidates for the z4j home / buffer
+        # tree, whose SQLite buffer holds task/event payload bytes
+        # (potentially PII). Matches z4j_core.paths.ensure_z4j_home.
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
     except (OSError, PermissionError):
         return False
     probe = path / f".z4j-write-probe-{os.getpid()}"

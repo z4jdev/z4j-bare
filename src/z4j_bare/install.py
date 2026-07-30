@@ -154,7 +154,21 @@ def install_agent(
     if active is not runtime:
         return active
     if config.autostart:
-        runtime.start()
+        # Apply the RM7 discipline at the install layer. If start()
+        # fails (a transient buffer-init error, etc.), UNREGISTER the singleton
+        # so a later install_agent can register + start a fresh runtime instead
+        # of returning this poisoned, never-started one. We only reach here as
+        # the singleton WINNER, so clearing it is safe.
+        try:
+            runtime.start()
+        except BaseException:
+            # COMPARE-and-clear. An unconditional clear here erases
+            # whatever is registered NOW, which after a slow failure may be a
+            # DIFFERENT runtime that legitimately replaced this one -- leaving a
+            # live runtime unregistered and a later install_agent handing back a
+            # second one. Clear only our own registration.
+            clear_runtime(expected=runtime)
+            raise
         # Wire graceful teardown for the bare-Python autostart path the
         # same way the framework adapters (Django/Flask/FastAPI) do -- the
         # one piece of teardown wiring the bare path was missing, so bare
@@ -171,7 +185,10 @@ def install_agent(
             try:
                 runtime.stop(timeout=5.0)
             finally:
-                clear_runtime()
+                # Same reasoning at shutdown. This hook belongs to THIS
+                # runtime; if another has since taken the registration, forget
+                # ours and leave theirs alone.
+                clear_runtime(expected=runtime)
 
         register_shutdown_atexit(_shutdown_bare)
     return runtime

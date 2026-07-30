@@ -21,6 +21,7 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
+from z4j_bare._process_singleton import post_fork
 from z4j_bare.buffer import BufferEntry, BufferStore
 from z4j_bare.framework import BareFrameworkAdapter
 from z4j_bare.install import install_agent
@@ -43,6 +44,7 @@ __all__ = [
     "RuntimeState",
     "__version__",
     "install_agent",
+    "post_fork",
     "safe_boundary",
     "safe_call",
 ]

@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import logging
 import os
 import random
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -41,6 +44,7 @@ from z4j_core.errors import (
 from z4j_core.models import Event
 from z4j_core.protocols import FrameworkAdapter, QueueEngineAdapter, SchedulerAdapter
 from z4j_core.transport.frames import (
+    RETRY_BY_REFERENCE_CAPABILITY,
     CommandFrame,
     EventBatchAckFrame,
     EventBatchFrame,
@@ -49,7 +53,7 @@ from z4j_core.transport.frames import (
     serialize_frame,
 )
 
-from z4j_bare.buffer import BufferStore
+from z4j_bare.buffer import EXTERNAL_SCHEDULE_ENTRY_KIND, BufferStore
 from z4j_bare.dispatcher import CommandDispatcher
 from z4j_bare.heartbeat import Heartbeat
 from z4j_bare.safety import safe_call
@@ -66,9 +70,94 @@ from z4j_bare.transport.websocket import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from z4j_core.models import Config
 
 logger = logging.getLogger("z4j.runtime.supervisor")
+
+# Leave ample room for the transport HMAC envelope beneath the default 1 MiB
+# Brain ceiling.  Stable snapshots are split at this unsigned-frame bound and
+# each resulting frame is verified again after complete serialization.
+_EXTERNAL_SNAPSHOT_FRAME_TARGET_BYTES = 768 * 1024
+_EXTERNAL_SNAPSHOT_ROW_PAYLOAD_BYTES = _EXTERNAL_SNAPSHOT_FRAME_TARGET_BYTES - 32 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternalScheduleAuthority:
+    """Brain-issued publication authority for one scheduler source scope."""
+
+    stream_id: str
+    epoch_uuid: str
+    epoch_number: int
+    adapter_instance_id: str
+    owner: str
+    source_scope: str
+    stable_source: bool
+
+
+def _advertised_capabilities(
+    engines: dict[str, QueueEngineAdapter],
+    schedulers: dict[str, SchedulerAdapter],
+) -> dict[str, list[str]]:
+    """Build capabilities from the adapter objects actually loaded.
+
+    Retry authority is adapter-owned. Only an adapter that explicitly attests
+    the safe contract receives the versioned marker, so a current runtime paired
+    with an old adapter fails closed.
+    """
+    capabilities: dict[str, list[str]] = {}
+    for name, engine in engines.items():
+        advertised = set(engine.capabilities())
+        if getattr(engine, "safe_retry_by_reference", False) is True:
+            advertised.add(RETRY_BY_REFERENCE_CAPABILITY)
+        capabilities[name] = sorted(advertised)
+    for name, scheduler in schedulers.items():
+        capabilities[name] = sorted(scheduler.capabilities())
+    return capabilities
+
+
+async def _await_in_daemon_thread(fn: Callable[[], Any]) -> Any:
+    """Run a blocking ``fn`` on a DAEMON thread and await its result.
+
+    M5: ``asyncio.to_thread`` runs on the loop's default ThreadPoolExecutor,
+    whose workers are NON-daemon and registered in ``_threads_queues``, so
+    CPython's ``concurrent.futures`` atexit hook JOINS them on interpreter exit.
+    A genuinely-wedged blocking call (e.g. an orphan scan stuck on a locked
+    SQLite DB) would therefore hang process exit indefinitely, past every
+    bounded drain. A raw daemon thread is excluded from BOTH that hook and
+    threading's own atexit (daemon threads are never joined), so exit stays
+    bounded while the result/exception is bridged back to the loop. Cancelling
+    the await abandons the thread (it finishes in the background); that is safe
+    here because the only such call, the orphan scan, serialises every buffer
+    write behind the buffer's lock and fails closed on a closed buffer.
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+
+    def _settle(setter: Callable[[Any], None], value: Any) -> None:
+        # RL3: the awaiter may have been CANCELLED (shutdown) before the daemon
+        # worker finishes; setting a result/exception on an already-cancelled or
+        # already-done future raises InvalidStateError. Re-check ``done()`` INSIDE
+        # the loop callback (the only place it is safe to read, single-threaded).
+        # The loop may also be closing during shutdown; if so nothing awaits fut.
+        def _apply() -> None:
+            if not fut.done():
+                setter(value)
+
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_apply)
+
+    def _runner() -> None:
+        try:
+            result = fn()
+        except BaseException as exc:  # bridge any failure back to the awaiter
+            _settle(fut.set_exception, exc)
+        else:
+            _settle(fut.set_result, result)
+
+    threading.Thread(target=_runner, name="z4j-orphan-scan", daemon=True).start()
+    return await fut
 
 
 def _drain_default_executor(loop: asyncio.AbstractEventLoop, *, deadline_s: float) -> None:
@@ -142,10 +231,45 @@ def _drain_default_executor(loop: asyncio.AbstractEventLoop, *, deadline_s: floa
         daemon=True,
     ).start()
     if not done.wait(deadline_s):
-        # Wedged provider thread; abandon the wait. The pool threads
-        # are daemon and will be reaped at interpreter exit.
+        # Wedged provider thread; abandon the wait. NOTE: the default executor's
+        # workers are NON-daemon and are JOINED (not reaped) by
+        # concurrent.futures' atexit hook, so a genuinely-wedged pool worker can
+        # still delay interpreter exit; this bound only caps how long WE wait
+        # here. Latency-critical blocking calls that could wedge indefinitely
+        # (the orphan scan) run on dedicated DAEMON threads instead (see
+        # _await_in_daemon_thread, M5) so they are never atexit-joined.
         with contextlib.suppress(Exception):
             executor.shutdown(wait=False)
+
+
+def _derive_deployment_id(hmac_secret: Any) -> str:
+    """H8/RH5: per-deployment buffer fingerprint derived from the agent's
+    hmac_secret (truncated SHA-256; reveals nothing about the secret).
+
+    MUST read the UNMASKED secret via ``get_secret_value()`` -- pydantic
+    ``str(SecretStr)`` is the literal ``"**********"`` for EVERY secret, which
+    made this fingerprint a single constant across all deployments and defeated
+    H8 cross-deployment orphan isolation entirely (the RH5 regression, which
+    shipped once). Falls back to ``str(...)`` only for a plain-string secret
+    (no get_secret_value), which is not a SecretStr and so not masked.
+
+    runtime:152: hash the DECODED key bytes, not the base64 TEXT. The secret is
+    urlsafe-base64 and the HMAC identity is ``decode_agent_hmac_secret(raw)``,
+    which strips whitespace and pads -- so padded / unpadded / newline-wrapped
+    encodings of the SAME key produce the SAME HMAC identity. Hashing the raw
+    text instead gave those equivalent forms DIFFERENT deployment ids, so one
+    deployment's own workers (secret written slightly differently) refused to
+    adopt each other's buffers. Decode first so the fingerprint tracks the key
+    identity. Fall back to the raw bytes only if the secret is not decodable
+    (which the HMAC path itself would already have rejected at startup).
+    """
+    getter = getattr(hmac_secret, "get_secret_value", None)
+    raw = getter() if callable(getter) else str(hmac_secret)
+    try:
+        key_bytes = _decode_hmac_secret(raw)
+    except Exception:
+        key_bytes = raw.encode("utf-8")
+    return hashlib.sha256(key_bytes).hexdigest()[:16]
 
 
 def _heartbeat_enabled() -> bool:
@@ -239,7 +363,7 @@ _SEND_BATCH_SIZE = 500
 #: Floor for the adaptive send-batch size: on a long-poll 413 (body too
 #: large) the batch is halved down to this so an oversized frame is
 #: isolated to a batch of one, where it can be dropped precisely
-#: (R7-MED) rather than pinning valid siblings behind it.
+#: rather than pinning valid siblings behind it.
 _MIN_SEND_BATCH = 1
 _SEND_IDLE_SLEEP = 0.05
 _RECONNECT_INITIAL = 1.0
@@ -262,32 +386,32 @@ _ACK_WATCHDOG_INTERVAL_SECONDS = 2.0
 #: batch, or a long-poll upload keeps returning a content-error status)
 #: the entry is quarantined (dropped, logged). Only content rejections
 #: count -- a flaky connection or a transient 5xx never increments this,
-#: so a deliverable batch is never dropped (R6-F4). At the 90s WS ack
+#: so a deliverable batch is never dropped. At the 90s WS ack
 #: deadline this is ~15 minutes of active rejection before a genuinely
 #: undeliverable event_batch is dropped.
 _MAX_SEND_ATTEMPTS = 10
 #: Backpressure cap on concurrent un-acked event_batch frames (WS
 #: deferred-ack mode). Bounds ``_pending_acks`` and therefore the
 #: ``exclude_ids`` set passed to ``buffer.drain`` well under SQLite's
-#: 32766-bound-parameter ceiling (R6-F5), and stops the agent piling
+#: 32766-bound-parameter ceiling, and stops the agent piling
 #: unbounded un-acked batches on a slow/stalled brain.
 _MAX_IN_FLIGHT_BATCHES = 256
 #: Long-poll TRANSIENT-retry backoff (seconds): a transient partial
 #: store sleeps this long (doubling per consecutive failure, capped)
 #: before re-sending the whole batch, so a struggling brain is not
-#: hammered (R7-HIGH2). Capped LOW (5s, not 30s): the brain now drops-
+#: hammered. Capped LOW (5s, not 30s): the brain now drops-
 #: and-acks every deterministic failure at source, so a partial store is
 #: always a genuine transient that self-heals within a few rounds; a 30s
 #: cap only slowed recovery and lengthened the window a real outage held
-#: the single-threaded send loop (R8).
+#: the single-threaded send loop.
 _SEND_BACKOFF_INITIAL = 0.5
 _SEND_BACKOFF_MAX = 5.0
 #: Fixed inter-attempt delay (seconds) on the long-poll CONTENT-reject
-#: path (413 / 415 / 422; a bare 400 is request-level and retried, R8-M2).
+#: path (413 / 415 / 422; a bare 400 is request-level and retried).
 #: Deliberately SMALL and NON-growing so
 #: bisection + the bounded per-frame drop clear a poison frame within a
 #: couple of seconds instead of the ~150s a growing backoff took, which
-#: starved every control frame queued behind the poison (R8: the R7 code
+#: starved every control frame queued behind the poison (the code
 #: shared the growing transient backoff here and blocked the head of the
 #: oldest-first queue for minutes).
 _CONTENT_REJECT_DELAY = 0.1
@@ -300,7 +424,7 @@ _CONTENT_REJECT_DELAY = 0.1
 #: the session binding), or a protocol-version skew during a rolling upgrade
 #: -- otherwise wedges the send loop forever because only the RECEIVE loop
 #: reconnects on its own error. ~20 x 5s cap = ~100s before re-establishing;
-#: no frame is dropped (reconnect preserves the buffer), R9.
+#: no frame is dropped (reconnect preserves the buffer).
 _MAX_CONSECUTIVE_RETRYABLE = 20
 
 # Auth-error backoff schedule. AuthenticationError indicates the
@@ -369,7 +493,18 @@ class AgentRuntime:
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # A monotonically-increasing START EPOCH. Each start() that wins the
+        # STOPPED->STARTING transition captures its epoch; the RUNNING publish only
+        # fires while this is STILL the current epoch, so a start() that a
+        # concurrent stop()+restart superseded while it was blocked in bring-up
+        # cannot publish RUNNING over the new owner (a value check on the state
+        # enum alone could not tell its own STARTING from the newer one).
+        self._start_epoch = 0
         self._loop_ready = threading.Event()
+        # Set when the loop thread fails to reach a healthy steady
+        # state (loop-creation error, or _main raising/returning during setup),
+        # so start() reports the failure instead of RUNNING on a dead loop.
+        self._loop_error = threading.Event()
         self._stop_event: asyncio.Event | None = None
 
         self._buffer: BufferStore | None = None
@@ -421,25 +556,25 @@ class AgentRuntime:
         # ``event_batch_ack`` while the send loop is still awaiting the
         # send that produced it; without this, that ack would pop nothing
         # and the entry would sit un-confirmed until the 90s watchdog
-        # (R6-F7). The send loop consults this set at registration time
+        # The send loop consults this set at registration time
         # and confirms immediately if the ack already arrived. Bounded;
         # cleared on reconnect.
         self._acks_seen_early: set[str] = set()
         # Current long-poll retry backoff (seconds), grown on consecutive
         # retryable outcomes (transient partial store, content reject,
         # 413) and reset on a successful send. Gives a genuinely-poison
-        # frame a real backoff instead of a 50ms hot-loop (R7-HIGH2).
+        # frame a real backoff instead of a 50ms hot-loop.
         self._send_backoff: float = _SEND_BACKOFF_INITIAL
         # Consecutive long-poll partial-store retries with zero confirmed
         # progress. Reset on any successful send and on reconnect; when it
         # crosses ``_MAX_CONSECUTIVE_RETRYABLE`` the send loop forces a
         # reconnect so a persistent session/version skew is not re-POSTed
-        # forever (R9).
+        # forever.
         self._consecutive_retryable: int = 0
         # Current per-send batch size. Starts at ``_SEND_BATCH_SIZE`` and
         # is halved on an HTTP 413 (long-poll body too large) down to a
         # floor of 1, so an agent behind a small server body cap adapts
-        # instead of looping on an oversized POST (R6-F6).
+        # instead of looping on an oversized POST.
         self._send_batch_size: int = _SEND_BATCH_SIZE
 
         # Reconnect-now event. set() by the SIGHUP handler from
@@ -463,6 +598,17 @@ class AgentRuntime:
         # disconnect. Read by the dispatcher's ``schedule.resync``
         # command handler so it can drive a snapshot on demand.
         self._connected_schedulers_ref: list[SchedulerAdapter] = []
+        # Boundary D: no scheduler observation is projected until the Brain
+        # assigns an exact stream epoch.  Locks serialize source observation
+        # with durable sequence reservation for each scheduler adapter.
+        self._external_schedule_authorities: dict[
+            str,
+            _ExternalScheduleAuthority,
+        ] = {}
+        self._external_schedule_locks: dict[str, asyncio.Lock] = {}
+        self._snapshot_signal_pending: set[str] = set()
+        self._snapshot_signal_dirty: set[str] = set()
+        self._schedule_observation_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # Sync API (safe from any thread/context)
@@ -528,45 +674,89 @@ class AgentRuntime:
                 "the project was created.",
             )
 
+        # H6: VALIDATE the hmac_secret (decode + length) BEFORE deriving the
+        # deployment fingerprint and constructing the BufferStore below. The
+        # deployment_id derives from the secret, and BufferStore.__init__ then
+        # discards/restamps a reused-pid buffer using it -- so an INVALID secret
+        # (non-base64, or a key that decodes to < 32 bytes) would PURGE/restamp
+        # pending buffered data BEFORE the later _main validation rejects the key
+        # and refuses to run. Validate first, mutate second: refuse to start
+        # (raise) here so the buffer is never touched for a config we reject.
+        try:
+            _secret_bytes = _decode_hmac_secret(self.config.hmac_secret.get_secret_value())
+        except Exception as exc:
+            raise RuntimeError(
+                "z4j agent refusing to start: hmac_secret is not valid "
+                "urlsafe-base64 (the value the brain returns from POST /agents).",
+            ) from exc
+        if len(_secret_bytes) < 32:
+            raise RuntimeError(
+                "z4j agent refusing to start: hmac_secret must decode to at "
+                f"least 32 bytes; got {len(_secret_bytes)}.",
+            )
+
         with self._state_lock:
             if self._state != RuntimeState.STOPPED:
                 return
             self._state = RuntimeState.STARTING
+            # Claim this start's epoch. A concurrent stop()+restart that
+            # supersedes us while we are blocked in bring-up will bump it, so the
+            # RUNNING publish below can detect it is no longer the current owner.
+            self._start_epoch += 1
+            my_epoch = self._start_epoch
+            # M6: record the pid that owns the live threads. reinit_after_fork
+            # compares it to detect a genuine fork child (pid changed, the
+            # inherited threads are dead) vs a same-process double-call (pid
+            # unchanged, the threads are really alive and must not be orphaned).
+            self._started_pid = os.getpid()
 
-        # Open the buffer on the caller's thread (fast, synchronous).
-        self._buffer = BufferStore(
-            path=self.config.buffer_path,
-            max_entries=self.config.buffer_max_events,
-            max_bytes=self.config.buffer_max_bytes,
-        )
+        # H8: derive a per-deployment fingerprint from the agent's secret so
+        # orphan adoption never crosses two z4j deployments that share a per-uid
+        # buffer root (same OS user, different projects/secrets). Stable per
+        # deployment and reveals nothing about the secret (truncated SHA-256).
+        deployment_id = _derive_deployment_id(self.config.hmac_secret)
 
-        # Spawn the background thread that owns the event loop.
-        # ``_loop_ready`` MUST be cleared before the thread starts so
-        # this caller's wait() cannot return spuriously on a leftover
-        # signal from a previous start/stop cycle.
-        self._loop_ready.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="z4j-agent",
-            daemon=True,
-        )
-        self._thread.start()
-
-        if not self._loop_ready.wait(timeout=5.0):
-            # The background thread never signalled ready - either it
-            # failed to construct the loop or the JIT thread start
-            # was delayed past the timeout. Tear down so the runtime
-            # is left in a clean STOPPED state.
-            logger.error(
-                "z4j agent runtime: background loop did not become ready within 5s; tearing down",
-            )
+        # RM7: buffer construction + bring-up runs under a guard that resets the
+        # state to STOPPED on ANY failure. BufferStore.__init__ can raise (an
+        # unwritable path, a transient disk-full, an H5 discard error); without
+        # this the runtime would be stranded in STARTING with ``_buffer=None``, so
+        # a later start() (e.g. after the disk recovers) would no-op at the
+        # STOPPED guard above and the agent would stay disabled forever.
+        # ``_abort_start`` closes any partial buffer, joins the thread, and resets
+        # to STOPPED so the next start() genuinely retries.
+        try:
+            self._start_bringup(deployment_id)
+        except BaseException:
             self._abort_start()
-            raise RuntimeError(
-                "z4j agent runtime failed to start: background loop did not become ready",
-            )
+            raise
 
+        # A concurrent stop() (and possibly a restart) may have
+        # moved us out of STARTING while _start_bringup was blocked (e.g. in a slow
+        # connect_signals). Publish RUNNING ONLY if we are STILL both STARTING and
+        # the CURRENT epoch. Two supersede cases:
+        #   - a plain stop() (state left STARTING): we own the handles we brought
+        #     up, so tear them down (the abort).
+        #   - a stop()+restart by a NEWER start() (epoch advanced): the newer start
+        #     now owns self._loop/_thread/_buffer, so we must NOT tear those down.
+        #     Our own orphaned thread is a bounded daemon that self-terminates and,
+        #     via the identity guard in _run_loop's finally, cannot clobber the new
+        #     owner's handles. Just return.
         with self._state_lock:
-            self._state = RuntimeState.RUNNING
+            superseded_by_newer_start = self._start_epoch != my_epoch
+            lost_to_stop = self._state != RuntimeState.STARTING
+            if not lost_to_stop and not superseded_by_newer_start:
+                self._state = RuntimeState.RUNNING
+        if superseded_by_newer_start:
+            logger.warning(
+                "z4j agent runtime: start superseded by a newer start "
+                "(epoch %d -> %d); leaving the current owner's runtime intact",
+                my_epoch,
+                self._start_epoch,
+            )
+            return
+        if lost_to_stop:
+            self._abort_start()
+            return
 
         # Pidfile + SIGHUP wiring (1.1.2+). Best-effort: failure to
         # write the pidfile or install the handler is logged but
@@ -605,11 +795,150 @@ class AgentRuntime:
             list(self.engines),
         )
 
+    def _start_bringup(self, deployment_id: str) -> None:
+        """Open the fresh buffer, spawn the loop thread, and wait for readiness.
+
+        Raises on any failure so start()'s RM7 guard resets state to STOPPED.
+        """
+        # Open the buffer on the caller's thread (fast, synchronous).
+        self._buffer = BufferStore(
+            path=self.config.buffer_path,
+            max_entries=self.config.buffer_max_events,
+            max_bytes=self.config.buffer_max_bytes,
+            deployment_id=deployment_id,
+        )
+
+        # Spawn the background thread that owns the event loop.
+        # ``_loop_ready`` MUST be cleared before the thread starts so
+        # this caller's wait() cannot return spuriously on a leftover
+        # signal from a previous start/stop cycle.
+        self._loop_ready.clear()
+        self._loop_error.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="z4j-agent",
+            daemon=True,
+        )
+        self._thread.start()
+
+        if not self._loop_ready.wait(timeout=5.0):
+            # The background thread never signalled ready - either it failed to
+            # construct the loop or the JIT thread start was delayed past the
+            # timeout. Raise so start()'s guard resets state to STOPPED cleanly.
+            logger.error(
+                "z4j agent runtime: background loop did not become ready within 5s",
+            )
+            raise RuntimeError(
+                "z4j agent runtime failed to start: background loop did not become ready",
+            )
+
+        # _loop_ready is now the STEADY-STATE signal, but _run_loop also
+        # sets it (with _loop_error) when _main dies during setup. So a ready
+        # signal alone is not proof of health -- check the error flag + that the
+        # thread is still alive, and raise (RM7 guard -> STOPPED, retryable) if
+        # the loop died on the way up.
+        if self._loop_error.is_set() or not (self._thread is not None and self._thread.is_alive()):
+            raise RuntimeError(
+                "z4j agent runtime failed to start: the event loop did not reach "
+                "a healthy running state",
+            )
+
+    def reinit_after_fork(self) -> None:
+        """Re-establish this runtime in a freshly ``os.fork()``ed child.
+
+        A fork copies memory but NOT threads, so a child inherits a
+        runtime object whose ``_state`` looks RUNNING while its transport
+        / heartbeat / dispatcher threads are dead. Events captured in the
+        child then pile into a buffer no live thread drains, and because
+        the process-singleton is non-None the child's own install path
+        short-circuits. This is the gunicorn/uWSGI ``--preload`` failure
+        mode.
+
+        This method forces a clean restart: reset to STOPPED, drop the
+        parent's dead thread + buffer handle, re-resolve the per-PID
+        buffer path for THIS child (so siblings don't share one file),
+        and ``start()`` fresh threads + a new brain connection.
+
+        It is NOT auto-wired via ``os.register_at_fork``: a blanket
+        at-fork handler would also fire in Celery's prefork pool
+        children, where the agent must NOT run. Operators wire it
+        explicitly for web servers only, via ``z4j_bare.post_fork()`` in
+        a gunicorn ``post_fork`` / uWSGI ``@postfork`` hook.
+        """
+        # M6: refuse to run in a NON-forked process whose threads are still
+        # alive. If the recorded owner pid equals ours we did NOT fork -- this
+        # is a stray second post_fork() call, or the hook wired in a
+        # non-forking context. Blindly resetting here would overwrite the live
+        # _loop / _thread / _buffer handles so stop() could never signal the
+        # old loop, leaking its WS session + BufferStore forever and spawning
+        # a duplicate stack that drains the same buffer file. Do nothing.
+        # M6: STARTING as well as RUNNING -- a same-process reinit during the
+        # brief startup window would otherwise slip past and reset a live
+        # (starting) stack.
+        if getattr(self, "_started_pid", None) == os.getpid() and self._state in (
+            RuntimeState.RUNNING,
+            RuntimeState.STARTING,
+            RuntimeState.STOPPING,  # RM8: a reinit racing shutdown is also not a fork
+        ):
+            logger.warning(
+                "z4j agent: reinit_after_fork() called in the SAME process "
+                "(pid=%d) as the running agent -- not a fork. Ignoring to "
+                "avoid orphaning the live agent thread. Wire post_fork() only "
+                "in a real fork hook (gunicorn post_fork / uWSGI @postfork).",
+                os.getpid(),
+            )
+            return
+
+        with self._state_lock:
+            self._state = RuntimeState.STOPPED
+            self._thread = None
+            old_buffer = self._buffer
+            self._buffer = None
+        # M6: this child inherited the parent's buffer as a shared open file
+        # description. Close ONLY the inherited lock fd (os.close, no flock
+        # unlock) so the parent keeps its live ownership lock now and its
+        # buffer becomes adoptable once it dies, without leaking the fd for the
+        # child's whole life. Do NOT call old_buffer.close() -- its
+        # _release_lock would flock(LOCK_UN) the shared OFD and drop the
+        # PARENT's lock.
+        if old_buffer is not None:
+            old_buffer.release_fork_inherited_lock()
+        # M5: re-derive the per-PID buffer filename in the SAME directory the
+        # config already points at, instead of forcing it back to
+        # ~/.z4j via _default_buffer_path(). An operator who set an explicit
+        # buffer_path (provisioned/persistent storage, tighter perms) and uses
+        # the documented gunicorn --preload + post_fork flow otherwise had
+        # every worker silently relocate its buffer to ~/.z4j (or the tmp
+        # fallback), violating the durability path they configured. Only the
+        # pid-specific filename changes; the directory is preserved.
+        with contextlib.suppress(Exception):
+            child_buffer_path = self.config.buffer_path.parent / f"buffer-{os.getpid()}.sqlite"
+            self.config = self.config.model_copy(
+                update={"buffer_path": child_buffer_path},
+            )
+        self.start()
+
     def _abort_start(self) -> None:
         """Best-effort cleanup when start() fails to come up cleanly."""
+        # SIGNAL the loop to stop BEFORE dropping the thread handle. A
+        # readiness timeout can fire while _main is still blocked in a slow
+        # connect_signals(); without this the thread handle is dropped but the
+        # loop later RESUMES and keeps running (an untracked live loop a retry
+        # start() could overlap). Setting the cooperative stop event makes the
+        # loop tear itself down the moment the blocking setup call returns, so at
+        # most one loop is ever live.
+        if self._loop is not None and self._stop_event is not None:
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._stop_event.set)
         if self._buffer is not None:
             try:
-                self._buffer.close()
+                # Bound the abort close with a lock deadline, mirroring
+                # stop(). Without it, a signal callback or a wedged orphan-scan
+                # holding the buffer lock at startup-timeout would block the abort
+                # (and thus start()) indefinitely. The abandon-on-timeout path
+                # marks the buffer closed and keeps the ownership flock held to
+                # process exit, so a bounded close is safe.
+                self._buffer.close(lock_timeout=2.0)
             except Exception:
                 logger.exception("error closing buffer during start abort")
             self._buffer = None
@@ -628,32 +957,59 @@ class AgentRuntime:
         Blocks up to ``timeout`` seconds while the background loop
         shuts down cleanly. Safe to call from any thread. Idempotent.
         """
+        import time as _time
+
+        deadline_started = _time.monotonic()
         with self._state_lock:
             if self._state in (RuntimeState.STOPPED, RuntimeState.STOPPING):
                 return
             self._state = RuntimeState.STOPPING
 
+        # If the loop already closed (it raced its own teardown at
+        # _run_loop's finally before self._loop was cleared), call_soon_threadsafe
+        # raises RuntimeError -- the thread is already exiting so the wake is moot.
+        # Suppress it (mirrors _abort_start's pattern) instead of letting it
+        # skip the cleanup + STOPPED transition below and strand the runtime in
+        # STOPPING (which the guard above would then never let another stop()
+        # retry, and the STOPPED start-guard would never let a start() proceed).
         if self._loop is not None and self._stop_event is not None:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._stop_event.set)
 
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-
-        if self._buffer is not None:
-            self._buffer.close()
-            self._buffer = None
-
-        # Best-effort pidfile cleanup so a stale entry doesn't
-        # confuse the next ``z4j-<adapter> restart``.
         try:
-            from z4j_bare.control import remove_pidfile
+            if self._thread is not None:
+                # The thread join shares the SINGLE stop() budget with the
+                # buffer close below (join gets the remaining budget, not the full
+                # timeout), so the two BLOCKING waits together cannot exceed the
+                # caller-supplied deadline.
+                join_budget = max(0.0, timeout - (_time.monotonic() - deadline_started))
+                self._thread.join(timeout=join_budget)
 
-            remove_pidfile(self.framework.name if self.framework else "bare")
-        except Exception:  # noqa: S110  best-effort pidfile cleanup on stop
-            pass
+            if self._buffer is not None:
+                # RM6 +: bound the close's LOCK acquisition by the
+                # REMAINING stop() budget (not a fixed 2s). A daemon orphan-scan
+                # wedged on SQLite I/O cannot hang stop() past the budget: on
+                # timeout close() abandons the handle; when uncontended it acquires
+                # immediately. (The final uncontended clean-close ops run to
+                # completion, bounded by buffer size / disk.)
+                remaining = max(0.0, timeout - (_time.monotonic() - deadline_started))
+                self._buffer.close(lock_timeout=remaining)
+                self._buffer = None
 
-        with self._state_lock:
-            self._state = RuntimeState.STOPPED
+            # Best-effort pidfile cleanup so a stale entry doesn't
+            # confuse the next ``z4j-<adapter> restart``.
+            try:
+                from z4j_bare.control import remove_pidfile
+
+                remove_pidfile(self.framework.name if self.framework else "bare")
+            except Exception:  # noqa: S110  best-effort pidfile cleanup on stop
+                pass
+        finally:
+            # STOPPED must ALWAYS be published, even if a teardown step
+            # above raises -- otherwise the runtime is stranded in STOPPING (no
+            # later stop() retries, no start() proceeds) permanently.
+            with self._state_lock:
+                self._state = RuntimeState.STOPPED
 
         logger.info("z4j agent runtime stopped")
 
@@ -694,7 +1050,7 @@ class AgentRuntime:
         frame = EventBatchFrame(
             # 128-bit id: event_batch ids key _pending_acks, so a 48-bit
             # collision could let a real ack for one entry delete a different
-            # unstored entry (R8-M5). 35 chars, within the 64-char id cap.
+            # unstored entry. 35 chars, within the 64-char id cap.
             id=f"ev_{_secrets.token_hex(16)}",
             ts=datetime.now(UTC),
             payload=EventBatchPayload(
@@ -747,17 +1103,27 @@ class AgentRuntime:
             self._reconnect_now = asyncio.Event()
         except Exception:
             logger.exception("z4j agent failed to create asyncio loop")
+            self._loop_error.set()
             self._loop_ready.set()  # unblock the caller's wait()
             return
 
-        # Loop and stop_event are both live now; safe to publish.
-        self._loop_ready.set()
-
+        # _loop_ready is now published by _main() only once it reaches
+        # STEADY STATE (consumer tasks created, signals wired -- just before
+        # _supervise), NOT here. So start() never reports RUNNING on a loop that
+        # dies during setup (an engine connect_signals raising, a short-secret
+        # early return, etc.). If _main returns/raises before reaching that
+        # point, the finally below flags the error and unblocks the waiter.
         try:
             loop.run_until_complete(self._main())
         except Exception:
             logger.exception("z4j agent runtime loop crashed")
+            self._loop_error.set()
         finally:
+            if not self._loop_ready.is_set():
+                # _main never reached steady state; the start() waiter is still
+                # blocked. Flag the failure and release it fast.
+                self._loop_error.set()
+                self._loop_ready.set()
             # Deterministic executor drain BEFORE close (the "Fix B"
             # half of the heartbeat shutdown-race fix). Any final
             # heartbeat tick dispatched a sync provider through the
@@ -775,7 +1141,14 @@ class AgentRuntime:
                 _drain_default_executor(loop, deadline_s=2.0)
             with contextlib.suppress(Exception):
                 loop.close()
-            self._loop = None
+            # Clear the shared handle ONLY if it still points at OUR loop.
+            # A slow teardown can outlive start()'s join timeout; if a retry
+            # start() has since spawned a new thread and published its own loop
+            # into self._loop, an unconditional clear here would null the NEW
+            # owner's live loop. The identity guard clears only what this thread
+            # still owns.
+            if self._loop is loop:
+                self._loop = None
 
     async def _main(self) -> None:  # noqa: PLR0912, PLR0915  asyncio main orchestration
         """The actual asyncio main - runs transport, send loop, heartbeat."""
@@ -807,6 +1180,8 @@ class AgentRuntime:
             schedulers=self.schedulers,
             buffer=self._buffer,
             resync_schedules=self.resync_schedules_now,
+            activate_schedule_stream=self.activate_external_schedule_stream,
+            control_external_schedule=self.control_external_schedule,
         )
 
         def _collect_engine_health() -> dict[str, str]:
@@ -960,6 +1335,30 @@ class AgentRuntime:
                     )
                 )
 
+            # RH8: refresh the buffer's liveness lease unconditionally (even
+            # with the heartbeat disabled and no events flowing) so an idle
+            # owner is never mistaken for dead by a peer's orphan-adoption. The
+            # append path already refreshes the lease when events/heartbeats
+            # flow; this covers the fully-idle case.
+            if self._buffer is not None:
+                engine_consumer_tasks.append(
+                    asyncio.create_task(
+                        self._periodic_lease_refresh(self._buffer),
+                        name="z4j-buffer-lease-refresh",
+                    ),
+                )
+                # C fresh-first + RH8: recover only after the fresh sink and
+                # runtime are ready. The task scans immediately and then on a
+                # cadence, so old-buffer classification is recovery rather than
+                # a startup precondition, while a still-fresh dead-owner lease is
+                # reconsidered once it ages out.
+                engine_consumer_tasks.append(
+                    asyncio.create_task(
+                        self._periodic_orphan_adoption(self._buffer),
+                        name="z4j-buffer-orphan-rescan",
+                    ),
+                )
+
             # 1.3.3 - Phase B: periodic schedule resync.
             # A long-lived task that drains ``list_schedules()`` on
             # every registered scheduler every
@@ -982,6 +1381,12 @@ class AgentRuntime:
             # on demand (Phase C). The dispatcher gets these via the
             # runtime accessor ``_schedule_snapshot_handler``.
             self._connected_schedulers_ref = connected_schedulers
+
+            # Publish STEADY-STATE readiness only here -- the loop is
+            # built, signals are wired, and every consumer task is created. Only
+            # now may start() report RUNNING; a failure anywhere above leaves
+            # _loop_ready unset so _run_loop's finally flags _loop_error.
+            self._loop_ready.set()
 
             await self._supervise()
         finally:
@@ -1047,30 +1452,57 @@ class AgentRuntime:
         scheduler: SchedulerAdapter,
         *,
         reason: str,
-    ) -> None:
-        """Drain a scheduler adapter's ``list_schedules`` and emit ONE
-        ``schedule.snapshot`` event carrying the full inventory.
+    ) -> dict[str, object] | None:
+        """Capture and durably sequence one complete external snapshot.
 
-        The brain's event ingestor 3-way diffs against the DB scoped
-        to ``(project, scheduler)``, inserts new rows, updates
-        existing rows, deletes rows missing from the snapshot. The
-        whole thing is one transaction on the brain side.
-
-        Called from three places:
-
-        1. Boot (Phase A) once per scheduler, ``reason="boot"``.
-        2. Periodic timer (Phase B), ``reason="periodic"``.
-        3. ``schedule.resync`` command receiver (Phase C),
-           ``reason="command"``.
-
-        Wrapped in defensive try/except: a misbehaving adapter that
-        raises during ``list_schedules`` MUST NOT take down the
-        whole runtime, especially on the periodic path where it
-        would loop on the next tick anyway.
+        Unsequenced N-1 schedule events are intentionally not emitted.  The
+        Brain first supplies an exact stream epoch via
+        ``schedule.external.activate``; every later observation for that
+        adapter is serialized by one asyncio lock and committed to the local
+        SQLite buffer together with its source sequence.
         """
+        scheduler_name = getattr(scheduler, "name", "unknown")
+        authority = getattr(self, "_external_schedule_authorities", {}).get(
+            scheduler_name,
+        )
+        if authority is None:
+            logger.debug(
+                "z4j agent: scheduler %s snapshot deferred until the Brain "
+                "issues external stream authority (reason=%s)",
+                scheduler_name,
+                reason,
+            )
+            return None
+        locks = getattr(self, "_external_schedule_locks", None)
+        if locks is None:
+            locks = {}
+            self._external_schedule_locks = locks
+        lock = locks.setdefault(scheduler_name, asyncio.Lock())
+        async with lock:
+            return await self._emit_schedule_snapshot_locked(
+                scheduler,
+                authority=authority,
+                reason=reason,
+            )
+
+    async def _emit_schedule_snapshot_locked(  # noqa: PLR0915
+        self,
+        scheduler: SchedulerAdapter,
+        *,
+        authority: _ExternalScheduleAuthority,
+        reason: str,
+    ) -> dict[str, object] | None:
+        """Observe then atomically reserve+append while the adapter lock is held."""
+        import secrets as _secrets
         from uuid import uuid4
 
-        from z4j_core.models import Event, EventKind  # local import to avoid cycles
+        from z4j_core.schedule_external import (
+            canonical_external_json,
+            external_projection_body,
+            external_projection_digest,
+            external_snapshot_frame_body,
+            external_snapshot_frame_digest,
+        )
 
         scheduler_name = getattr(scheduler, "name", "unknown")
         try:
@@ -1081,8 +1513,9 @@ class AgentRuntime:
                 scheduler_name,
                 reason,
             )
-            return
+            return None
 
+        observed_at = datetime.now(UTC)
         # Serialize each schedule. ``model_dump(mode="json")`` produces
         # JSON-safe primitives so the brain's frame validator does not
         # reject e.g. datetime / UUID objects.
@@ -1094,34 +1527,185 @@ class AgentRuntime:
             try:
                 schedules_payload.append(dump(mode="json"))
             except Exception:
+                # M13: a schedule that fails to serialize must NOT be silently
+                # DROPPED from this snapshot. The snapshot is AUTHORITATIVE --
+                # the brain reconciler deletes any schedule absent from it -- so
+                # a partial inventory that omits one un-dumpable job reads as a
+                # deletion of a job that still exists (e.g. args=[b"\xff"] maps
+                # cleanly in the adapter but only blows up here at JSON time).
+                # Abort the whole snapshot, the same fail-safe as a
+                # list_schedules error above: skip this cycle so NOTHING is
+                # deleted, and let the next resync retry. Adapters are expected
+                # to keep args/kwargs JSON-safe (see the apscheduler adapter's
+                # degraded mapping); reaching here means one slipped through.
                 logger.exception(
-                    "z4j agent: scheduler %s yielded a Schedule that failed model_dump",
+                    "z4j agent: scheduler %s yielded a Schedule that failed "
+                    "model_dump; skipping this snapshot to avoid a false deletion",
                     scheduler_name,
                 )
-                continue
+                return None
 
-        placeholder = uuid4()
-        event = Event(
-            id=uuid4(),
-            project_id=placeholder,
-            agent_id=placeholder,
-            engine=scheduler_name,
-            task_id="",
-            kind=EventKind.SCHEDULE_SNAPSHOT,
-            occurred_at=datetime.now(UTC),
-            data={
-                "scheduler": scheduler_name,
-                "schedules": schedules_payload,
-                "reason": reason,
-            },
-        )
-        self.record_event(event)
+        buffer = self._buffer
+        if buffer is None or buffer.closed:
+            return None
+        snapshot_id = str(uuid4())
+
+        def _build_payloads(
+            sequence: int,
+            adapter_instance_id: str,
+        ) -> list[bytes]:
+            projection_body = external_projection_body(
+                stream_id=authority.stream_id,
+                epoch_uuid=authority.epoch_uuid,
+                epoch_number=authority.epoch_number,
+                sequence=sequence,
+                kind="snapshot",
+                owner=authority.owner,
+                source_scope=authority.source_scope,
+                adapter_instance_id=adapter_instance_id,
+                schedules=schedules_payload,
+                complete=True,
+                stable_source=authority.stable_source,
+            )
+            snapshot_digest = external_projection_digest(projection_body)
+            normalized_rows = projection_body["schedules"]
+            chunks: list[list[dict[str, Any]]] = []
+            current: list[dict[str, Any]] = []
+            for row in normalized_rows:
+                candidate = [*current, row]
+                candidate_bytes = len(
+                    canonical_external_json({"schedules": candidate}),
+                )
+                if current and candidate_bytes > _EXTERNAL_SNAPSHOT_ROW_PAYLOAD_BYTES:
+                    chunks.append(current)
+                    current = [row]
+                else:
+                    current = candidate
+                if (
+                    len(
+                        canonical_external_json({"schedules": current}),
+                    )
+                    > _EXTERNAL_SNAPSHOT_ROW_PAYLOAD_BYTES
+                ):
+                    raise ValueError(
+                        "one external schedule row exceeds the stable snapshot frame limit",
+                    )
+            if current:
+                chunks.append(current)
+
+            frame_count = len(chunks)
+            payloads: list[bytes] = []
+
+            def _serialize_snapshot_frame(
+                *,
+                frame_kind: str,
+                frame_index: int,
+                rows: list[dict[str, Any]],
+            ) -> bytes:
+                frame_body = external_snapshot_frame_body(
+                    stream_id=authority.stream_id,
+                    epoch_uuid=authority.epoch_uuid,
+                    epoch_number=authority.epoch_number,
+                    sequence=sequence,
+                    owner=authority.owner,
+                    source_scope=authority.source_scope,
+                    adapter_instance_id=adapter_instance_id,
+                    snapshot_id=snapshot_id,
+                    frame_kind=frame_kind,
+                    frame_index=frame_index,
+                    frame_count=frame_count,
+                    row_count=len(normalized_rows),
+                    snapshot_digest=snapshot_digest,
+                    stable_source=authority.stable_source,
+                    schedules=rows,
+                )
+                frame = EventBatchFrame(
+                    id=f"ev_{_secrets.token_hex(16)}",
+                    ts=observed_at,
+                    payload=EventBatchPayload(
+                        events=[
+                            {
+                                "id": str(uuid4()),
+                                "kind": "schedule.snapshot",
+                                "engine": scheduler_name,
+                                "task_id": "",
+                                "occurred_at": observed_at.isoformat(),
+                                "data": {
+                                    "external_snapshot_frame": frame_body,
+                                    "frame_digest": (
+                                        external_snapshot_frame_digest(
+                                            frame_body,
+                                        )
+                                    ),
+                                    "reason": reason,
+                                },
+                            },
+                        ],
+                    ),
+                )
+                serialized = serialize_frame(frame)
+                if len(serialized) > _EXTERNAL_SNAPSHOT_FRAME_TARGET_BYTES:
+                    raise ValueError(
+                        "external stable snapshot framing exceeded its serialized frame limit",
+                    )
+                return serialized
+
+            for index, chunk in enumerate(chunks):
+                payloads.append(
+                    _serialize_snapshot_frame(
+                        frame_kind="rows",
+                        frame_index=index,
+                        rows=chunk,
+                    ),
+                )
+            payloads.append(
+                _serialize_snapshot_frame(
+                    frame_kind="terminal",
+                    frame_index=frame_count,
+                    rows=[],
+                ),
+            )
+            return payloads
+
+        try:
+            entry_ids, sequence, adapter_instance_id = (
+                buffer.append_external_schedule_projection_frames(
+                    owner=authority.owner,
+                    source_scope=authority.source_scope,
+                    stream_id=authority.stream_id,
+                    epoch_uuid=authority.epoch_uuid,
+                    epoch_number=authority.epoch_number,
+                    adapter_instance_id=authority.adapter_instance_id,
+                    build_payloads=_build_payloads,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "z4j agent: scheduler %s failed to reserve and buffer its "
+                "external projection (reason=%s)",
+                scheduler_name,
+                reason,
+            )
+            return None
         logger.info(
-            "z4j agent: scheduler %s snapshot emitted (count=%d, reason=%s)",
+            "z4j agent: scheduler %s external snapshot buffered "
+            "(count=%d, frames=%d, sequence=%d, reason=%s)",
             scheduler_name,
             len(schedules_payload),
+            len(entry_ids),
+            sequence,
             reason,
         )
+        return {
+            "scheduler": scheduler_name,
+            "stream_id": authority.stream_id,
+            "epoch_uuid": authority.epoch_uuid,
+            "epoch_number": authority.epoch_number,
+            "sequence": sequence,
+            "adapter_instance_id": adapter_instance_id,
+            "schedule_count": len(schedules_payload),
+            "frame_count": len(entry_ids),
+        }
 
     async def _periodic_schedule_resync(
         self,
@@ -1156,6 +1740,69 @@ class AgentRuntime:
                     reason="periodic",
                 )
 
+    async def _periodic_lease_refresh(self, buffer: BufferStore) -> None:
+        """RH8: keep this owner's buffer liveness lease fresh so a peer never
+        adopts a LIVE-but-idle buffer. Runs until stop; a lease write must never
+        take down the runtime, so failures are swallowed."""
+        from z4j_bare.buffer import _LEASE_REFRESH_SECONDS
+
+        while not self._stop_event.is_set():
+            with contextlib.suppress(Exception):
+                buffer.touch_lease()
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=_LEASE_REFRESH_SECONDS,
+                )
+                return  # stop signalled
+            except TimeoutError:
+                pass  # normal tick
+
+    async def _periodic_orphan_adoption(self, buffer: BufferStore) -> None:
+        """Scan for recoverable buffers immediately, then periodically.
+
+        C fresh-first: this task is created before readiness is published but
+        cannot run until ``_main`` yields after setting ``_loop_ready``. Old
+        buffer classification is therefore never a startup precondition. RH8:
+        cadence scans reconsider a dead owner's initially fresh lease after it
+        ages out. Best-effort; never raises.
+        """
+        from z4j_bare.buffer import _ORPHAN_RESCAN_SECONDS, adopt_orphaned_buffers
+
+        while not self._stop_event.is_set():
+            try:
+                # The scan opens + drains orphan SQLite DBs, which
+                # can be slow on a large/locked orphan set. Run it OFF the event
+                # loop so it never blocks sends, acks, shutdown, or this process's
+                # lease refresh. Writes into `buffer` are serialised by its
+                # threading.Lock, so the cross-thread append is safe.
+                # M5: a DAEMON thread (not asyncio.to_thread's pooled non-daemon
+                # worker), so a genuinely-wedged scan on a locked orphan DB is
+                # never atexit-joined and can never hang process exit past the
+                # bounded shutdown drain.
+                adopted = await _await_in_daemon_thread(
+                    lambda: adopt_orphaned_buffers(buffer, home_dir=buffer.path.parent)
+                )
+                if adopted:
+                    logger.info(
+                        "z4j agent: recovered %d buffered event(s) from a dead "
+                        "peer on a periodic re-scan",
+                        adopted,
+                    )
+            except Exception:
+                logger.warning(
+                    "z4j agent: periodic orphaned-buffer adoption failed",
+                    exc_info=True,
+                )
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=_ORPHAN_RESCAN_SECONDS,
+                )
+                return  # stop signalled
+            except TimeoutError:
+                pass  # normal cadence tick -- re-scan above
+
     async def resync_schedules_now(self, reason: str = "command") -> int:
         """Drain every connected scheduler adapter and emit one
         ``schedule.snapshot`` per adapter.
@@ -1170,63 +1817,413 @@ class AgentRuntime:
             await self._emit_schedule_snapshot(scheduler, reason=reason)
         return len(schedulers)
 
+    async def activate_external_schedule_stream(
+        self,
+        target: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> dict[str, object]:
+        """Accept one Brain-issued epoch and publish its activation snapshot."""
+        scheduler_name = str(
+            target.get("scheduler") or parameters.get("scheduler") or parameters.get("owner") or ""
+        ).strip()
+        scheduler = self.schedulers.get(scheduler_name)
+        if scheduler is None:
+            raise ValueError(f"no scheduler adapter registered for {scheduler_name or '<missing>'}")
+        connected = getattr(self, "_connected_schedulers_ref", ())
+        if scheduler not in connected:
+            raise RuntimeError(f"scheduler adapter {scheduler_name} is not connected")
+
+        owner = str(parameters.get("owner") or "").strip()
+        source_scope = str(parameters.get("source_scope") or "").strip()
+        stream_id = str(parameters.get("stream_id") or "").strip()
+        epoch_uuid = str(parameters.get("epoch_uuid") or "").strip()
+        adapter_instance_id = str(parameters.get("adapter_instance_id") or "").strip()
+        try:
+            epoch_number = int(parameters.get("epoch_number"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("external activation epoch_number is invalid") from exc
+        if (
+            owner != scheduler_name
+            or not source_scope
+            or not stream_id
+            or not epoch_uuid
+            or not adapter_instance_id
+            or epoch_number <= 0
+        ):
+            raise ValueError("external activation does not bind the exact scheduler stream epoch")
+        # This flag is a signed Brain command obligation, not agent-supplied
+        # evidence.  The Brain may set it only after its activation policy has
+        # established a source-native stable read or operator quiescence.
+        if parameters.get("stable_source") is not True:
+            raise ValueError(
+                "external activation requires Brain-authorized stable source observation"
+            )
+
+        authority = _ExternalScheduleAuthority(
+            stream_id=stream_id,
+            epoch_uuid=epoch_uuid,
+            epoch_number=epoch_number,
+            adapter_instance_id=adapter_instance_id,
+            owner=owner,
+            source_scope=source_scope,
+            stable_source=True,
+        )
+        authorities = getattr(self, "_external_schedule_authorities", None)
+        if authorities is None:
+            authorities = {}
+            self._external_schedule_authorities = authorities
+        locks = getattr(self, "_external_schedule_locks", None)
+        if locks is None:
+            locks = {}
+            self._external_schedule_locks = locks
+        lock = locks.setdefault(scheduler_name, asyncio.Lock())
+        async with lock:
+            existing = authorities.get(scheduler_name)
+            if existing is not None and existing != authority:
+                raise RuntimeError(
+                    "scheduler adapter already holds a different external stream epoch"
+                )
+            authorities[scheduler_name] = authority
+            result = await self._emit_schedule_snapshot_locked(
+                scheduler,
+                authority=authority,
+                reason="activation",
+            )
+            if result is None:
+                if existing is None:
+                    authorities.pop(scheduler_name, None)
+                raise RuntimeError("external activation snapshot was not durably buffered")
+            return result
+
+    async def control_external_schedule(  # noqa: PLR0912, PLR0915
+        self,
+        target: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> dict[str, object]:
+        """Execute one exact set-to-state operation under its reserved sequence."""
+
+        import secrets as _secrets
+        from uuid import UUID, uuid4
+
+        from z4j_core.schedule_external import (
+            canonical_external_json,
+            external_control_result_matches_desired,
+            external_projection_body,
+            external_projection_digest,
+            normalize_external_schedule,
+        )
+
+        required_fields = {
+            "operation_id",
+            "scheduler",
+            "schedule_id",
+            "source_key",
+            "z4j_schedule_id",
+            "stream_id",
+            "epoch_uuid",
+            "epoch_number",
+            "adapter_instance_id",
+            "expected_accepted_sequence",
+            "expected_projection_digest",
+            "desired_projection",
+            "desired_projection_digest",
+            "registry_owner_id",
+            "session_generation",
+        }
+        if set(parameters) != required_fields:
+            raise ValueError("external control fields are not the closed protocol vocabulary")
+        try:
+            operation_id = str(UUID(str(parameters["operation_id"])))
+            stream_id = str(UUID(str(parameters["stream_id"])))
+            epoch_uuid = str(UUID(str(parameters["epoch_uuid"])))
+            UUID(str(parameters["z4j_schedule_id"]))
+            UUID(str(parameters["registry_owner_id"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("external control UUID is invalid") from exc
+        scheduler_name = str(parameters["scheduler"]).strip()
+        source_key = str(parameters["source_key"]).strip()
+        if not scheduler_name or str(parameters["schedule_id"]) != source_key or not source_key:
+            raise ValueError("external control source identity is invalid")
+        scheduler = self.schedulers.get(scheduler_name)
+        if scheduler is None:
+            raise ValueError(f"no scheduler adapter registered for {scheduler_name!r}")
+        connected = getattr(self, "_connected_schedulers_ref", ())
+        if scheduler not in connected:
+            raise RuntimeError(f"scheduler adapter {scheduler_name} is not connected")
+        try:
+            epoch_number = int(parameters["epoch_number"])
+            expected_sequence = int(
+                parameters["expected_accepted_sequence"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("external control epoch or sequence is invalid") from exc
+        if (
+            isinstance(parameters["epoch_number"], bool)
+            or isinstance(parameters["expected_accepted_sequence"], bool)
+            or epoch_number <= 0
+            or expected_sequence < 0
+        ):
+            raise ValueError("external control epoch or sequence is invalid")
+        adapter_instance_id = str(
+            parameters["adapter_instance_id"],
+        ).strip()
+        expected_projection_digest = str(
+            parameters["expected_projection_digest"],
+        )
+        desired_projection_digest = str(
+            parameters["desired_projection_digest"],
+        )
+        desired_raw = parameters["desired_projection"]
+        if not isinstance(desired_raw, dict):
+            raise TypeError("external control desired projection is invalid")
+        desired_projection = normalize_external_schedule(
+            desired_raw,
+            owner=scheduler_name,
+        )
+        if (
+            desired_projection["source_key"] != source_key
+            or hashlib.sha256(
+                canonical_external_json(desired_projection),
+            ).hexdigest()
+            != desired_projection_digest
+            or len(expected_projection_digest) != 64
+            or any(character not in "0123456789abcdef" for character in expected_projection_digest)
+        ):
+            raise ValueError("external control desired or prior projection digest mismatched")
+
+        authority = getattr(
+            self,
+            "_external_schedule_authorities",
+            {},
+        ).get(scheduler_name)
+        if authority is None or (
+            authority.stream_id,
+            authority.epoch_uuid,
+            authority.epoch_number,
+            authority.adapter_instance_id,
+            authority.owner,
+        ) != (
+            stream_id,
+            epoch_uuid,
+            epoch_number,
+            adapter_instance_id,
+            scheduler_name,
+        ):
+            raise RuntimeError("external control does not match this adapter's stream authority")
+        buffer = self._buffer
+        if buffer is None or buffer.closed:
+            raise RuntimeError("external control buffer is unavailable")
+        lock = self._external_schedule_locks.setdefault(
+            scheduler_name,
+            asyncio.Lock(),
+        )
+        async with lock:
+            reservation = buffer.reserve_external_schedule_control(
+                operation_id=operation_id,
+                owner=authority.owner,
+                source_scope=authority.source_scope,
+                stream_id=authority.stream_id,
+                epoch_uuid=authority.epoch_uuid,
+                epoch_number=authority.epoch_number,
+                adapter_instance_id=authority.adapter_instance_id,
+                expected_sequence=expected_sequence,
+                desired_projection_digest=desired_projection_digest,
+            )
+            if reservation.already_published:
+                return {
+                    "operation_id": operation_id,
+                    "sequence": reservation.sequence,
+                    "projection_buffered": True,
+                    "deduplicated": True,
+                }
+
+            prior = await scheduler.get_schedule(source_key)
+            if prior is None:
+                raise RuntimeError("external control source schedule is missing")
+            prior_dump = prior.model_dump(mode="json")
+            prior_projection = normalize_external_schedule(
+                prior_dump,
+                owner=scheduler_name,
+            )
+            if prior_projection["source_key"] != source_key:
+                raise RuntimeError("external control prior source projection is stale")
+            prior_projection_digest = hashlib.sha256(
+                canonical_external_json(prior_projection),
+            ).hexdigest()
+            prior_is_expected = hmac.compare_digest(
+                prior_projection_digest,
+                expected_projection_digest,
+            )
+            prior_is_landed_result = external_control_result_matches_desired(
+                desired_projection,
+                prior_projection,
+            )
+            if prior_is_expected:
+                desired_enabled = bool(
+                    desired_projection["is_enabled"],
+                )
+                adapter_result = (
+                    await scheduler.enable_schedule(source_key)
+                    if desired_enabled
+                    else await scheduler.disable_schedule(source_key)
+                )
+                if getattr(adapter_result, "status", None) != "success":
+                    raise RuntimeError(
+                        getattr(adapter_result, "error", None)
+                        or "external scheduler rejected the set-to-state operation"
+                    )
+
+                observed = await scheduler.get_schedule(source_key)
+                if observed is None:
+                    raise RuntimeError("external control result schedule is missing")
+                observed_projection = normalize_external_schedule(
+                    observed.model_dump(mode="json"),
+                    owner=scheduler_name,
+                )
+            elif prior_is_landed_result:
+                # A prior attempt may have landed in the native scheduler and
+                # crashed before publishing its reserved projection.  The
+                # reservation binds this exact operation/sequence; observe and
+                # publish the already-landed set-to-state result without
+                # invoking the native side effect a second time.
+                observed_projection = prior_projection
+            else:
+                raise RuntimeError("external control prior source projection is stale")
+            observed_at = datetime.now(UTC)
+            if not external_control_result_matches_desired(
+                desired_projection,
+                observed_projection,
+            ):
+                raise RuntimeError(
+                    "external control result differs from the allowed desired projection"
+                )
+
+            def _build_payload(
+                sequence: int,
+                reserved_adapter_instance_id: str,
+            ) -> bytes:
+                body = external_projection_body(
+                    stream_id=authority.stream_id,
+                    epoch_uuid=authority.epoch_uuid,
+                    epoch_number=authority.epoch_number,
+                    sequence=sequence,
+                    kind="control",
+                    owner=authority.owner,
+                    source_scope=authority.source_scope,
+                    adapter_instance_id=reserved_adapter_instance_id,
+                    schedules=[observed_projection],
+                    deleted_source_keys=[],
+                    complete=False,
+                    stable_source=True,
+                    operation_id=operation_id,
+                )
+                frame = EventBatchFrame(
+                    id=f"ev_{_secrets.token_hex(16)}",
+                    ts=observed_at,
+                    payload=EventBatchPayload(
+                        events=[
+                            {
+                                "id": str(uuid4()),
+                                "kind": "schedule.updated",
+                                "engine": scheduler_name,
+                                "task_id": "",
+                                "occurred_at": observed_at.isoformat(),
+                                "data": {
+                                    "external_projection": body,
+                                    "payload_digest": (external_projection_digest(body)),
+                                    "reason": "external-control",
+                                },
+                            },
+                        ],
+                    ),
+                )
+                return serialize_frame(frame)
+
+            _, sequence, _, replayed = buffer.append_reserved_external_schedule_control(
+                operation_id=operation_id,
+                owner=authority.owner,
+                source_scope=authority.source_scope,
+                stream_id=authority.stream_id,
+                epoch_uuid=authority.epoch_uuid,
+                epoch_number=authority.epoch_number,
+                adapter_instance_id=authority.adapter_instance_id,
+                expected_sequence=expected_sequence,
+                desired_projection_digest=desired_projection_digest,
+                build_payload=_build_payload,
+            )
+            return {
+                "operation_id": operation_id,
+                "sequence": sequence,
+                "projection_buffered": True,
+                "deduplicated": replayed,
+            }
+
     def _scheduler_sink(
         self,
         scheduler_name: str,
         action: str,
         schedule: object,
     ) -> None:
-        """Sink passed to scheduler adapters' ``connect_signals``.
+        """Turn a native signal into a fresh, sequenced source observation.
 
-        Schedulers call this (via a per-scheduler closure that binds
-        ``scheduler_name``) from inside their native lifecycle hooks
-        - Django signals for celery-beat, APScheduler listeners for
-        apscheduler, etc. We translate the ``(action, schedule)`` pair
-        into a generic ``Event`` shape stamped with the *actual*
-        scheduler's name and put it on the outbound buffer via
-        :meth:`record_event`. Wrapped in :func:`safe_call` so a
-        malformed schedule cannot crash the host process's signal
-        handler.
-
-        ``scheduler_name`` is required (no default): the previous
-        Phase-1 implementation hardcoded ``"celery-beat"`` here, which
-        would have mislabelled every APScheduler/rq-scheduler event
-        once those adapters land. See docs/BARE_AUDIT_2026Q2.md F2.
+        The signal's schedule object is deliberately not serialized later and
+        assigned a new sequence: that would re-stamp an old observation.
+        Instead it only prompts a new complete ``list_schedules`` observation
+        on the runtime loop.  Bursts coalesce per adapter.
         """
-        from uuid import uuid4
+        del schedule
+        if action not in {"created", "updated", "deleted"}:
+            return
+        scheduler = self.schedulers.get(scheduler_name)
+        loop = self._loop
+        if scheduler is None or loop is None or not loop.is_running():
+            return
 
-        from z4j_core.models import Event, EventKind  # local import to avoid cycles
-
-        def _build_and_record() -> None:
-            kind_map = {
-                "created": EventKind.SCHEDULE_CREATED,
-                "updated": EventKind.SCHEDULE_UPDATED,
-                "deleted": EventKind.SCHEDULE_DELETED,
-            }
-            kind = kind_map.get(action)
-            if kind is None:
+        def _schedule_fresh_observation() -> None:
+            pending = getattr(self, "_snapshot_signal_pending", None)
+            if pending is None:
+                pending = set()
+                self._snapshot_signal_pending = pending
+            dirty = getattr(self, "_snapshot_signal_dirty", None)
+            if dirty is None:
+                dirty = set()
+                self._snapshot_signal_dirty = dirty
+            if scheduler_name in pending:
+                # A signal that arrives while list_schedules() is in flight
+                # represents a potentially newer source state.  Coalesce the
+                # burst, but force one more fresh read after the current one.
+                dirty.add(scheduler_name)
                 return
-            schedule_dict: dict[str, object] = {}
-            dump = getattr(schedule, "model_dump", None)
-            if callable(dump):
-                try:
-                    schedule_dict = dump(mode="json")
-                except Exception:
-                    schedule_dict = {}
-            placeholder = uuid4()
-            event = Event(
-                id=uuid4(),
-                project_id=placeholder,
-                agent_id=placeholder,
-                engine=scheduler_name,
-                task_id="",
-                kind=kind,
-                occurred_at=datetime.now(UTC),
-                data={"schedule": schedule_dict},
-            )
-            self.record_event(event)
+            pending.add(scheduler_name)
 
-        safe_call(_build_and_record)
+            async def _run() -> None:
+                try:
+                    observation_reason = f"signal:{action}"
+                    while True:
+                        dirty.discard(scheduler_name)
+                        await self._emit_schedule_snapshot(
+                            scheduler,
+                            reason=observation_reason,
+                        )
+                        if scheduler_name not in dirty:
+                            break
+                        observation_reason = "signal:coalesced"
+                finally:
+                    pending.discard(scheduler_name)
+                    dirty.discard(scheduler_name)
+
+            task = asyncio.create_task(
+                _run(),
+                name=f"z4j-schedule-observation-{scheduler_name}",
+            )
+            tasks = getattr(self, "_schedule_observation_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._schedule_observation_tasks = tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+        loop.call_soon_threadsafe(_schedule_fresh_observation)
 
     async def _supervise(self) -> None:  # noqa: PLR0912, PLR0915  supervisor reconnect loop
         """Supervisor: connect → run tasks → on disconnect, reconnect.
@@ -1444,14 +2441,14 @@ class AgentRuntime:
         self._acks_seen_early.clear()
         # Restore the full send batch size on a fresh connection: a 413
         # that shrank it may have been a per-connection proxy limit that
-        # no longer applies (R6-F6). If the new brain still 413s, it
+        # no longer applies. If the new brain still 413s, it
         # shrinks again.
         self._send_batch_size = _SEND_BATCH_SIZE
         # Reset the retryable-outcome backoff too, so a backoff grown on a
         # dying session does not throttle the first sends of a fresh one.
         self._send_backoff = _SEND_BACKOFF_INITIAL
         # Fresh session -> the persistent-retryable reconnect counter starts
-        # over (R9).
+        # over.
         self._consecutive_retryable = 0
 
         async with asyncio.TaskGroup() as tg:
@@ -1476,7 +2473,7 @@ class AgentRuntime:
         The excess event_batch entries stay in the buffer (drain is a
         non-destructive SELECT), so they re-drain once acks free in-flight
         slots -- bounding the WS ``_pending_acks`` window at the cap without
-        starving control frames or losing any event (R8-M4).
+        starving control frames or losing any event.
         """
         if max_event_batch <= 0:
             # Not expected in the below-cap branch (remaining >= 1 there), but
@@ -1512,7 +2509,7 @@ class AgentRuntime:
             # the same un-acked event_batch entries re-drain every
             # iteration and re-send at line rate (they are only removed
             # on ack), flooding the brain and starving fresh entries
-            # behind a full in-flight window (R5-M2). The excluded set is
+            # behind a full in-flight window. The excluded set is
             # the buffer-entry ids currently in ``_pending_acks``.
             in_flight = {entry_id for entry_id, _sent_at in self._pending_acks.values()}
             # Backpressure: STRICTLY cap concurrent un-acked event_batch
@@ -1520,7 +2517,7 @@ class AgentRuntime:
             # (command acks/results confirm on send and never become
             # pending, so they must not be starved) but exclude
             # event_batch so ``_pending_acks`` never grows past the cap
-            # (R7-MED). Below the cap, drain everything.
+            # Below the cap, drain everything.
             if len(self._pending_acks) >= _MAX_IN_FLIGHT_BATCHES:
                 entries = buffer.drain(
                     self._send_batch_size,
@@ -1540,7 +2537,7 @@ class AgentRuntime:
                 # REMAINING in-flight slots on a defer-acks (WS) transport. The
                 # cap check above only fires once ALREADY at/over the cap, so a
                 # single drain of up to _SEND_BATCH_SIZE starting from e.g. 255
-                # pending could register 500 more and overshoot to 755 (R8-M4).
+                # pending could register 500 more and overshoot to 755.
                 # Control frames are never trimmed (they confirm on send and
                 # never become pending). Not applied to long-poll
                 # (confirm_on_send: _pending_acks stays 0, so an unconditional
@@ -1560,14 +2557,26 @@ class AgentRuntime:
                 # (unparseable / unsigned / oversize): DETERMINISTIC. The
                 # socket is healthy, so stay connected -- confirm/register the
                 # frames that DID ship and force-purge the undeliverable ones.
-                self._handle_undeliverable_drop(buffer, entries, exc)
+                retained_causal_frame = self._handle_undeliverable_drop(
+                    buffer,
+                    entries,
+                    exc,
+                )
+                if retained_causal_frame:
+                    # Do not spin on an impossible local send.  Reconnect so a
+                    # changed Brain-advertised frame cap can be negotiated,
+                    # while preserving the causal entry losslessly.
+                    raise ConnectionError(
+                        "external schedule projection is locally "
+                        "undeliverable; retained pending Brain acknowledgement",
+                    ) from exc
                 continue
             except (PartialSendError, ConnectionError):
                 # TRANSPORT failure (socket dropped mid-batch, connection
                 # error, retryable HTTP status like 3xx/5xx/429). The
                 # batch was not delivered. We do NOT confirm anything, and
                 # we do NOT increment any drop counter: a flaky connection
-                # is not the batch's fault (R6-F4/R7). Re-raise so the
+                # is not the batch's fault. Re-raise so the
                 # supervisor reconnects; the batch re-drains next session
                 # (the brain dedups any that did land).
                 raise
@@ -1580,7 +2589,7 @@ class AgentRuntime:
                 # partial store is ALWAYS a genuine transient that recovers
                 # within a few rounds. Re-send the whole batch after a
                 # MODEST capped backoff (never counts toward any drop
-                # budget, R7-HIGH2). Blocking here is harmless: during a
+                # budget). Blocking here is harmless: during a
                 # real transient outage nothing can be stored anyway, so no
                 # deliverable frame is being starved. The brain dedups
                 # already-stored frames on replay.
@@ -1605,11 +2614,11 @@ class AgentRuntime:
                 # Long-poll CONTENT problem: 413 (too large) or 400/415/422
                 # (malformed). Reduce/split a multi-frame batch so valid
                 # siblings still deliver; drop only a SINGLE frame that
-                # persistently fails, after a bounded budget (R7-MED). Use a
+                # persistently fails, after a bounded budget. Use a
                 # SMALL FIXED delay (not the growing transient backoff) so an
                 # isolated poison frame at the buffer HEAD is isolated and
                 # dropped within seconds and does not starve control frames
-                # queued behind it for minutes (R8: head-of-line fix).
+                # queued behind it for minutes (head-of-line fix).
                 self._handle_content_reject(buffer, entries, exc)
                 await asyncio.sleep(_CONTENT_REJECT_DELAY)
                 continue
@@ -1642,7 +2651,7 @@ class AgentRuntime:
             # ``event_batch_ack`` arrives. There is no "legacy pre-1.5
             # brain" fallback that confirms on socket-write: that path
             # deleted un-acked events whenever a modern brain merely
-            # withheld an ack for a transient DB skip (R7-HIGH1). On WS,
+            # withheld an ack for a transient DB skip. On WS,
             # an event_batch is confirmed ONLY by a real ack.
             defer_acks = not getattr(self._transport, "confirm_on_send", False)
             confirm_now = self._confirm_or_register(entries, accepted, defer_acks, now)
@@ -1663,7 +2672,7 @@ class AgentRuntime:
         For a ``defer_acks`` transport (WebSocket), a frame whose parsed WIRE
         type is ``event_batch`` goes into ``_pending_acks`` to await its
         ``event_batch_ack`` -- unless the ack ALREADY arrived during the send
-        await (recorded in ``_acks_seen_early``, R6-F7), in which case confirm
+        await (recorded in ``_acks_seen_early``), in which case confirm
         it now. Everything else (control frames, and every frame on a
         confirm-on-send transport) confirms immediately. The decision keys off
         the parsed wire type, NOT the buffer entry's ``kind`` metadata, so
@@ -1695,7 +2704,7 @@ class AgentRuntime:
                 # The ack for this frame already arrived while we were
                 # awaiting the send, before we could register it. Confirm
                 # now instead of registering it for a deadline that has
-                # already passed (R6-F7).
+                # already passed.
                 self._acks_seen_early.discard(frame_id)
                 confirm_now.append(entry.id)
             elif frame_id not in self._pending_acks:
@@ -1704,7 +2713,7 @@ class AgentRuntime:
                 # pending frame, but guard the overwrite anyway so a
                 # re-send can never slide the watchdog deadline (that was
                 # the mechanism by which the deadline was never reached,
-                # R5-M2).
+                # ).
                 self._pending_acks[frame_id] = (entry.id, now)
         return confirm_now
 
@@ -1713,7 +2722,7 @@ class AgentRuntime:
         buffer: BufferStore,
         entries: list,
         exc: UndeliverableFrameError,
-    ) -> None:
+    ) -> bool:
         """Purge frames the transport reported as locally undeliverable.
 
         The transport shipped ``exc.accepted`` and rejected ``exc.drop_indices``
@@ -1730,11 +2739,25 @@ class AgentRuntime:
         self._reset_send_backoff()
         defer_acks = not getattr(self._transport, "confirm_on_send", False)
         confirm_now = self._confirm_or_register(entries, exc.accepted, defer_acks, now)
-        purge = confirm_now + [entries[i].id for i in exc.drop_indices]
+        protected = [
+            entries[i] for i in exc.drop_indices if entries[i].kind == EXTERNAL_SCHEDULE_ENTRY_KIND
+        ]
+        purge = confirm_now + [
+            entries[i].id
+            for i in exc.drop_indices
+            if entries[i].kind != EXTERNAL_SCHEDULE_ENTRY_KIND
+        ]
         if purge:
             buffer.confirm(purge)
+        if protected:
+            logger.critical(
+                "retaining %d locally-undeliverable external schedule "
+                "projection frame(s); causal entries require a Brain ack",
+                len(protected),
+            )
         if self._heartbeat is not None and exc.accepted:
             self._heartbeat.record_flush(now)
+        return bool(protected)
 
     async def _backoff_retry(self) -> None:
         """Sleep the current TRANSIENT-retry backoff, then grow it.
@@ -1742,11 +2765,11 @@ class AgentRuntime:
         Called ONLY on a long-poll transient partial store
         (``UploadRetryableError``). The delay doubles per consecutive
         failure up to ``_SEND_BACKOFF_MAX`` (5s) so a struggling brain is
-        not hammered while it recovers (R7-HIGH2); a successful send
+        not hammered while it recovers; a successful send
         resets it via :meth:`_reset_send_backoff`. The CONTENT-reject path
         does NOT use this -- it uses a small fixed ``_CONTENT_REJECT_DELAY``
         so an isolated poison frame is dropped fast instead of starving
-        frames behind it (R8).
+        frames behind it.
         """
         await asyncio.sleep(self._send_backoff)
         self._send_backoff = min(self._send_backoff * 2, _SEND_BACKOFF_MAX)
@@ -1756,7 +2779,7 @@ class AgentRuntime:
         successful send.
 
         The backoff and the ``_consecutive_retryable`` reconnect counter are
-        reset (a successful send is confirmed forward progress, R9). The
+        reset (a successful send is confirmed forward progress). The
         adaptive ``_send_batch_size`` is deliberately left where a 413 shrank
         it (it is restored to the full ``_SEND_BATCH_SIZE`` on reconnect):
         growing it back mid connection would oscillate straight into the same
@@ -1780,7 +2803,7 @@ class AgentRuntime:
           but we don't know which. Halve ``_send_batch_size`` (floor
           ``_MIN_SEND_BATCH``) so the next drain pulls a smaller batch;
           repeated rejections bisect down to the single offending frame,
-          while valid siblings keep delivering (R7-MED). Nothing is
+          while valid siblings keep delivering. Nothing is
           dropped here.
         * **Single-frame batch** -- the culprit is isolated. An
           ``event_batch`` frame gets its attempt counter bumped and is
@@ -1790,10 +2813,10 @@ class AgentRuntime:
           would pin the queue forever, so it is dropped immediately with
           a warning -- losing it merely times the command out server
           side, which is recoverable, whereas pinning the queue loses
-          everything behind it (R7-MED).
+          everything behind it.
 
         Once the isolated offender is actually DROPPED, ``_send_batch_size``
-        is restored to the full ``_SEND_BATCH_SIZE`` (R8): the shrink only
+        is restored to the full ``_SEND_BATCH_SIZE``: the shrink only
         existed to isolate that frame, so the remaining (valid) buffer must
         ship at full width again rather than dribble one frame per POST for
         the rest of the connection.
@@ -1812,10 +2835,13 @@ class AgentRuntime:
             return
 
         # Single frame: the culprit is isolated. Bump the DEDICATED
-        # content-reject budget (not the shared ``attempts`` metric, R8-H1)
+        # content-reject budget (not the shared ``attempts`` metric)
         # and drop only once THAT budget is exhausted.
         entry = entries[0]
-        if entry.kind == "event_batch":
+        if entry.kind in {
+            "event_batch",
+            EXTERNAL_SCHEDULE_ENTRY_KIND,
+        }:
             buffer.increment_content_rejects([entry.id])
             dropped = buffer.evict_if_exhausted([entry.id], _MAX_SEND_ATTEMPTS)
             if dropped:
@@ -1827,8 +2853,14 @@ class AgentRuntime:
                     type(exc).__name__,
                 )
                 # Offender gone -- restore full width so the rest of the
-                # buffer stops dribbling one frame per POST (R8).
+                # buffer stops dribbling one frame per POST.
                 self._send_batch_size = _SEND_BATCH_SIZE
+            elif entry.kind == EXTERNAL_SCHEDULE_ENTRY_KIND:
+                logger.critical(
+                    "retaining content-rejected external schedule projection "
+                    "entry %d; causal entries require a Brain ack",
+                    entry.id,
+                )
             return
 
         # An isolated CONTROL frame cannot be split or re-batched and
@@ -1841,7 +2873,7 @@ class AgentRuntime:
             type(exc).__name__,
         )
         buffer.confirm([entry.id])
-        # Offender gone -- restore full width (R8).
+        # Offender gone -- restore full width.
         self._send_batch_size = _SEND_BATCH_SIZE
 
     async def _run_receive_loop(self) -> None:
@@ -1918,7 +2950,7 @@ class AgentRuntime:
             # the attempt-count quarantine (which dropped a deliverable
             # batch after ~15 min of a socket/DB outage or a persistent
             # transient rejection). Retry is unbounded in count and
-            # bounded only by the buffer size (R7-HIGH1).
+            # bounded only by the buffer size.
             for k in stale_keys:
                 self._pending_acks.pop(k, None)
             # increment_attempts is kept for the operator-visible
@@ -1968,7 +3000,7 @@ class AgentRuntime:
             # that produced this frame and had not yet registered it in
             # ``_pending_acks``. Record it so the send loop confirms it at
             # registration time instead of leaving it to the 90s watchdog
-            # (R6-F7). Bounded: in normal operation this set is ~empty.
+            # Bounded: in normal operation this set is ~empty.
             if len(self._acks_seen_early) < _MAX_IN_FLIGHT_BATCHES * 4:
                 self._acks_seen_early.add(acked_id)
             return
@@ -1999,11 +3031,7 @@ class AgentRuntime:
         version may add WebSocket-then-fallback negotiation; that
         would land here.
         """
-        capabilities: dict[str, list[str]] = {}
-        for name, engine in self.engines.items():
-            capabilities[name] = sorted(engine.capabilities())
-        for name, scheduler in self.schedulers.items():
-            capabilities[name] = sorted(scheduler.capabilities())
+        capabilities = _advertised_capabilities(self.engines, self.schedulers)
 
         if self.config.transport == "longpoll":
             # Long-poll has no handshake frame, so the agent has to

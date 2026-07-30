@@ -1,12 +1,11 @@
 """Runtime-level regression tests for the round-6 delivery fixes.
 
 Covers the send-loop behaviors that the buffer / transport unit tests
-cannot: transport-failure attempts (R6-F4), the 413 batch-size reaction
-(R6-F6), and the ack-arrives-before-registration race (R6-F7). Each
+cannot: transport-failure attempts, the 413 batch-size reaction
+and the ack-arrives-before-registration race. Each
 drives the real ``AgentRuntime._run_send_loop`` (and, where needed, the
 supervisor) with a scripted fake transport, on this event loop, no real
-socket.
-"""
+socket."""
 
 from __future__ import annotations
 
@@ -104,8 +103,8 @@ async def _run_send_loop_briefly(rt: AgentRuntime, seconds: float = 0.4) -> None
 def _neutralize_send_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     """Collapse the long-poll retry delays to a pure event-loop yield.
 
-    The transient path (R7-HIGH2) backs off by a real (0.5s-doubling)
-    sleep and the content-reject path (R8) uses a fixed
+    The transient path backs off by a real (0.5s-doubling)
+    sleep and the content-reject path uses a fixed
     ``_CONTENT_REJECT_DELAY``, both so a poison frame does not hot-loop
     the brain. That is correct in production but would blow these
     sub-second outcome tests' time budget, so the tests pin BOTH to 0
@@ -118,7 +117,7 @@ def _neutralize_send_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# R6-F4: a transport failure must NOT increment the quarantine counter.
+# A transport failure must NOT increment the quarantine counter.
 # ---------------------------------------------------------------------------
 
 
@@ -173,7 +172,7 @@ async def test_partial_send_failure_does_not_count(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# R6-F4 (positive): a long-poll content rejection DOES count + quarantines.
+# (Positive): a long-poll content rejection DOES count + quarantines.
 # ---------------------------------------------------------------------------
 
 
@@ -209,7 +208,7 @@ async def test_content_rejection_isolates_before_dropping(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R7-MED: a content reject on a MULTI-frame batch reduces the send
+    """A content reject on a MULTI-frame batch reduces the send
     batch size to isolate the offender; it must NOT drop valid siblings.
 
     Here every POST that carries more than one frame is content-rejected,
@@ -243,7 +242,7 @@ async def test_content_rejection_isolates_before_dropping(
 
 
 # ---------------------------------------------------------------------------
-# R6-F6: a 413 reduces the send batch size; a single-frame 413 drops it.
+# A 413 reduces the send batch size; a single-frame 413 drops it.
 # ---------------------------------------------------------------------------
 
 
@@ -287,7 +286,7 @@ async def test_413_single_frame_dropped_only_after_bounded_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R6-panel-MED: a single-frame 413 is NOT deleted on the first
+    """Panel-MED: a single-frame 413 is NOT deleted on the first
     failure; it goes through the bounded content-reject quarantine, so a
     transient 413 cannot instantly lose a deliverable frame."""
     monkeypatch.setattr(runtime_mod, "_MAX_SEND_ATTEMPTS", 3)
@@ -319,7 +318,7 @@ async def test_413_single_frame_survives_a_transient_413(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R6-panel-MED: a 413 that clears on retry (transient proxy/WAF)
+    """Panel-MED: a 413 that clears on retry (transient proxy/WAF)
     does not lose the frame -- it delivers once the 413 stops."""
     _neutralize_send_backoff(monkeypatch)
 
@@ -349,7 +348,7 @@ async def test_413_single_frame_survives_a_transient_413(
 
 
 # ---------------------------------------------------------------------------
-# R7-MED: an isolated CONTROL frame that content-rejects is dropped on the
+# An isolated CONTROL frame that content-rejects is dropped on the
 # FIRST rejection (it can't be split or re-batched, so keeping it would pin
 # every data frame behind it forever), whereas an event_batch is dropped
 # only after the bounded attempt budget.
@@ -388,7 +387,7 @@ async def test_control_frame_content_reject_dropped_immediately(
 
 
 # ---------------------------------------------------------------------------
-# R9: a PERSISTENT long-poll partial store (zero confirmed progress) forces
+# A PERSISTENT long-poll partial store (zero confirmed progress) forces
 # a reconnect after _MAX_CONSECUTIVE_RETRYABLE tries, so a send-side session/
 # version skew is not re-POSTed forever (only the receive loop reconnects on
 # its own error). Loss-free: the buffer is preserved across the reconnect.
@@ -432,7 +431,7 @@ async def test_partial_stores_interleaved_with_success_never_reconnect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R9-4: the reconnect fires only on CONSECUTIVE zero-progress partial
+    """4: the reconnect fires only on CONSECUTIVE zero-progress partial
     stores. A successful send resets ``_consecutive_retryable``, so a flaky-
     but-working brain (partials interleaved with successes) must NOT force a
     spurious reconnect even across many CUMULATIVE partials.
@@ -469,7 +468,7 @@ async def test_partial_stores_interleaved_with_success_never_reconnect(
 
 
 # ---------------------------------------------------------------------------
-# R8: a content reject isolates ONE poison event_batch by batch-size
+# A content reject isolates ONE poison event_batch by batch-size
 # reduction, drops it after the bounded budget, RESTORES the full batch
 # size (so the rest stops dribbling one frame per POST), and delivers every
 # valid sibling behind it.
@@ -510,14 +509,14 @@ async def test_content_reject_isolates_drops_restores_and_delivers_rest(
     # Poison dropped after the bounded budget; every valid sibling
     # delivered (buffer fully drains); and the batch size was RESTORED to
     # full once the poison was gone (not left collapsed at 1 for the
-    # connection lifetime, R8).
+    # connection lifetime).
     assert buffer.size() == 0
     assert rt._send_batch_size == runtime_mod._SEND_BATCH_SIZE
     buffer.close()
 
 
 # ---------------------------------------------------------------------------
-# R6-F7: an ack that arrives before the send loop registers the pending
+# An ack that arrives before the send loop registers the pending
 # entry is not lost; the entry is confirmed at registration time.
 # ---------------------------------------------------------------------------
 
@@ -551,7 +550,7 @@ async def test_early_ack_confirms_at_registration(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# R8-M4: the WS in-flight cap must trim event_batch draining to the REMAINING
+# The WS in-flight cap must trim event_batch draining to the REMAINING
 # slots (not just switch to control-only once ALREADY over), so _pending_acks
 # cannot overshoot _MAX_IN_FLIGHT_BATCHES; control frames always pass through.
 # ---------------------------------------------------------------------------

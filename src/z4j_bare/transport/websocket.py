@@ -22,10 +22,13 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 from z4j_core.errors import (
     AuthenticationError,
     InvalidFrameError,
+    ProtocolError,
     SignatureError,
     Z4JError,
 )
+from z4j_core.schedule_external import EXTERNAL_SCHEDULE_RUNTIME_FEATURE
 from z4j_core.transport.frames import (
+    ErrorFrame,
     Frame,
     HelloAckFrame,
     HelloFrame,
@@ -41,6 +44,52 @@ from z4j_core.version import (
 )
 
 logger = logging.getLogger("z4j.transport.websocket")
+
+#: Brain close codes that reconnecting can never fix, mapped to the message
+#: surfaced to the operator.
+#:
+#: Anything absent from this map is treated as a transient connection failure
+#: and retried on the normal backoff. That default is right for network blips
+#: and wrong for "this agent build is not acceptable": the agent would reconnect
+#: forever against a brain that will refuse it every time.
+#:
+#: 4427 is listed BEFORE the brain sends it, on purpose. A brain that began
+#: enforcing version skew today would reject exactly the agents too old to have
+#: this table, and they would storm it. The client side ships first; enforcement
+#: follows once these agents are the deployed floor.
+_TERMINAL_CLOSE_CODES: dict[int, str] = {
+    4426: "brain does not support this agent's wire protocol version",
+    4427: (
+        "agent version is outside the range this brain supports; upgrade the "
+        "agent to within one minor of the brain"
+    ),
+}
+
+
+def _ws_close_code(exc: Exception) -> int | None:
+    """Best-effort WebSocket close code from a ConnectionClosed exception.
+
+    ``websockets`` exposes the received Close frame on ``.rcvd``; older
+    versions carried ``.code`` directly. Returns None when neither is
+    available.
+    """
+    rcvd = getattr(exc, "rcvd", None)
+    code = getattr(rcvd, "code", None)
+    if isinstance(code, int):
+        return code
+    direct = getattr(exc, "code", None)
+    return direct if isinstance(direct, int) else None
+
+
+#: RH1: runtime feature flags this z4j-bare build advertises in its handshake
+#: (``HelloPayload.runtime_features``). Retry authority never uses these;
+#: Boundary D combines the external protocol marker from this exact Hello with
+#: the scheduler adapter's stable-snapshot capability and immutable WebSocket
+#: generation before assigning a stream epoch.
+AGENT_RUNTIME_FEATURES: tuple[str, ...] = (
+    "retry_by_reference",
+    EXTERNAL_SCHEDULE_RUNTIME_FEATURE,
+)
 
 
 class WebSocketTransport:
@@ -321,6 +370,9 @@ class WebSocketTransport:
                 worker_role=self.worker_role,
                 worker_pid=self.worker_pid,
                 worker_started_at=self.worker_started_at,
+                # RH1: advertise the runtime's safe-operation feature flags so
+                # the brain can fail closed on version-skewed operations.
+                runtime_features=list(AGENT_RUNTIME_FEATURES),
             ),
         )
 
@@ -338,6 +390,37 @@ class WebSocketTransport:
             raise ConnectionError("timed out waiting for hello_ack") from exc
         except WebSocketException as exc:
             await self._close_ws()
+            # B23: the brain accepts the HTTP upgrade, then closes with
+            # 4401 (bad/revoked token) or 4403 (forbidden) when it
+            # validates the bearer. That surfaces here as a ConnectionClosed
+            # -- an AUTH failure, not a transient network blip. Classifying
+            # it as AuthenticationError lets the runtime apply the
+            # auth-backoff schedule (and log the real reason) instead of
+            # hammering reconnects on a token that will never work.
+            code = _ws_close_code(exc)
+            if code in (4401, 4403):
+                raise AuthenticationError(
+                    "brain rejected agent token",
+                    details={"close_code": code},
+                ) from exc
+            if code in _TERMINAL_CLOSE_CODES:
+                # Reconnecting cannot fix these: the brain has judged this
+                # agent build unusable, so surface a ProtocolError, which the
+                # runtime backs off separately from transient connection
+                # failures instead of retrying on the normal schedule.
+                #
+                # Handled here BEFORE the brain ever sends them. A brain that
+                # started closing on version skew today would be rejecting
+                # precisely the old agents that lack this branch, and those
+                # agents would read the close as a transient blip and
+                # reconnect-storm. Shipping the client side first is what makes
+                # enforcement safe in a later release. Celery did the same for
+                # the v1 -> v2 task protocol: 3.1.25 taught the old side to
+                # cope, and only then did the new side change.
+                raise ProtocolError(
+                    _TERMINAL_CLOSE_CODES[code],
+                    details={"close_code": code},
+                ) from exc
             raise ConnectionError(f"failed to receive hello_ack: {exc}") from exc
 
         ack = parse_frame(raw)
@@ -624,6 +707,11 @@ class WebSocketTransport:
                     raise InvalidFrameError(
                         f"could not parse inbound frame: {exc}",
                     ) from exc
+                if isinstance(frame, ErrorFrame) and frame.payload.fatal:
+                    await self._close_ws()
+                    raise ProtocolError(
+                        f"{frame.payload.code}: {frame.payload.message}",
+                    )
                 try:
                     await on_frame(frame)
                 except Z4JError:

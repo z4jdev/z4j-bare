@@ -134,3 +134,44 @@ class TestRequiredFieldsFailFast:
         assert "Z4J_BRAIN_URL" in msg
         assert "Z4J_TOKEN" in msg
         assert "Z4J_PROJECT_ID" in msg
+
+
+class TestAutostartFailureClearsSingletonR7P26:
+    """install_agent(autostart=True) registers the runtime in the
+    process singleton BEFORE start(). If start() then raises, the poisoned
+    never-started runtime must be UNREGISTERED so a later install_agent can
+    register + start a fresh one -- otherwise every subsequent install short-
+    circuits through try_register's loser path and returns the dead runtime."""
+
+    def test_start_failure_unregisters_the_poisoned_runtime(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        _fake_engine: object,
+    ) -> None:
+        import secrets
+
+        from z4j_bare import _process_singleton
+        from z4j_bare.runtime import AgentRuntime
+
+        def _boom(self: object) -> None:
+            raise RuntimeError("start blew up (transient buffer-init error)")
+
+        monkeypatch.setattr(AgentRuntime, "start", _boom)
+
+        with pytest.raises(RuntimeError, match="start blew up"):
+            install_agent(
+                engines=[_fake_engine],
+                brain_url="http://u:7700",
+                token="test-token-12345678901234567890",
+                project_id="p",
+                hmac_secret=secrets.token_hex(32),
+                autostart=True,
+                dev_mode=True,
+                buffer_path=tmp_path / "buf.sqlite",  # type: ignore[operator]
+            )
+
+        # The singleton is empty again: a fresh registration WINS (returns its
+        # own object) instead of losing to the poisoned runtime.
+        sentinel = object()
+        assert _process_singleton.try_register(sentinel, owner="probe") is sentinel

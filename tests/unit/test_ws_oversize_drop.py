@@ -30,15 +30,18 @@ from z4j_bare.transport.websocket import (
     UndeliverableFrameError,
     WebSocketTransport,
 )
+from z4j_core.errors import ProtocolError
 from z4j_core.models import Config
 from z4j_core.transport.frames import (
+    ErrorFrame,
+    ErrorPayload,
     EventBatchFrame,
     EventBatchPayload,
     HeartbeatFrame,
     HeartbeatPayload,
     serialize_frame,
 )
-from z4j_core.transport.framing import FrameSigner
+from z4j_core.transport.framing import FrameSigner, FrameVerifier
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,6 +59,24 @@ class _RecordingWs:
 
     async def send(self, data: bytes) -> None:
         self.sent.append(data)
+
+
+class _InboundWs:
+    def __init__(self, frames: list[bytes]) -> None:
+        self._frames = iter(frames)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return next(self._frames)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def _make_transport() -> WebSocketTransport:
@@ -125,6 +146,55 @@ async def test_oversize_frame_raises_and_is_not_sent() -> None:
     assert exc_info.value.accepted == []
     # ... and it was never actually put on the wire.
     assert ws.sent == []
+
+
+async def test_fatal_upgrade_error_closes_websocket_and_raises_protocol_error() -> None:
+    secret = secrets.token_bytes(32)
+    agent_id = "22222222-2222-2222-2222-222222222222"
+    project_id = "11111111-1111-1111-1111-111111111111"
+    session_id = "33333333-3333-3333-3333-333333333333"
+    signer = FrameSigner(
+        secret=secret,
+        agent_id=agent_id,
+        project_id=project_id,
+        session_id=session_id,
+    )
+    error = signer.sign_and_serialize(
+        ErrorFrame(
+            id="err_upgrade",
+            payload=ErrorPayload(
+                code="scheduler_upgrade_required",
+                message="upgrade the scheduler adapter",
+                fatal=True,
+            ),
+        ),
+    )
+    ws = _InboundWs([error])
+    transport = WebSocketTransport(
+        brain_url="http://brain.local",
+        token="tok",
+        project_id=project_id,
+        framework_name="celery",
+        engines=["celery"],
+        schedulers=[],
+        capabilities={},
+        hmac_secret=secret,
+    )
+    transport._ws = ws  # type: ignore[assignment]
+    transport._verifier = FrameVerifier(
+        secret=secret,
+        agent_id=agent_id,
+        project_id=project_id,
+        session_id=session_id,
+        direction="brain->agent",
+    )
+
+    async def _unused(_frame) -> None:
+        raise AssertionError("fatal errors must not reach the dispatcher")
+
+    with pytest.raises(ProtocolError, match="scheduler_upgrade_required"):
+        await transport.receive_frames(_unused)
+    assert ws.closed is True
 
 
 async def test_unparseable_frame_raises_for_purge_not_accepted() -> None:

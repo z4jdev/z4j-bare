@@ -78,6 +78,24 @@ class TestBasicRegistration:
         _process_singleton.clear_runtime()
         assert _process_singleton.current_runtime() is None
 
+    def test_compare_and_clear_r9_m8(self) -> None:
+        # clear_runtime(expected=X) is a COMPARE-AND-CLEAR -- it must NOT
+        # clear a DIFFERENT runtime B that replaced A, so a failing installer A
+        # can never erase B's registration.
+        _process_singleton.clear_runtime()
+        a = MagicMock(name="A")
+        b = MagicMock(name="B")
+        _process_singleton.try_register(a, owner="A")
+        # B is now the live registration (A was superseded / cleared + re-reg).
+        _process_singleton.clear_runtime()
+        _process_singleton.try_register(b, owner="B")
+        # A's failed-install cleanup passes expected=A -> must NOT clear B.
+        assert _process_singleton.clear_runtime(expected=a) is False
+        assert _process_singleton.current_runtime() is b
+        # Clearing with the correct owner works.
+        assert _process_singleton.clear_runtime(expected=b) is True
+        assert _process_singleton.current_runtime() is None
+
 
 class TestThreadSafety:
     """Stress test the lock around concurrent registrations.

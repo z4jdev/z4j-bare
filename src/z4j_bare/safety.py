@@ -1,8 +1,7 @@
 """Exception-safety wrappers.
 
 The single most important invariant in z4j: **the agent must never
-break the host application.** See ``docs/CLAUDE.md §2.2`` and
-``docs/SECURITY.md``.
+break the host application.** See ``docs/SECURITY.md``.
 
 Every public entry point of the agent runtime that can be called from
 an engine signal/middleware/hook (Celery signals, RQ Job hooks,

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.8.0 (2026-07-23)
+
+* Retry authority is now derived from each loaded adapter and advertised on the exact WebSocket generation or long-poll request; an old adapter paired with a current runtime fails closed.
+* Agent events buffered during an outage are now recovered on restart (orphaned per-PID buffers are adopted) instead of silently lost; adoption is gated by a process-lifetime flock ownership lock so a live sibling's buffer is never drained or unlinked.
+* Buffer ownership is now a fresh-sink possession capability bound to one process generation. Same-deployment `SEALED_READY` sources and recognized pre-1.8 per-process buffers recover automatically; only PID-validated per-process filenames are swept, explicit shared paths and all uncertain sources are preserved, and bounded scans never evict live events.
+* POSIX buffer directories should be owner-controlled and not group/world writable. Where that invariant cannot be proven (including WSL DrvFS), buffering remains operational in a logged owner-private temporary root and recovery of the requested directory is disabled. Rollback with undelivered 1.8 buffers requires the documented quiesce-and-recovery procedure.
+* Fork-safety: a `post_fork` hook revives the agent under gunicorn / uWSGI `--preload`, forked children get their own buffer, and offload pools reset in the child.
+* Hardened the predictable `/tmp` buffer fallback and applied the low-tier sweep fixes (B18/B21/B23/B25/B27).
+* Part of the coordinated 1.8.0 fleet release (unified fleet version, green lint/format/import-boundary gate).
+
 ## 1.7.0 (2026-07-11)
 
 * Orchestrator-detection preflight is now hermetic under test (a `probe_filesystem` switch skips the real filesystem probes), with the filesystem-marker cascade extracted into a helper.
