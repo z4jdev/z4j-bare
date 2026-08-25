@@ -57,17 +57,16 @@ def install_agent(
     2. ``Z4J_*`` environment variables
     3. Defaults from the :class:`Config` model
 
-    The three arguments marked "required" must be supplied by exactly
-    one of these sources - otherwise :class:`ConfigError` is raised.
+    The arguments marked "required" must be supplied by at least one
+    applicable source. When more than one source provides a value, the
+    precedence above decides which value wins.
 
     Required:
-        engines: At least one :class:`QueueEngineAdapter` instance
-                 from any installed engine package - e.g.
-                 :class:`z4j_celery.CeleryEngineAdapter`,
-                 :class:`z4j_rq.RqEngineAdapter`,
-                 :class:`z4j_dramatiq.DramatiqEngineAdapter`. The
-                 runtime supports multiple engines installed
-                 simultaneously.
+        engines / schedulers: At least one adapter across the two lists.
+                 Queue-only, scheduler-only, and combined processes are all
+                 supported. Queue adapters include, for example,
+                 :class:`z4j_celery.CeleryEngineAdapter` and
+                 :class:`z4j_rq.RqEngineAdapter`.
         brain_url (or ``Z4J_BRAIN_URL``): Base URL of the brain.
         token (or ``Z4J_TOKEN``): Agent bearer token.
         project_id (or ``Z4J_PROJECT_ID``): Project slug.
@@ -92,8 +91,8 @@ def install_agent(
     # silently-relocated state directory.
     reject_deprecated_path_env()
 
-    if not engines:
-        raise ConfigError("install_agent: at least one engine adapter is required")
+    if not engines and not schedulers:
+        raise ConfigError("install_agent: at least one engine or scheduler adapter is required")
 
     from z4j_core.config import resolve_agent_config
 

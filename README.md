@@ -1,8 +1,8 @@
 # z4j-bare
 
-[![PyPI version](https://img.shields.io/pypi/v/z4j-bare.svg?v=1.8.0)](https://pypi.org/project/z4j-bare/)
-[![Python](https://img.shields.io/pypi/pyversions/z4j-bare.svg?v=1.8.0)](https://pypi.org/project/z4j-bare/)
-[![License](https://img.shields.io/pypi/l/z4j-bare.svg?v=1.8.0)](https://github.com/z4jdev/z4j-bare/blob/main/LICENSE)
+[![PyPI version](https://img.shields.io/pypi/v/z4j-bare.svg)](https://pypi.org/project/z4j-bare/)
+[![Python](https://img.shields.io/pypi/pyversions/z4j-bare.svg)](https://pypi.org/project/z4j-bare/)
+[![License](https://img.shields.io/pypi/l/z4j-bare.svg)](https://github.com/z4jdev/z4j-bare/blob/main/LICENSE)
 
 The framework-free agent runtime for [z4j](https://z4j.com).
 
@@ -22,9 +22,10 @@ Full per-adapter matrix at <https://z4j.dev/reference/compatibility/>.
 
 - **Agent runtime**, connect, authenticate, supervise, reconnect
   with bounded backoff
-- **Outbound buffer**, every event written to a local SQLite ring
-  before going out on the wire; durable across short brain outages
-  and agent restarts
+- **Outbound buffer**, captured events are written to a bounded local SQLite
+  ring before going out on the wire and survive short brain outages and agent
+  restarts. At the configured count or byte limit, the oldest buffered rows
+  are evicted and the loss is logged.
 - **Engine signal hooks**, wired up by whichever engine adapter you
   install (z4j-celery, z4j-rq, etc.); the runtime drains them into
   the buffer
@@ -47,6 +48,8 @@ z4j-fastapi) which pulls z4j-bare automatically.
 ## Quick start (framework-free worker)
 
 ```python
+import os
+
 from z4j_bare import install_agent
 from z4j_celery import CeleryEngineAdapter
 
@@ -55,18 +58,21 @@ install_agent(
     brain_url="https://brain.example.com",
     token="z4j_agent_...",
     project_id="my-project",
+    hmac_secret=os.environ["Z4J_HMAC_SECRET"],
 )
 ```
 
 ## Reliability
 
-- No exception from the agent ever propagates back into your worker /
-  signal handler / request path. Every brain interaction is wrapped in
-  a top-level try/except.
-- Events buffer locally when z4j is unreachable. Workers never
-  block on network I/O.
-- Supervisor reconnects on every transient failure (network, TLS,
-  protocol mismatch) with bounded backoff.
+- Invalid or missing configuration and unsafe buffer initialization fail the
+  explicit `install_agent()` call; after successful startup, transport work
+  runs off the host application's request and task paths.
+- Engine adapters use bounded in-process event queues and the runtime uses a
+  bounded SQLite buffer. Queue overflow drops new events; buffer pressure
+  evicts the oldest rows. Both paths log the loss.
+- The supervisor retries transient network and TLS failures with bounded
+  backoff. Authentication, configuration, and protocol-version failures are
+  terminal so they do not create reconnect storms.
 
 ## Documentation
 

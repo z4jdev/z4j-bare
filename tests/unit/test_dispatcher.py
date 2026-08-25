@@ -359,6 +359,34 @@ class TestRetryTask:
         assert args == (1, 2)
         assert kwargs == {"k": "v"}
 
+    async def test_retry_converts_legacy_eta_seconds_to_absolute_timestamp(
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr("z4j_bare.dispatcher.time.time", lambda: 1_700_000_000.0)
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "delayed"},
+            parameters={"eta_seconds": 45},
+        )
+        await dispatcher.handle(cmd)
+        assert engine.retry_calls[0][3] == 1_700_000_045.0
+
+    async def test_retry_absolute_eta_wins_even_when_zero(
+        self,
+        dispatcher: CommandDispatcher,
+        engine: FakeEngine,
+    ) -> None:
+        cmd = _make_command(
+            action="retry_task",
+            target={"engine": "fake", "task_id": "absolute"},
+            parameters={"eta": 0, "eta_seconds": 45},
+        )
+        await dispatcher.handle(cmd)
+        assert engine.retry_calls[0][3] == 0.0
+
     async def test_retry_missing_task_id(
         self,
         dispatcher: CommandDispatcher,
@@ -716,6 +744,7 @@ class TestCancelAndOthers:
         dispatcher: CommandDispatcher,
         engine: FakeEngine,
         buf: BufferStore,
+        monkeypatch,
     ) -> None:
         # With explicit operator overrides the polyfill re-submits with THOSE
         # (the operator is the authority on the retry inputs).
@@ -724,7 +753,7 @@ class TestCancelAndOthers:
         engine.submit_calls: list[tuple] = []  # type: ignore[attr-defined]
 
         async def fake_submit(name, *, args=(), kwargs=None, queue=None, eta=None, priority=None):
-            engine.submit_calls.append((name, args, kwargs))  # type: ignore[attr-defined]
+            engine.submit_calls.append((name, args, kwargs, eta))  # type: ignore[attr-defined]
             return CommandResult(
                 status="success",
                 result={"task_id": "polyfill-id", "engine": "fake"},
@@ -732,6 +761,7 @@ class TestCancelAndOthers:
 
         engine.submit_task = fake_submit  # type: ignore[attr-defined]
 
+        monkeypatch.setattr("z4j_bare.dispatcher.time.time", lambda: 1_700_000_000.0)
         cmd = _make_command(
             action="retry_task",
             target={"engine": "fake", "task_id": "old-id"},
@@ -739,11 +769,12 @@ class TestCancelAndOthers:
                 "task_name": "myapp.flaky",
                 "override_args": [1, 2],
                 "override_kwargs": {"flag": True},
+                "eta_seconds": 30,
             },
         )
         await dispatcher.handle(cmd)
         assert engine.submit_calls == [  # type: ignore[attr-defined]
-            ("myapp.flaky", (1, 2), {"flag": True}),
+            ("myapp.flaky", (1, 2), {"flag": True}, 1_700_000_030.0),
         ]
         entries = buf.drain(10)
         result = next(e for e in entries if e.kind == "command_result")
@@ -1101,6 +1132,36 @@ class TestScheduleResync:
         assert parsed["payload"]["status"] == "failed"
         assert "RuntimeError" in parsed["payload"]["error"]
         assert "boom" in parsed["payload"]["error"]
+
+    async def test_adapter_timeout_is_serialized_as_failed_not_timeout(
+        self,
+        buf: BufferStore,
+        engine: FakeEngine,
+        scheduler: FakeScheduler,
+    ) -> None:
+        """Agent-side deadlines are execution failures on protocol v2.
+
+        Only the brain timeout worker may create command ``TIMEOUT`` after no
+        result arrives by its durable deadline.
+        """
+
+        async def time_out(reason: str) -> int:
+            raise TimeoutError(f"{reason} adapter deadline elapsed")
+
+        dispatcher = CommandDispatcher(
+            engines={"fake": engine},
+            schedulers={"celery-beat": scheduler},
+            buffer=buf,
+            resync_schedules=time_out,
+        )
+
+        await dispatcher.handle(_make_command(action="schedule.resync", target={}))
+
+        results = [entry for entry in buf.drain(10) if entry.kind == "command_result"]
+        assert len(results) == 1
+        parsed = _decode_frame(results[0].payload)
+        assert parsed["payload"]["status"] == "failed"
+        assert "TimeoutError" in parsed["payload"]["error"]
 
 
 class TestExternalScheduleActivationBoundaryD:

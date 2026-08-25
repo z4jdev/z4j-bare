@@ -243,12 +243,12 @@ def test_rollback_runbook_inventories_explicit_sources_and_requires_manifest() -
     runbook = (repository / "docs/operations/buffer-recovery.md").read_text(
         encoding="utf-8",
     )
-    rollback = runbook.split("## Preparing a rollback from 1.8", maxsplit=1)[1]
+    rollback = runbook.split("## Preparing a rollback to a pre-1.8 agent", maxsplit=1)[1]
 
     assert "explicitly configured shared path" in rollback
     assert "active, discovered, and advisory" in rollback
     assert "zero undelivered rows" in rollback
-    assert "FOREIGN or UNKNOWN" in rollback
+    assert "labelled `legacy-local`, `foreign`, or `unknown`" in rollback
     assert "outside the old scanner root" in rollback
     assert "rollback manifest" in rollback
     assert "device/inode" in rollback
@@ -493,6 +493,106 @@ def test_classification_copy_failure_closes_source_and_scratch_descriptors(
         assert leaked_targets == []
     finally:
         current.close()
+
+
+def _sqlite_source_carrying_control_bytes(path: Path) -> bytes:
+    """Build a real SQLite file whose payload holds 0x1A and bare newlines."""
+    blob = b"HEAD" + bytes([0x1A]) + b"\n" + b"TAIL" * 400
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute(
+            "CREATE TABLE payloads (id INTEGER PRIMARY KEY, body BLOB NOT NULL)",
+        )
+        conn.execute("INSERT INTO payloads(body) VALUES (?)", (blob,))
+    finally:
+        conn.close()
+    return blob
+
+
+def test_classification_snapshot_copies_a_binary_source_verbatim(tmp_path: Path) -> None:
+    """Attribution is decided from the snapshot, so it must be the exact source.
+
+    A buffer holding an event payload with 0x1A in it is ordinary: payloads are
+    opaque blobs. Windows' text-mode default would stop the copy at that byte
+    and re-expand every newline it did copy, and classification would then read
+    a database that never existed.
+    """
+    source = tmp_path / "source.sqlite"
+    blob = _sqlite_source_carrying_control_bytes(source)
+    assert bytes([0x1A]) in source.read_bytes()
+
+    expected = buffer_mod._source_component_signature(source)
+    assert expected is not None
+    destination = tmp_path / "snapshot.sqlite"
+    buffer_mod._copy_source_component(source, destination, expected)
+
+    assert destination.read_bytes() == source.read_bytes()
+    conn = sqlite3.connect(str(destination))
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert conn.execute("SELECT body FROM payloads").fetchone()[0] == blob
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_BINARY"),
+    reason="text-mode translation only exists on Windows",
+)
+def test_classification_snapshot_copy_depends_on_binary_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strip the flag and the copy above stops being verbatim, and is caught."""
+    source = tmp_path / "source.sqlite"
+    _sqlite_source_carrying_control_bytes(source)
+    expected = buffer_mod._source_component_signature(source)
+    assert expected is not None
+
+    monkeypatch.setattr(os, "O_BINARY", 0)
+    destination = tmp_path / "snapshot.sqlite"
+    with pytest.raises(buffer_mod.BufferMetadataUnreadableError, match="expected"):
+        buffer_mod._copy_source_component(source, destination, expected)
+    assert destination.read_bytes() != source.read_bytes()
+
+
+def test_classification_snapshot_rejects_a_silently_short_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Size the copy against its source, on every platform.
+
+    The identity checks around the copy all compare the source against itself,
+    so they still pass while the written file is short. Only a check that
+    observes the destination can refuse a truncated snapshot.
+    """
+    payload = b"HEAD" + bytes([0x1A]) + b"TAIL" * 100
+    source = tmp_path / "source.sqlite"
+    source.write_bytes(payload)
+    expected = buffer_mod._source_component_signature(source)
+    assert expected is not None
+
+    real_read = buffer_mod.os.read
+    served: list[int] = []
+
+    def truncating_read(fd: int, length: int) -> bytes:
+        served.append(length)
+        if len(served) > 1:
+            return b""
+        return real_read(fd, length)[:4]
+
+    destination = tmp_path / "snapshot.sqlite"
+    monkeypatch.setattr(buffer_mod.os, "read", truncating_read)
+    try:
+        with pytest.raises(
+            buffer_mod.BufferMetadataUnreadableError,
+            match=f"expected {len(payload)}",
+        ):
+            buffer_mod._copy_source_component(source, destination, expected)
+    finally:
+        monkeypatch.undo()
+    assert destination.read_bytes() == payload[:4]
 
 
 @pytest.mark.skipif(buffer_mod.fcntl is None, reason="POSIX recovery possession")

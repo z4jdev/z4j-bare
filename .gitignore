@@ -3,6 +3,14 @@ dist/
 build/
 *.egg-info/
 
+# ...except the compiled dashboard SPA, which is a SHIPPED artifact rather
+# than local build output. The packaged Dockerfile does `COPY . /build/z4j`
+# and pip-installs that tree, so excluding this directory publishes a brain
+# with a working API and no user interface. Both lines are required: git
+# cannot re-include a file whose parent directory is itself excluded.
+!backend/src/z4j_brain/dashboard/dist/
+!backend/src/z4j_brain/dashboard/dist/**
+
 # Python caches
 __pycache__/
 *.pyc
@@ -10,6 +18,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .hypothesis/
+.cache/
+.wrangler/
 
 # Virtualenvs
 .venv/

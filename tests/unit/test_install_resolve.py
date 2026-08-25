@@ -62,6 +62,48 @@ def _fake_engine() -> object:
     return _StubEngine()
 
 
+@pytest.fixture
+def _fake_scheduler() -> object:
+    """A scheduler adapter sufficient for a non-started runtime."""
+
+    class _StubScheduler:
+        name = "stub-scheduler"
+
+        def capabilities(self) -> set[str]:
+            return set()
+
+    return _StubScheduler()
+
+
+class TestAdapterPresence:
+    def test_scheduler_only_install_builds_runtime_and_registers_singleton(
+        self,
+        _fake_scheduler: object,
+    ) -> None:
+        from z4j_bare import _process_singleton
+
+        runtime = install_agent(
+            engines=[],
+            schedulers=[_fake_scheduler],  # type: ignore[list-item]
+            brain_url="http://brain.invalid:7700",
+            token="test-token",
+            project_id="test-project",
+            dev_mode=True,
+            autostart=False,
+        )
+
+        assert runtime.engines == {}
+        assert runtime.schedulers == {"stub-scheduler": _fake_scheduler}
+        assert _process_singleton.current_runtime() is runtime
+
+    def test_engine_and_scheduler_lists_cannot_both_be_empty(self) -> None:
+        with pytest.raises(
+            ConfigError,
+            match="at least one engine or scheduler adapter is required",
+        ):
+            install_agent(engines=[], schedulers=[], autostart=False)
+
+
 class TestRequiredFieldsFailFast:
     def test_empty_brain_url_does_not_fall_back_to_env(
         self,

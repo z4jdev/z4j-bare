@@ -5,8 +5,9 @@ The runtime orchestrates every subsystem:
 - Reads the resolved :class:`Config` from the framework adapter
 - Opens the local SQLite buffer
 - Starts a background thread that runs an asyncio event loop
-- Inside that loop, runs three cooperating tasks:
-    1. Connect/reconnect transport loop (WebSocket primary, long-poll fallback)
+- Inside that loop, runs four cooperating tasks:
+    1. Connect/reconnect loop for the configured transport. ``"auto"`` is
+       currently a synonym for ``"ws"``; long-poll must be selected explicitly.
     2. Send loop - drains buffer batches to the transport
     3. Heartbeat loop - periodically appends heartbeat frames
     4. Receive loop - handles inbound command frames via the dispatcher
@@ -34,9 +35,10 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from z4j_core.errors import (
+    AgentIncompatibleError,
     AuthenticationError,
     ProtocolError,
     Z4JError,
@@ -444,6 +446,80 @@ _AUTH_RECONNECT_JITTER = 0.3
 _PROTOCOL_RECONNECT_INITIAL = 1.0
 _PROTOCOL_RECONNECT_MAX = 60.0
 
+# Incompatible-agent handling. The brain has closed with a code that says this
+# build is unacceptable: an unsupported wire protocol, or a version outside the
+# supported range. Nothing about reconnecting changes that answer, so retrying
+# on the protocol schedule above is a storm against a brain that already said
+# no. What fixes it is a person upgrading something, on human timescales.
+#
+# Not fatal on purpose. The agent lives inside somebody's application, so
+# stopping for good would mean an operator who corrects the deployment gets no
+# agent back until they restart their app.
+_INCOMPATIBLE_RECONNECT_INITIAL = 120.0
+_INCOMPATIBLE_RECONNECT_MAX = 3600.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconnectSchedule:
+    """Retry timing for one supervisor error class."""
+
+    initial: float
+    jitter: float
+    maximum: float
+
+
+#: Every error class the supervisor can classify, with its retry timing.
+#:
+#: This table is the single source of truth for those class names. The
+#: consecutive-failure streak, the sleep before the next attempt and the
+#: schedule advance are all looked up by the same key, so a class cannot be
+#: known to one of them and unknown to another. When those lived in parallel
+#: hand-written branches they drifted: the branch that chose the streak had no
+#: arm for ``incompatible`` and fell through to the connection streak, which
+#: reads zero on a fresh rejection. A streak of zero is not a first failure, so
+#: the one ERROR that tells an operator to upgrade something was never emitted
+#: -- the agent logged a mid-streak summary at INFO on every attempt instead.
+#: An unknown class now raises a KeyError at the first failure rather than
+#: quietly reporting another class's numbers.
+_RECONNECT_SCHEDULES: Final[dict[str, _ReconnectSchedule]] = {
+    "auth": _ReconnectSchedule(
+        initial=_AUTH_RECONNECT_INITIAL,
+        jitter=_AUTH_RECONNECT_JITTER,
+        maximum=_AUTH_RECONNECT_MAX,
+    ),
+    "incompatible": _ReconnectSchedule(
+        initial=_INCOMPATIBLE_RECONNECT_INITIAL,
+        jitter=_RECONNECT_JITTER,
+        maximum=_INCOMPATIBLE_RECONNECT_MAX,
+    ),
+    "protocol": _ReconnectSchedule(
+        initial=_PROTOCOL_RECONNECT_INITIAL,
+        jitter=_RECONNECT_JITTER,
+        maximum=_PROTOCOL_RECONNECT_MAX,
+    ),
+    "connection": _ReconnectSchedule(
+        initial=_RECONNECT_INITIAL,
+        jitter=_RECONNECT_JITTER,
+        maximum=_RECONNECT_MAX,
+    ),
+}
+
+# ``except*`` executes every matching arm. Keep the precedence used to merge
+# those arms in one production helper so tests exercise the decision that the
+# supervisor itself makes rather than a copied table.
+_SUPERVISOR_FAILURE_RANK: Final[dict[str, int]] = {
+    "connection": 0,
+    "protocol": 1,
+    "incompatible": 2,
+    "auth": 3,
+}
+
+#: Error class used when the supervisor completes an iteration without
+#: classifying a failure. ``_connect_and_run`` always unwinds through
+#: ``_StopRequested`` today, so this is a floor rather than a live path: it
+#: keeps a clean return on a retry schedule instead of spinning with no delay.
+_DEFAULT_ERROR_CLASS: Final = "connection"
+
 
 def _decode_hmac_secret(value: str) -> bytes:
     """Decode the configured ``hmac_secret`` string into raw bytes.
@@ -512,27 +588,20 @@ class AgentRuntime:
         self._dispatcher: CommandDispatcher | None = None
         self._heartbeat: Heartbeat | None = None
 
-        # Per-class consecutive-failure counters. Reset by
+        # Per-class consecutive-failure streaks and connect-retry
+        # backoff, both keyed by the supervisor's error class. Reset by
         # ``_connect_and_run`` on successful handshake (which is the
         # only place that observably happens, since the supervisor's
-        # task-group exit is always via _StopRequested). Surfaced to
-        # the doctor CLI and heartbeat frames so operators can
-        # distinguish "agent is in a flap loop" from "agent is fine,
-        # just disconnected once."
-        self._auth_error_count = 0
-        self._protocol_error_count = 0
-        self._connection_error_count = 0
-
-        # Per-class connect-retry backoff. Held as instance state
-        # rather than stack-locals inside _supervise so that
-        # _connect_and_run can reset them on successful handshake.
-        # Without this, the delay schedule advanced monotonically
-        # for the lifetime of the runtime, leaving a long-stable
-        # connection pinned at the cap (30s/60s/600s) after eventual
-        # disconnect instead of returning to the floor.
-        self._delay_conn = _RECONNECT_INITIAL
-        self._delay_proto = _PROTOCOL_RECONNECT_INITIAL
-        self._delay_auth = _AUTH_RECONNECT_INITIAL
+        # task-group exit is always via _StopRequested). Streaks are
+        # surfaced to the doctor CLI and heartbeat frames so operators
+        # can distinguish "agent is in a flap loop" from "agent is
+        # fine, just disconnected once." Delays are instance state
+        # rather than stack-locals inside _supervise, so a long-stable
+        # connection starts its next disconnect at the floor instead of
+        # staying pinned at the cap it reached hours earlier.
+        self._failure_streaks: dict[str, int] = {}
+        self._delays: dict[str, float] = {}
+        self._reset_reconnect_state()
 
         # Phase H: timestamp of the most recent successful handshake.
         # None until the first connect, then monotonically updated.
@@ -628,6 +697,30 @@ class AgentRuntime:
         """
         if self._loop is not None and self._reconnect_now is not None:
             self._loop.call_soon_threadsafe(self._reconnect_now.set)
+
+    def _reset_reconnect_state(self) -> None:
+        """Put every error class back to a zero streak and its floor delay."""
+        self._failure_streaks = dict.fromkeys(_RECONNECT_SCHEDULES, 0)
+        self._delays = {name: sched.initial for name, sched in _RECONNECT_SCHEDULES.items()}
+
+    @property
+    def _auth_error_count(self) -> int:
+        return self._failure_streaks["auth"]
+
+    @property
+    def _protocol_error_count(self) -> int:
+        """Both protocol-class streaks as one number.
+
+        The ``agent_status`` frame carries a single protocol streak field, and
+        an incompatible-agent rejection is a protocol-level rejection. Summing
+        is exact rather than approximate: a successful handshake clears every
+        streak, so at most one class is ever non-zero.
+        """
+        return self._failure_streaks["protocol"] + self._failure_streaks["incompatible"]
+
+    @property
+    def _connection_error_count(self) -> int:
+        return self._failure_streaks["connection"]
 
     def supervisor_state(self) -> dict[str, object]:
         """Return current supervisor health for the doctor CLI.
@@ -1018,9 +1111,10 @@ class AgentRuntime:
 
         Intended to be called from an engine's hot-path callback
         (Celery signal handler, RQ Job callback, Dramatiq middleware
-        method) or any other host-app hot path. **Non-blocking**.
-        Wraps the buffer write in :func:`safe_call` so a buffer error
-        never propagates into the host code.
+        method) or another host-app hot path. The write is local and bounded,
+        but synchronous: it takes the buffer lock and writes SQLite. Wraps the
+        write in :func:`safe_call` so a buffer error never propagates into the
+        host code.
 
         Thread-safety: ``_buffer`` is read into a local variable
         ONCE, then used. Even if ``stop()`` races to set
@@ -2270,22 +2364,52 @@ class AgentRuntime:
         others.
         """
         assert self._stop_event is not None
-        # Counters and per-class delays are instance state initialised
+        # Streaks and per-class delays are instance state initialised
         # in __init__ and reset on successful handshake by
         # _connect_and_run. We re-initialise them here as well in case
         # _supervise is invoked more than once over the runtime's life
         # (it currently is not, but the contract should not depend on
         # call-count).
-        self._auth_error_count = 0
-        self._protocol_error_count = 0
-        self._connection_error_count = 0
-        self._delay_conn = _RECONNECT_INITIAL
-        self._delay_proto = _PROTOCOL_RECONNECT_INITIAL
-        self._delay_auth = _AUTH_RECONNECT_INITIAL
+        self._reset_reconnect_state()
         stop_loop = False
         while not stop_loop and not self._stop_event.is_set():
             error_class: str | None = None
             err: BaseException | None = None
+
+            def _classify(candidate: str, group: BaseExceptionGroup) -> None:
+                """Record a failure class, keeping the most consequential one.
+
+                ``except*`` is not ``except``: PEP 654 runs EVERY arm whose
+                type appears in the group, in source order, so a plain
+                assignment lets the LAST matching arm win regardless of which
+                failure actually matters. That is not the subclass case, which
+                ``except*`` splits correctly; it is the sibling case, where two
+                tasks in the group fail differently.
+
+                It happens on the path this ordering exists to protect. When
+                the brain answers with a fatal error frame the receive task
+                raises AgentIncompatibleError, and the transport clears its
+                socket reference before awaiting the close, so a send in that
+                window raises ConnectionError alongside it. Assigned in order,
+                the cycle was binned as "connection" and retried on the 1s
+                schedule, which is the reconnect storm the incompatible class
+                was added to stop.
+
+                Ranked instead, so the answer does not depend on which sibling
+                happened to fail. A connection error raised while tearing down
+                an incompatible session is a consequence of it, and
+                reconnecting in a second does not make the version match.
+                """
+                nonlocal error_class, err
+                current = (
+                    (error_class, err) if error_class is not None and err is not None else None
+                )
+                error_class, err = _prefer_supervisor_failure(
+                    current,
+                    candidate,
+                    group,
+                )
+
             try:
                 await self._connect_and_run()
             except* _StopRequested:
@@ -2294,17 +2418,13 @@ class AgentRuntime:
                 # so we set a flag and break out at the next loop guard.
                 stop_loop = True
             except* AuthenticationError as eg:
-                error_class = "auth"
-                err = _first(eg)
-                self._auth_error_count += 1
+                _classify("auth", eg)
+            except* AgentIncompatibleError as eg:
+                _classify("incompatible", eg)
             except* ProtocolError as eg:
-                error_class = "protocol"
-                err = _first(eg)
-                self._protocol_error_count += 1
+                _classify("protocol", eg)
             except* ConnectionError as eg:
-                error_class = "connection"
-                err = _first(eg)
-                self._connection_error_count += 1
+                _classify("connection", eg)
             except* Exception as eg:
                 # Unknown failure class. Treat as connection-class
                 # for backoff purposes; log full traceback so future
@@ -2313,41 +2433,30 @@ class AgentRuntime:
                     "z4j agent unexpected supervisor error",
                     exc_info=eg,
                 )
-                error_class = "connection"
-                err = _first(eg)
-                self._connection_error_count += 1
+                _classify("connection", eg)
 
             if stop_loop:
                 break
 
-            if err is not None:
-                count = (
-                    self._auth_error_count
-                    if error_class == "auth"
-                    else self._protocol_error_count
-                    if error_class == "protocol"
-                    else self._connection_error_count
-                )
-                _log_disconnect(error_class, err, count)
+            # Count the failure and report it through the same key that
+            # classified it. Splitting the increment across the ``except*``
+            # arms and the lookup across a separate branch is what let the
+            # two disagree, and a disagreement here is silent: the tiered
+            # logger just sees the wrong number and picks the wrong tier.
+            if err is not None and error_class is not None:
+                self._failure_streaks[error_class] += 1
+                _log_disconnect(error_class, err, self._failure_streaks[error_class])
 
             if self._stop_event.is_set():
                 return
 
-            # Pick the schedule for the most recent error class.
-            if error_class == "auth":
-                base = self._delay_auth
-                jitter = _AUTH_RECONNECT_JITTER
-                cap = _AUTH_RECONNECT_MAX
-            elif error_class == "protocol":
-                base = self._delay_proto
-                jitter = _RECONNECT_JITTER
-                cap = _PROTOCOL_RECONNECT_MAX
-            else:
-                base = self._delay_conn
-                jitter = _RECONNECT_JITTER
-                cap = _RECONNECT_MAX
+            # Pick the schedule for the most recent error class, by the same
+            # key the streak above was counted under.
+            retry_class = error_class or _DEFAULT_ERROR_CLASS
+            schedule = _RECONNECT_SCHEDULES[retry_class]
+            base = self._delays[retry_class]
 
-            sleep_for = base + random.uniform(0, base * jitter)  # noqa: S311  non-security reconnect jitter
+            sleep_for = base + random.uniform(0, base * schedule.jitter)  # noqa: S311  non-security reconnect jitter
             # Wake either on stop (clean exit) or reconnect_now
             # (SIGHUP from z4j-<adapter> restart). On reconnect_now
             # we clear the event and skip straight to the next
@@ -2383,12 +2492,7 @@ class AgentRuntime:
             # Advance only the schedule that fired. Other classes
             # keep their state so a flap pattern in one class doesn't
             # zero out an unrelated class's progress.
-            if error_class == "auth":
-                self._delay_auth = min(self._delay_auth * 2.0, cap)
-            elif error_class == "protocol":
-                self._delay_proto = min(self._delay_proto * 2.0, cap)
-            else:
-                self._delay_conn = min(self._delay_conn * 2.0, cap)
+            self._delays[retry_class] = min(base * 2.0, schedule.maximum)
 
     async def _connect_and_run(self) -> None:
         """One supervisor cycle: connect, run tasks, until disconnect."""
@@ -2400,7 +2504,7 @@ class AgentRuntime:
 
         await self._transport.connect()
 
-        # Connection established. Reset failure counters AND the
+        # Connection established. Reset failure streaks AND the
         # per-class backoff delays so the next disconnect starts at
         # the floor again. This is the only reachable reset point in
         # the supervisor lifecycle: the supervise() task-group always
@@ -2409,20 +2513,13 @@ class AgentRuntime:
         # that flapped once on startup and then stabilised for hours
         # would still be pinned at the 30s/60s/600s cap on its next
         # disconnect, which is worse than starting at 1s/1s/10s.
-        prior_failures = (
-            self._connection_error_count + self._protocol_error_count + self._auth_error_count
-        )
+        prior_failures = sum(self._failure_streaks.values())
         if prior_failures > 0:
             logger.info(
                 "z4j agent recovered after %d failed connect attempt(s)",
                 prior_failures,
             )
-        self._connection_error_count = 0
-        self._protocol_error_count = 0
-        self._auth_error_count = 0
-        self._delay_conn = _RECONNECT_INITIAL
-        self._delay_proto = _PROTOCOL_RECONNECT_INITIAL
-        self._delay_auth = _AUTH_RECONNECT_INITIAL
+        self._reset_reconnect_state()
         # Phase H: timestamp the successful connect so the agent_status
         # frame can report session age. Updated on every connect, not
         # just the first.
@@ -3130,6 +3227,24 @@ def _first(eg: BaseExceptionGroup[BaseException]) -> BaseException:
     return eg
 
 
+def _prefer_supervisor_failure(
+    current: tuple[str, BaseException] | None,
+    candidate: str,
+    group: BaseExceptionGroup[BaseException],
+) -> tuple[str, BaseException]:
+    """Merge one ``except*`` match into the supervisor classification.
+
+    Every matching ``except*`` arm runs, so source order must not choose the
+    reconnect schedule. The highest-ranked failure wins and retains one leaf
+    from the corresponding exception group for logging. Unknown class names
+    fail closed with ``KeyError`` instead of silently borrowing a schedule.
+    """
+    candidate_rank = _SUPERVISOR_FAILURE_RANK[candidate]
+    if current is None or candidate_rank > _SUPERVISOR_FAILURE_RANK[current[0]]:
+        return candidate, _first(group)
+    return current
+
+
 # Every Nth consecutive failure of the same class re-emits an INFO
 # summary so an operator tailing the log sees a heartbeat-rate
 # signal that the agent is still alive and trying. 10 is chosen so
@@ -3142,7 +3257,7 @@ _LOG_SUMMARY_EVERY = 10
 
 
 def _log_disconnect(
-    error_class: str | None,
+    error_class: str,
     err: BaseException,
     count: int,
 ) -> None:
@@ -3156,9 +3271,9 @@ def _log_disconnect(
     the host application's stderr to flood.
 
     Args:
-        error_class: One of ``"auth"`` / ``"protocol"`` / ``"connection"``
-            (or ``None`` if the supervisor saw no error - the caller
-            never invokes this helper in that case).
+        error_class: A key of :data:`_RECONNECT_SCHEDULES`. The supervisor
+            only calls this once it has classified a failure, so there is
+            no "no error" case to encode here.
         err: The leaf exception extracted from the supervisor's
             ExceptionGroup.
         count: Position of this failure within the current streak.
@@ -3174,6 +3289,15 @@ def _log_disconnect(
                 "z4j agent auth rejected: %s. Will retry with backoff "
                 "(10min cap). Subsequent identical failures suppressed; "
                 "set the z4j.agent logger to DEBUG to see every attempt.",
+                err,
+            )
+        elif error_class == "incompatible":
+            # ERROR, not WARNING: nothing this agent does will clear it, and
+            # the operator needs to see the version they have to change.
+            logger.error(
+                "z4j agent rejected as incompatible: %s. Reconnecting cannot "
+                "fix this; upgrade the agent or the brain. Retrying hourly in "
+                "case the deployment is corrected.",
                 err,
             )
         elif error_class == "protocol":

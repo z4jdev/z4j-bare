@@ -20,6 +20,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 from z4j_core.errors import (
+    AgentIncompatibleError,
     AuthenticationError,
     InvalidFrameError,
     ProtocolError,
@@ -64,6 +65,31 @@ _TERMINAL_CLOSE_CODES: dict[int, str] = {
         "agent to within one minor of the brain"
     ),
 }
+
+#: Fatal ``error``-frame codes that describe a BUILD rather than a moment.
+#:
+#: A close code is not the only way the brain says "this agent is not one I
+#: can work with"; it can also say it in an error frame over an established
+#: session, and the agent re-sends the frame that provoked it on every
+#: reconnect. Classifying that as transient produces exactly the storm the
+#: close-code table above exists to prevent, just arrived at from the other
+#: direction.
+#:
+#: Codes absent from this set stay transient, which is the safe default: a
+#: fatal frame that a retry COULD clear must not strand an agent for an hour.
+#:
+#: ``protocol_incompatible`` is the wire code an incompatibility verdict
+#: already carries, and ``agent_incompatible`` is a name reserved for one.
+#: Both are listed before the brain emits either, for the same reason 4427 is
+#: above: an agent that accepts the code first is one a later brain can safely
+#: start sending it to.
+_TERMINAL_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "scheduler_upgrade_required",
+        "agent_incompatible",
+        "protocol_incompatible",
+    },
+)
 
 
 def _ws_close_code(exc: Exception) -> int | None:
@@ -295,9 +321,9 @@ class WebSocketTransport:
                     f"  2. Use a loopback hostname (localhost, 127.0.0.1,\n"
                     f"     ::1) - allowed by default, no flag needed.\n"
                     f"  3. Opt in to dev_mode via your framework's config\n"
-                    f"     (NOT via Z4J_DEV_MODE env var - that is\n"
-                    f"     refused as of 1.5 since untrusted env can't\n"
-                    f"     disable HMAC, see security audit C3):\n"
+                    f"     (NOT via a Z4J_DEV_MODE env var - the agent\n"
+                    f"     refuses that one, so nothing in the process\n"
+                    f"     environment can switch off frame signing):\n"
                     f"       Django: settings.Z4J = {{'dev_mode': True, ...}}\n"
                     f"       Flask:  app.config['Z4J'] = {{'dev_mode': True, ...}}\n"
                     f"               or app.config['Z4J_DEV_MODE'] = True\n"
@@ -409,6 +435,12 @@ class WebSocketTransport:
                 # runtime backs off separately from transient connection
                 # failures instead of retrying on the normal schedule.
                 #
+                # The supervisor gives this its own long schedule, because a
+                # version mismatch is resolved by upgrading something, not by
+                # reconnecting. Raising a plain ProtocolError here put it on
+                # the transient 1s..60s schedule and retried forever, which is
+                # the reconnect storm this branch exists to prevent.
+                #
                 # Handled here BEFORE the brain ever sends them. A brain that
                 # started closing on version skew today would be rejecting
                 # precisely the old agents that lack this branch, and those
@@ -417,7 +449,7 @@ class WebSocketTransport:
                 # enforcement safe in a later release. Celery did the same for
                 # the v1 -> v2 task protocol: 3.1.25 taught the old side to
                 # cope, and only then did the new side change.
-                raise ProtocolError(
+                raise AgentIncompatibleError(
                     _TERMINAL_CLOSE_CODES[code],
                     details={"close_code": code},
                 ) from exc
@@ -431,10 +463,18 @@ class WebSocketTransport:
             )
 
         # Verify the brain's protocol version is one we can speak.
-        # Raises ProtocolError on mismatch - caller surfaces this and
-        # refuses to retry, since it cannot be fixed by reconnecting.
         try:
             check_compatibility(ack.payload.protocol_version)
+        except ProtocolError as exc:
+            await self._close_ws()
+            # Same verdict as a terminal close code, learned one frame later:
+            # a peer that acks a version this build does not implement will
+            # ack the same version on every reconnect, because which versions
+            # either side speaks is a property of the two builds and not of
+            # the moment. Re-raised as the base class it was binned with
+            # genuinely transient handshake faults and retried on the
+            # 1s..60s schedule forever, which is the storm.
+            raise AgentIncompatibleError(exc.message, details=exc.details) from exc
         except Exception:
             await self._close_ws()
             raise
@@ -709,9 +749,17 @@ class WebSocketTransport:
                     ) from exc
                 if isinstance(frame, ErrorFrame) and frame.payload.fatal:
                     await self._close_ws()
-                    raise ProtocolError(
-                        f"{frame.payload.code}: {frame.payload.message}",
-                    )
+                    detail = f"{frame.payload.code}: {frame.payload.message}"
+                    if frame.payload.code in _TERMINAL_ERROR_CODES:
+                        # The frame that provoked this is still at the head of
+                        # the agent's buffer, so a reconnect replays it and
+                        # earns the same verdict; only upgrading something
+                        # changes the answer.
+                        raise AgentIncompatibleError(
+                            detail,
+                            details={"error_code": frame.payload.code},
+                        )
+                    raise ProtocolError(detail)
                 try:
                     await on_frame(frame)
                 except Z4JError:
@@ -719,13 +767,38 @@ class WebSocketTransport:
                 except Exception:
                     logger.exception("unexpected error handling inbound frame")
         except ConnectionClosed as exc:
-            logger.info("z4j agent websocket closed: %s", exc)
+            await self._raise_receive_closed(exc)
         except WebSocketException as exc:
+            await self._close_ws()
             raise ConnectionError(f"websocket recv failed: {exc}") from exc
+
+        # A WebSocket iterator normally ends by raising ConnectionClosed, but
+        # test doubles, alternative implementations, and future library
+        # versions may end it cleanly. Returning here would leave the send,
+        # heartbeat, acknowledgement watchdog, and stop tasks alive in the
+        # surrounding TaskGroup, so the agent could remain wedged forever.
+        await self._close_ws()
+        raise ConnectionError("websocket receive stream ended without a close frame")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _raise_receive_closed(self, exc: ConnectionClosed) -> None:
+        """Clear an established socket and classify its peer close."""
+        code = _ws_close_code(exc)
+        logger.info("z4j agent websocket closed: %s", exc)
+        await self._close_ws()
+        # A revoke can race with the hello acknowledgement. During the
+        # handshake it is reported as 4401/4403; after the session is
+        # established the brain uses 4003. Both are durable credential
+        # failures and belong on the authentication backoff schedule.
+        if code == 4003:
+            raise AuthenticationError(
+                "brain revoked agent token",
+                details={"close_code": code},
+            ) from exc
+        raise ConnectionError(f"websocket closed during receive: {exc}") from exc
 
     @staticmethod
     def _new_frame_id(prefix: str) -> str:

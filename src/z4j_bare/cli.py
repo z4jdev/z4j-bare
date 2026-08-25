@@ -66,10 +66,8 @@ logger = logging.getLogger("z4j.runtime.cli")
 # to import its package raises ``ImportError`` with a helpful pip
 # install hint; the CLI converts that into a non-zero exit code.
 #
-# Adding a new engine = add one row here. No other CLI changes needed.
-# A future v1.1 polish (tracked in docs/BARE_AUDIT_2026Q2.md) replaces
-# this hand-rolled registry with ``importlib.metadata`` entry-point
-# discovery once we have 5+ engines.
+# Adding a new built-in engine requires one row here. This CLI uses the
+# hand-maintained registry rather than entry-point discovery.
 
 EngineLoader = Callable[[str | None], Any]
 

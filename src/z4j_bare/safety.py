@@ -1,17 +1,10 @@
 """Exception-safety wrappers.
 
-The single most important invariant in z4j: **the agent must never
-break the host application.** See ``docs/SECURITY.md``.
-
-Every public entry point of the agent runtime that can be called from
-an engine signal/middleware/hook (Celery signals, RQ Job hooks,
-Dramatiq middleware), a framework lifecycle hook (Django AppConfig,
-Flask before-request, FastAPI lifespan), or the host app's request
-path runs through one of the helpers in this module. If an exception
-escapes our own code, we log it and drop it. The host app continues.
-
-This is defense in depth, not defense in "oh the test suite caught
-most bugs." We trap unconditionally at the boundary.
+These helpers isolate z4j failures at synchronous host-call boundaries that
+opt into them. Some engine and framework integrations implement an equivalent
+local boundary instead, so this module is not a universal wrapper around every
+public entry point. ``KeyboardInterrupt`` and ``SystemExit`` deliberately
+propagate so process lifecycle control keeps working.
 """
 
 from __future__ import annotations
@@ -36,10 +29,9 @@ def safe_call(func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R | No
     unhandled exception. Logs the exception at ``ERROR`` level with
     traceback.
 
-    Never re-raises. Never propagates. This is the final firewall
-    between z4j code and the host application. A bug here does not
-    crash the user's worker, web process, or async app - regardless
-    of which engine or framework they use.
+    Re-raises ``KeyboardInterrupt`` and ``SystemExit``; suppresses other
+    ``BaseException`` subclasses. At call sites that use this helper, it is the
+    final firewall between z4j code and the host application.
     """
     try:
         return func(*args, **kwargs)
@@ -71,10 +63,20 @@ def safe_boundary(func: Callable[P, R]) -> Callable[P, R | None]:
         def handle_task_prerun(sender, task_id, task, **kwargs):
             runtime.record_event(Event(...))
 
-    The decorated function swallows every exception - including
-    ``KeyboardInterrupt`` and ``SystemExit`` - because host signal
-    handlers MUST return cleanly. Our tests ensure this is the only
-    place in z4j that traps ``BaseException``.
+    The decorated function swallows every exception EXCEPT
+    ``KeyboardInterrupt`` and ``SystemExit``, which are re-raised so the host
+    can shut down: swallowing them blocks SIGTERM and Ctrl-C, which was an
+    audit finding. See :func:`safe_call`, which this delegates to.
+
+    This docstring used to say the opposite, that those two were swallowed
+    too. It is worth being exact here, because a reader who believed it would
+    either conclude z4j blocks clean shutdown or "fix" the code to match and
+    reintroduce the defect.
+
+    It is the only place in z4j that swallows a ``BaseException``. Every other
+    handler re-raises it or forwards it to an awaiter, and
+    ``test_only_one_place_swallows_base_exception`` enforces that rather than
+    leaving it as a claim.
     """
 
     @wraps(func)

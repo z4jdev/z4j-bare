@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.9.0 (2026-08-25)
+
+* An agent rejected by the brain no longer reconnects forever: an unsupported protocol or version now backs off on its own schedule and says what to upgrade, instead of retrying on the transient schedule.
+* Buffer and websocket transport hardening around that path.
+
 ## 1.8.0 (2026-07-23)
 
 * Retry authority is now derived from each loaded adapter and advertised on the exact WebSocket generation or long-poll request; an old adapter paired with a current runtime fails closed.

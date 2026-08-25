@@ -180,8 +180,9 @@ class Heartbeat:
     async def _enqueue_agent_status(self) -> None:
         """Emit an :class:`AgentStatusFrame` alongside the heartbeat.
 
-        Phase H: brain-side persisted to ``agent_status_history`` so
-        the dashboard can render a per-agent flap timeline. Opt out
+        Phase H: brain-side best-effort persistence to
+        ``agent_status_history`` lets the dashboard render a per-agent flap
+        timeline; rate limits or persistence failures can drop a sample. Opt out
         via ``Z4J_AGENT_STATUS_DISABLED=1`` in environments that don't
         want the frame on the wire (typically resource-constrained
         agents that ship hundreds per host).

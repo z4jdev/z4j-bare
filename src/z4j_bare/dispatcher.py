@@ -480,9 +480,10 @@ class CommandDispatcher:
             )
             return CommandResult(status="failed", error=detail)
 
-        # ``submit_task`` is the universal v1.0+ enqueue primitive.
-        # The brain calls it directly (and uses it as a polyfill for
-        # retry / bulk_retry / requeue_dlq).
+        # ``submit_task`` is the direct enqueue primitive. This dispatcher can
+        # also lower one retry through it, but only when the command supplies
+        # both explicit override halves; bulk and dead-letter actions remain
+        # capability-gated native adapter operations.
         if action == "submit_task":
             name = parameters.get("name") or target.get("name")
             if not name:
@@ -505,7 +506,7 @@ class CommandDispatcher:
                 args=args,
                 kwargs=kwargs,
                 queue=parameters.get("queue"),
-                eta=parameters.get("eta"),
+                eta=_adapter_eta(parameters),
                 priority=parameters.get("priority"),
             )
 
@@ -545,9 +546,10 @@ class CommandDispatcher:
         # Brain-side polyfill bridge: if the brain asked for an
         # action the adapter doesn't natively advertise but it has a
         # universal lowering to ``submit_task``, do the lowering
-        # transparently. The brain enriches the payload with the
-        # original ``(task_name, args, kwargs)`` it captured on
-        # ``task.received`` so we have everything we need.
+        # transparently. The brain can supply the task name, but stored
+        # task arguments are redacted and are not replayable input. The
+        # branch below therefore requires both explicit operator override
+        # halves and fails closed if either is absent.
         #
         # This is what lets the dashboard show the same "Retry"
         # button on every engine without per-engine UI gating.
@@ -597,7 +599,7 @@ class CommandDispatcher:
                 args=tuple(override_args),
                 kwargs=dict(override_kwargs),
                 queue=parameters.get("queue"),
-                eta=parameters.get("eta") or parameters.get("eta_seconds"),
+                eta=_adapter_eta(parameters),
                 priority=parameters.get("priority"),
             )
 
@@ -723,6 +725,8 @@ class CommandDispatcher:
                 override_kwargs = dict(override_kwargs or {})
                 override_kwargs["__z4j_actor_name__"] = task_name
 
+            adapter_eta = _adapter_eta(parameters)
+
             # Pass task_name as an explicit kwarg for adapters that
             # accept it. z4j-rq 1.6.7+ requires task_name (the action
             # layer fails closed if absent); the dispatcher must NOT
@@ -751,7 +755,7 @@ class CommandDispatcher:
                     task_name=task_name,
                     override_args=override_args,
                     override_kwargs=override_kwargs,
-                    eta=parameters.get("eta"),
+                    eta=adapter_eta,
                     # Brain looks up the original task's priority and
                     # forwards it so high-priority work doesn't get
                     # silently demoted on retry. ``None`` falls back
@@ -777,7 +781,7 @@ class CommandDispatcher:
                     task_id,
                     override_args=override_args,
                     override_kwargs=override_kwargs,
-                    eta=parameters.get("eta"),
+                    eta=adapter_eta,
                     priority=parameters.get("priority"),
                 )
 
@@ -1364,6 +1368,24 @@ def _maybe_tuple(value: object) -> tuple[Any, ...] | None:
     if isinstance(value, (list, tuple)):
         return tuple(value)
     return None
+
+
+def _adapter_eta(parameters: dict[str, Any]) -> float | None:
+    """Return the adapters' absolute-POSIX ``eta`` value.
+
+    Current brains resolve the public relative ``eta_seconds`` input when the
+    command is issued and send the resulting ``eta``. The fallback keeps a
+    current agent compatible with an older brain that sent only the relative
+    field. An explicit ``eta`` wins even when it is ``0`` so malformed or
+    stale absolute values fail in the adapter instead of changing meaning.
+    """
+    eta = parameters.get("eta")
+    if eta is not None:
+        return float(eta)
+    eta_seconds = parameters.get("eta_seconds")
+    if eta_seconds is None:
+        return None
+    return time.time() + float(eta_seconds)
 
 
 __all__ = ["CommandDispatcher"]

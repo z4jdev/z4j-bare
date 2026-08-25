@@ -18,8 +18,9 @@ Probes:
 - :func:`probe_dns` - resolves the brain hostname.
 - :func:`probe_tcp` - opens a TCP connection to the brain port.
 - :func:`probe_tls` - completes a TLS handshake (SNI honored).
-- :func:`probe_websocket` - upgrades to ``wss://<brain>/ws/agent``
-  and waits for the server's hello_ack or auth rejection.
+- :func:`probe_websocket` - starts the agent transport runtime far
+  enough to validate local configuration, buffer, and loop readiness.
+  It does not wait for a remote connection or authentication result.
 - :func:`run_all` - one-call orchestrator that runs each probe in
   order, short-circuiting after the first hard failure.
 """
@@ -236,17 +237,17 @@ def probe_tls(brain_url: str, timeout: float = 5.0) -> ProbeResult:
 
 
 def probe_websocket(config: Config, timeout: float = 5.0) -> ProbeResult:
-    """Try to upgrade to ``wss://<brain>/ws/agent`` and read the first frame.
+    """Validate local startup of the runtime used for WebSocket transport.
 
-    Uses the same transport the runtime would use, but with an
-    aggressive timeout and an early close - the goal is to detect:
+    Uses the same runtime startup path as an installed agent, with an
+    aggressive timeout and an early close. This proves local HMAC-secret
+    syntax and length, buffer initialization, background-loop readiness,
+    and adapter signal wiring.
 
-    - Bad token (server closes with 4001/4002)
-    - Wrong project_id (server closes with 4003)
-    - HMAC missing/invalid (server closes with 4004)
-    - Reverse proxy that doesn't pass Upgrade header (server returns
-      HTTP 200/301/502 instead of 101)
-    - Idle close from intermediary (Cloudflare 5xx, etc.)
+    ``AgentRuntime.start()`` returns before its supervisor completes
+    ``transport.connect()``. Therefore ``ok=True`` does not prove a WebSocket
+    upgrade, an authenticated ``hello_ack``, valid token/project credentials,
+    or a working reverse-proxy Upgrade path.
     """
     try:
         return asyncio.run(_probe_websocket_async(config, timeout))
@@ -261,9 +262,10 @@ def probe_websocket(config: Config, timeout: float = 5.0) -> ProbeResult:
 
 
 async def _probe_websocket_async(config: Config, timeout: float) -> ProbeResult:  # noqa: ASYNC109  timeout forwarded to asyncio.wait_for
-    # We instantiate a transport-only path: build the framework
-    # adapter and a no-op engines list so AgentRuntime.start() opens
-    # the WS but does nothing else. Then immediately close.
+    # Build the same runtime with no engines or schedulers, wait only for
+    # AgentRuntime.start()'s local steady-state signal, then close. The
+    # supervisor's remote connect/authentication runs after that signal and is
+    # deliberately outside this probe's contract.
     from z4j_bare.framework import BareFrameworkAdapter
     from z4j_bare.runtime import AgentRuntime  # local import to avoid cycle
 
@@ -280,13 +282,13 @@ async def _probe_websocket_async(config: Config, timeout: float) -> ProbeResult:
         return ProbeResult(
             name="websocket",
             ok=False,
-            message=f"FAIL: ws upgrade did not complete within {timeout}s",
+            message=f"FAIL: agent transport runtime was not locally ready within {timeout}s",
         )
     except Exception as exc:
         return ProbeResult(
             name="websocket",
             ok=False,
-            message=f"FAIL: ws upgrade rejected: {type(exc).__name__}: {exc}",
+            message=f"FAIL: agent transport startup failed: {type(exc).__name__}: {exc}",
         )
     finally:
         with contextlib.suppress(Exception):
@@ -294,7 +296,14 @@ async def _probe_websocket_async(config: Config, timeout: float) -> ProbeResult:
     return ProbeResult(
         name="websocket",
         ok=True,
-        message=f"OK: ws upgrade to {config.brain_url} succeeded",
+        message=(
+            f"OK: local agent transport runtime started for {config.brain_url}; "
+            "remote connection and authentication were not verified"
+        ),
+        details={
+            "remote_connection_verified": False,
+            "remote_authentication_verified": False,
+        },
     )
 
 

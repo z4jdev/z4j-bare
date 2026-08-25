@@ -10,9 +10,9 @@ Design constraints:
 
 - **Bounded**: oldest entries are dropped when size/byte limits are hit.
   The buffer never grows unbounded.
-- **Non-blocking** to the host app: all operations are fast enough to
-  call from an engine signal/middleware/hook without measurable impact
-  (Celery signal, RQ Job callback, Dramatiq middleware, etc.).
+- **Bounded synchronous work** on the host callback: appends take a lock and
+  write SQLite locally. They avoid network I/O, but may briefly wait on another
+  buffer operation or the filesystem.
 - **Crash-safe**: SQLite in WAL mode with ``synchronous=NORMAL`` gives
   us durability across process crashes.
 - **Thread-safe**: a single ``threading.Lock`` guards the connection.
@@ -3069,6 +3069,15 @@ def _copy_source_component(
     source_flags |= getattr(os, "O_NOFOLLOW", 0)
     destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     destination_flags |= getattr(os, "O_CLOEXEC", 0)
+    # A SQLite main file, WAL or rollback journal is opaque binary. Windows'
+    # ``os.open`` defaults to text mode when neither O_TEXT nor O_BINARY is
+    # given, which stops the read dead at the first 0x1A byte and expands
+    # every 0x0A written back out to 0x0D 0x0A. Either translation yields a
+    # snapshot that classification would read as a corrupt or differently
+    # shaped database. POSIX defines O_BINARY as 0 (or omits it), so this is
+    # a no-op there.
+    source_flags |= getattr(os, "O_BINARY", 0)
+    destination_flags |= getattr(os, "O_BINARY", 0)
     source_fd = os.open(str(source), source_flags)
     destination_fd: int | None = None
     try:
@@ -3100,6 +3109,17 @@ def _copy_source_component(
         if final_signature != expected:
             raise BufferMetadataUnreadableError(
                 f"SQLite component {source.name} changed during snapshot",
+            )
+        # Every check above compares the source against itself, so all of
+        # them still pass when the copy is silently short. Size the written
+        # file against the source it was taken from: that is the only
+        # assertion here that can observe a truncated or expanded snapshot,
+        # and classification must never run against one.
+        copied = int(os.fstat(destination_fd).st_size)
+        if copied != expected[2]:
+            raise BufferMetadataUnreadableError(
+                f"classification snapshot of {source.name} is {copied} bytes, "
+                f"expected {expected[2]}",
             )
     finally:
         if destination_fd is not None:

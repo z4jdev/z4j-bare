@@ -27,9 +27,9 @@ from z4j_core.models import Config, DiscoveryHints, RequestContext, User
 class BareFrameworkAdapter:
     """Framework-free adapter.
 
-    Does not integrate with any web framework. Configuration comes
-    either from the explicit ``config`` passed to the constructor or
-    from environment variables read by :func:`z4j_bare.install.build_config`.
+    Does not integrate with any web framework. :func:`install_agent`
+    resolves explicit arguments, environment variables, and defaults before
+    passing the resulting ``Config`` to this constructor.
 
     Attributes:
         name: Always ``"bare"``.
@@ -72,10 +72,9 @@ class BareFrameworkAdapter:
     def fire_startup(self) -> None:
         """Invoke every registered startup hook.
 
-        Called by :class:`z4j_bare.runtime.AgentRuntime` after the
-        transport connects. Exceptions from individual hooks are
-        allowed to propagate to the caller - the runtime wraps this
-        call in a safety boundary.
+        Bare integrations may call this explicitly at their chosen lifecycle
+        boundary. ``AgentRuntime`` does not invoke it automatically. Exceptions
+        from individual hooks propagate to the caller.
         """
         for hook in self._startup_hooks:
             hook()
@@ -83,9 +82,9 @@ class BareFrameworkAdapter:
     def fire_shutdown(self) -> None:
         """Invoke every registered shutdown hook.
 
-        Called during :meth:`AgentRuntime.stop` after the transport
-        is closed. Exceptions are allowed to propagate; the caller
-        handles them.
+        Bare integrations may call this explicitly at their chosen lifecycle
+        boundary. ``AgentRuntime.stop`` does not invoke it automatically.
+        Exceptions propagate to the caller.
         """
         for hook in self._shutdown_hooks:
             hook()

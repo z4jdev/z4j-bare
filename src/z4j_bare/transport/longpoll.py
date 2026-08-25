@@ -1,8 +1,10 @@
-"""HTTPS long-poll fallback transport.
+"""HTTPS long-poll transport.
 
-When the WebSocket path is blocked (some corporate proxies strip
-the ``Upgrade`` header) the agent falls back to two HTTPS
-endpoints exposed by the brain at ``/api/v1/agent/*``:
+Operators select this transport explicitly with
+``transport="longpoll"`` when, for example, a corporate proxy blocks
+WebSocket ``Upgrade`` requests. The runtime does not fall back to it
+automatically. It uses two HTTPS endpoints exposed by the brain at
+``/api/v1/agent/*``:
 
 - ``POST /api/v1/agent/events`` - upload one or more signed v2
   frames produced by :class:`FrameSigner`.
@@ -11,21 +13,17 @@ endpoints exposed by the brain at ``/api/v1/agent/*``:
   for up to ``wait`` seconds, returning immediately on the first
   pending command.
 
-Same authentication (bearer token), same v2 envelope-HMAC framing,
-same routing semantics on the brain side. The only loss vs the
-WebSocket transport is single-frame latency (~50-200 ms per round
-trip vs single-digit ms over an open socket) and the ack-vs-loss
-window: the WebSocket ack is implicit in the next sent frame; the
-long-poll ack is the HTTP 200 itself, so a network drop between
-"brain processed the frame" and "agent received 200" can cause
-the agent to re-send. The brain dedups by ``event_id`` UNIQUE so
-the duplicate is harmless.
+It uses the same bearer authentication and signed v2 envelopes as the
+WebSocket path. A WebSocket event batch is confirmed by an explicit
+signed ``event_batch_ack``; long-poll uses the events POST response.
+A network drop after the brain commits but before the agent receives
+that response can cause an exact replay, which ingestion handles with
+its idempotent event identity and insert key.
 
-The handshake (``hello``/``hello_ack``) is intentionally a no-op
-on this transport - the brain instantiates per-agent
-``FrameSigner``/``FrameVerifier`` lazily on the first
-authenticated request and pins them to the agent's bearer token,
-so we never need an explicit session-establishment frame.
+There is no ``hello``/``hello_ack`` exchange. ``connect()`` performs
+an authenticated, non-claiming command-poll probe, reads the canonical
+agent and project identities from response headers, and constructs the
+per-session signer and verifier with a fresh session nonce.
 """
 
 from __future__ import annotations
@@ -92,8 +90,8 @@ class UploadRetryableError(Exception):
     deadlock / pool timeout / transient skip on the brain).
 
     The whole batch is re-sent after a BACKOFF (the brain dedups
-    already-stored frames by content-derived event_id, so replay is
-    harmless). It must NOT count toward any drop budget: the frames are
+    already-stored events through the idempotent ingestion key). It must
+    NOT count toward any drop budget: the frames are
     deliverable, the brain just could not store them this instant
     Deliberately NOT a:class:`ConnectionError` (a content
     round-trip succeeded; no need to tear down the session).
@@ -124,7 +122,7 @@ class PayloadTooLargeError(Exception):
 
 
 class LongPollTransport:
-    """HTTPS long-poll fallback transport.
+    """HTTPS long-poll transport selected explicitly by configuration.
 
     Public surface mirrors :class:`WebSocketTransport`:
     :meth:`connect`, :meth:`send_frames`, :meth:`receive_frames`,
@@ -168,8 +166,8 @@ class LongPollTransport:
     #: The brain has no ack channel over long-poll: it never signs an
     #: ``event_batch_ack`` into the ``GET /commands`` response (that
     #: route only carries command frames), and the events POST's HTTP
-    #: 200 IS the acknowledgement (the brain dedups by event_id, so a
-    #: replay is harmless). The runtime consults this flag to confirm
+    #: 200 IS the acknowledgement (exact event replays use the brain's
+    #: idempotent ingestion key). The runtime consults this flag to confirm
     #: buffered event_batch entries on a successful send instead of
     #: waiting for an ack frame that never arrives. Without it the send
     #: loop re-drains every unconfirmed batch each iteration and POSTs
@@ -519,8 +517,8 @@ class LongPollTransport:
             # had a TRANSIENT problem storing some frames (a DB deadlock /
             # pool timeout / transient skip). Confirm NOTHING and re-send
             # the whole batch after a backoff. The brain dedups the
-            # already-stored frames by content-derived event_id, so
-            # replay is harmless. This is a transient outcome, NOT a
+            # already-stored events through the idempotent ingestion key.
+            # This is a transient outcome, NOT a
             # content rejection: it must not consume a drop budget
             raise UploadRetryableError(
                 f"long-poll: brain stored {stored}/{len(signed)} frames "

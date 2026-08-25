@@ -1,6 +1,6 @@
 [project]
 name = "z4j-bare"
-version = "1.8.0"
+version = "1.9.0"
 description = "z4j framework-free agent bootstrapper (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,7 +26,7 @@ dependencies = [
     # is tested together, so intra-z4j floors track the wave version.
     # Mixed-version installs are refused rather than half-supported
     # (a 1.6.x mixed-dispatcher install was an RCE re-open, R9-H2).
-    "z4j-core>=1.8.0,<2",
+    "z4j-core>=1.9.0,<2",
     "httpx>=0.28.1",
     "websockets>=16.0",
 ]
@@ -39,12 +39,11 @@ dependencies = [
 z4j-bare = "z4j_bare.cli:main"
 
 [project.optional-dependencies]
-# Filesystem watcher for ``Z4J_DEV_MODE=true``. Lets the agent
-# fire a registry-delta when a ``tasks.py`` changes on disk so
-# the dashboard sees newly-added tasks without a worker
-# restart. Off by default; not loaded unless the env flag is
-# set AND ``z4j-bare[watcher]`` is installed - production
-# images never pull this in.
+# Optional filesystem-watcher dependency. The Celery adapter starts it from
+# its registry subscription when the literal ``Z4J_DEV_MODE`` environment
+# variable is true and discovery supplied app paths. Passing ``dev_mode=True``
+# only as programmatic agent configuration does not activate this watcher, and
+# installing the extra alone does not start it.
 watcher = [
     "watchdog>=6.0",
 ]
@@ -57,7 +56,7 @@ Issues = "https://github.com/z4jdev/z4j-bare/issues"
 Source = "https://github.com/z4jdev/z4j-bare"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
