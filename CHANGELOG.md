@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.1 (2026-08-26)
+
+* Carried with the coordinated fleet release. No adapter behaviour changed.
+
 ## 1.9.0 (2026-08-25)
 
 * An agent rejected by the brain no longer reconnects forever: an unsupported protocol or version now backs off on its own schedule and says what to upgrade, instead of retrying on the transient schedule.
