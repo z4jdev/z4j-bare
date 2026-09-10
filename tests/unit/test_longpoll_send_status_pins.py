@@ -38,6 +38,7 @@ from z4j_bare.transport.longpoll import (
     UploadContentRejectedError,
     UploadRetryableError,
 )
+from z4j_bare.transport.websocket import UndeliverableFrameError
 from z4j_core.errors import AuthenticationError, ProtocolError
 from z4j_core.transport.frames import (
     EventBatchFrame,
@@ -348,4 +349,37 @@ async def test_200_schedule_upgrade_requirement_is_typed_and_unconfirmed(
     t = await _connected_transport()
     with pytest.raises(ProtocolError, match="Boundary-D"):
         await t.send_frames([_event_batch_bytes()])
+    await t.close()
+
+
+async def test_locally_refused_frame_is_reported_not_accepted(fake_httpx) -> None:
+    """A frame the transport cannot parse is never POSTed and is reported as
+    undeliverable, never as accepted: the runtime confirms accepted indices as
+    stored, so an accepted refusal was deleted with no telemetry-loss
+    accounting. It is reported only once the batch outcome is final; a failed
+    POST keeps it buffered for the next attempt, as before.
+    """
+    unreadable = b'{"id": "evb_drift", "type": "from_the_future", "payload": {}}'
+    t = await _connected_transport()
+
+    fake_httpx.post_response = _FakeResponse(status_code=413)
+    with pytest.raises(PayloadTooLargeError):
+        await t.send_frames([unreadable, _event_batch_bytes()])
+
+    fake_httpx.post_response = _FakeResponse(
+        status_code=200,
+        body={"accepted": 1, "rejected": 0, "errors": []},
+    )
+    with pytest.raises(UndeliverableFrameError) as mixed:
+        await t.send_frames([unreadable, _event_batch_bytes()])
+    assert mixed.value.accepted == [1]
+    assert mixed.value.drop_indices == [0]
+    assert len(fake_httpx.posts[-1]["json"]["frames"]) == 1
+
+    posts = len(fake_httpx.posts)
+    with pytest.raises(UndeliverableFrameError) as alone:
+        await t.send_frames([unreadable])
+    assert alone.value.accepted == []
+    assert alone.value.drop_indices == [0]
+    assert len(fake_httpx.posts) == posts  # nothing left to POST
     await t.close()

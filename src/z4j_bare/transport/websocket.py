@@ -845,7 +845,14 @@ class UndeliverableFrameError(Z4JError):
     same connection rather than reconnecting (a reconnect would just re-drain
     and re-raise on the same frame).
 
+    The long-poll transport raises it too, for frames it cannot parse or that
+    are not a signed frame type. Either way the runtime drops them through the
+    buffer's accounted discard, so they are reported as
+    ``content_rejected_frames`` telemetry loss by kind rather than disappearing
+    like a delivered frame.
+
     Attributes:
+
         accepted: Indices actually sent this call -- confirm / register these
             normally.
         drop_indices: Indices of the undeliverable frames to force-purge from

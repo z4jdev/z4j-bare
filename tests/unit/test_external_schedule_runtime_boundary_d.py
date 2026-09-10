@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from z4j_bare.buffer import BufferStore
 from z4j_bare.runtime import AgentRuntime
 from z4j_bare.transport.longpoll import UploadContentRejectedError
@@ -339,12 +340,17 @@ async def test_content_reject_cannot_delete_unacknowledged_projection(
         store.close()
 
 
+@pytest.mark.parametrize("confirm_on_send", [False, True], ids=["websocket", "longpoll"])
 async def test_local_undeliverable_path_retains_projection(
     tmp_path: Path,
+    confirm_on_send: bool,
 ) -> None:
     store = BufferStore(tmp_path / "buffer.sqlite")
     scheduler = _Scheduler()
     runtime = _runtime(store, scheduler)
+    # Long-poll reports its local refusals through the same exception, so a
+    # causal projection it cannot send stays buffered on either transport.
+    runtime._transport = SimpleNamespace(confirm_on_send=confirm_on_send)
     try:
         await runtime.activate_external_schedule_stream(
             {"scheduler": "apscheduler"},

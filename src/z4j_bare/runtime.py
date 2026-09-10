@@ -32,6 +32,7 @@ import os
 import random
 import sys
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -560,6 +561,7 @@ class AgentRuntime:
         schedulers: list[SchedulerAdapter] | None = None,
     ) -> None:
         self.config = config
+        self._telemetry_runtime_id = uuid.uuid4().hex
         self.framework = framework
         self.engines: dict[str, QueueEngineAdapter] = {e.name: e for e in engines}
         self.schedulers: dict[str, SchedulerAdapter] = {s.name: s for s in (schedulers or [])}
@@ -1340,6 +1342,8 @@ class AgentRuntime:
                 stop_event=self._stop_event,
                 interval=10.0,
                 health_provider=_collect_engine_health,
+                engines=self.engines,
+                runtime_id=f"{self._telemetry_runtime_id}:{os.getpid()}",
                 status_provider=_collect_agent_status,
             )
         else:
@@ -2829,7 +2833,10 @@ class AgentRuntime:
         undeliverable ``event_batch`` can still peek to a real frame_id, so
         registering it would defer an ``event_batch_ack`` that never arrives and
         pin the buffer head forever -- the exact loop this drop exists to
-        eliminate.
+        eliminate. The purge is an accounted discard, never a confirm: these
+        frames never reached the brain, so they are reported as
+        ``content_rejected_frames`` loss by kind (the local twin of a brain
+        content rejection) instead of vanishing as if delivered.
         """
         now = datetime.now(UTC)
         # A partial ship is forward progress; reset the transient backoff.
@@ -2839,13 +2846,15 @@ class AgentRuntime:
         protected = [
             entries[i] for i in exc.drop_indices if entries[i].kind == EXTERNAL_SCHEDULE_ENTRY_KIND
         ]
-        purge = confirm_now + [
+        undeliverable = [
             entries[i].id
             for i in exc.drop_indices
             if entries[i].kind != EXTERNAL_SCHEDULE_ENTRY_KIND
         ]
-        if purge:
-            buffer.confirm(purge)
+        if confirm_now:
+            buffer.confirm(confirm_now)
+        if undeliverable:
+            buffer.discard(undeliverable, reason="content_rejected_frames")
         if protected:
             logger.critical(
                 "retaining %d locally-undeliverable external schedule "
@@ -2961,15 +2970,18 @@ class AgentRuntime:
             return
 
         # An isolated CONTROL frame cannot be split or re-batched and
-        # would pin the send queue indefinitely. Drop it now (confirm =
-        # delete) so data frames behind it keep flowing.
+        # would pin the send queue indefinitely. Drop it now so data frames
+        # behind it keep flowing. It never reached the brain, so it goes
+        # through the accounted discard (``content_rejected_frames``, counted
+        # by kind), never a confirm: confirm is the delivery path and would
+        # hide the loss from the heartbeat and status reports.
         logger.error(
             "dropping undeliverable %s control frame (entry %d): %s",
             entry.kind,
             entry.id,
             type(exc).__name__,
         )
-        buffer.confirm([entry.id])
+        buffer.discard([entry.id], reason="content_rejected_frames")
         # Offender gone -- restore full width.
         self._send_batch_size = _SEND_BATCH_SIZE
 

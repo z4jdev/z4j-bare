@@ -299,7 +299,8 @@ async def test_runtime_purges_undeliverable_event_batch_without_registering(
 ) -> None:
     """The re-review finding + round-9 H2: on the WS defer-acks path, an
     undeliverable event_batch reported via UndeliverableFrameError must be
-    buffer.confirm'd (purged) and NEVER registered in _pending_acks (which
+    purged through the buffer's accounted discard, never confirmed, and NEVER
+    registered in _pending_acks (which
     would await an ack that can never arrive -> infinite ~90s resend loop +
     buffer-head pin)."""
     buffer = BufferStore(tmp_path / "oversize-buf.sqlite")

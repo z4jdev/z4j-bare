@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import json
 import logging
 import math
 import os
@@ -58,6 +59,23 @@ from z4j_bare.storage import (
 )
 
 logger = logging.getLogger("z4j.runtime.buffer")
+
+_LOSS_COUNTERS = (
+    "capacity_evicted_frames",
+    "content_rejected_frames",
+    "event_records",
+    "command_results",
+    "other_frames",
+    "unclassified_frames",
+)
+
+#: Why a frame was discarded. An accounted discard adds one to exactly one of
+#: these, plus its kind's category above (``event_records`` counts the records
+#: inside a readable batch rather than the frame).
+_LOSS_REASONS = (
+    "capacity_evicted_frames",
+    "content_rejected_frames",
+)
 
 
 _SCHEMA = """
@@ -2219,6 +2237,39 @@ class BufferStore:
             self._cached_count -= removed_count
             self._cached_bytes -= removed_bytes
 
+    def discard(self, ids: list[int], *, reason: str) -> int:
+        """Delete entries the brain never received and account them as loss.
+
+        The counterpart of :meth:`confirm` for a frame the agent gives up on
+        without delivering it: one the transport refused locally (unparseable,
+        not a signed frame type, or larger than the brain accepts) or an
+        isolated control frame the brain rejected. :meth:`confirm` is the delivery path;
+        using it here would hide the loss from the heartbeat and status reports.
+
+        Counting goes through :meth:`_discard_entries_locked`, shared with
+        capacity eviction and :meth:`evict_if_exhausted`, so it is by kind and
+        commits in the same savepoint as the deletion. Only rows still present
+        are counted, so a repeated or stale call counts each entry exactly
+        once. Causal external schedule projections are never discarded here;
+        they leave the buffer only on a brain acknowledgement. Returns the
+        number of entries removed.
+        """
+        if reason not in _LOSS_REASONS:
+            raise ValueError(f"unknown telemetry loss reason: {reason!r}")
+        if not ids:
+            return 0
+        with self._lock:
+            if not self._operational_in_current_process():
+                return 0
+            placeholders = ",".join("?" * len(ids))
+            rows = self._conn.execute(
+                f"SELECT id, kind, payload FROM entries WHERE kind <> ? AND id IN ({placeholders})",  # noqa: S608  bound '?' params
+                (EXTERNAL_SCHEDULE_ENTRY_KIND, *ids),
+            ).fetchall()
+            if rows:
+                self._discard_entries_locked(rows, reason=reason)
+        return len(rows)
+
     def increment_attempts(self, ids: list[int]) -> None:
         """Increment the ``attempts`` METRIC counter for a batch of entries.
 
@@ -2278,23 +2329,18 @@ class BufferStore:
             if not self._operational_in_current_process():
                 return 0
             placeholders = ",".join("?" * len(ids))
-            row = self._conn.execute(
-                f"SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) FROM entries WHERE content_rejects >= ? AND kind <> ? AND id IN ({placeholders})",  # noqa: S608  bound '?' params
+            rows = self._conn.execute(
+                f"SELECT id, kind, payload FROM entries WHERE content_rejects >= ? AND kind <> ? AND id IN ({placeholders})",  # noqa: S608  bound '?' params
                 (max_rejects, EXTERNAL_SCHEDULE_ENTRY_KIND, *ids),
-            ).fetchone()
-            dropped_count, dropped_bytes = int(row[0]), int(row[1])
+            ).fetchall()
+            dropped_count = len(rows)
             if dropped_count == 0:
                 return 0
-            self._conn.execute(
-                f"DELETE FROM entries WHERE content_rejects >= ? AND kind <> ? AND id IN ({placeholders})",  # noqa: S608  bound '?' params
-                (max_rejects, EXTERNAL_SCHEDULE_ENTRY_KIND, *ids),
-            )
-            self._cached_count -= dropped_count
-            self._cached_bytes -= dropped_bytes
+            self._discard_entries_locked(rows, reason="content_rejected_frames")
         logger.warning(
             "z4j agent buffer dropped %d entr%s after %d content "
             "rejections (brain kept rejecting this specific frame's "
-            "content); events dropped",
+            "content); frames dropped",
             dropped_count,
             "y" if dropped_count == 1 else "ies",
             max_rejects,
@@ -2304,6 +2350,73 @@ class BufferStore:
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
+
+    def loss_snapshot(self) -> dict[str, int | str]:
+        """Return committed cumulative loss for this buffer file.
+
+        Counters and removal share a SQLite savepoint, including when nested
+        in a projection transaction. Rollback cannot report a phantom loss.
+        Normal acknowledgement is deliberately outside this path.
+        """
+        with self._lock:
+            if not self._operational_in_current_process():
+                raise RuntimeError("BufferStore is not operational")
+            return self._loss_snapshot_locked()
+
+    def _loss_snapshot_locked(self) -> dict[str, int | str]:
+        raw = _read_buffer_meta(self._conn, "telemetry_loss_v1")
+        counters = json.loads(raw) if raw else {}
+        buffer_id = _read_buffer_uuid(self._conn) or _read_buffer_meta(
+            self._conn, "telemetry_loss_id"
+        )
+        if buffer_id is None:
+            # Legacy/unattributed stores have no sealed-buffer UUID.
+            buffer_id = uuid.uuid4().hex
+            self._conn.execute(
+                "INSERT INTO _meta(key, value) VALUES ('telemetry_loss_id', ?)", (buffer_id,)
+            )
+        return {
+            "buffer_id": buffer_id,
+            **{key: int(counters.get(key, 0)) for key in _LOSS_COUNTERS},
+        }
+
+    def _discard_entries_locked(self, rows: list[tuple[int, str, bytes]], *, reason: str) -> None:
+        counters = self._loss_snapshot_locked()
+        counters[reason] = int(counters[reason]) + len(rows)
+        for _entry_id, kind, payload in rows:
+            category = "other_frames"
+            count = 1
+            if kind == "event_batch":
+                # Decode only on the loss path, never on successful append.
+                # Invalid batches cannot honestly be reported as zero events.
+                try:
+                    frame = json.loads(payload)
+                    events = frame["payload"]["events"]
+                    if not isinstance(events, list) or not all(
+                        isinstance(event, dict) for event in events
+                    ):
+                        raise ValueError("invalid event batch")  # noqa: TRY301  classified below
+                    category, count = "event_records", len(events)
+                except (ValueError, TypeError, KeyError, RecursionError):
+                    category = "unclassified_frames"
+            elif kind == "command_result":
+                category = "command_results"
+            counters[category] = int(counters[category]) + count
+        stored = {key: min(int(counters[key]), 2**53 - 1) for key in _LOSS_COUNTERS}
+        self._conn.execute("SAVEPOINT telemetry_loss")
+        try:
+            self._conn.executemany("DELETE FROM entries WHERE id = ?", [(r[0],) for r in rows])
+            self._conn.execute(
+                "INSERT OR REPLACE INTO _meta(key, value) VALUES ('telemetry_loss_v1', ?)",
+                (json.dumps(stored),),
+            )
+            self._conn.execute("RELEASE SAVEPOINT telemetry_loss")
+        except BaseException:
+            self._conn.execute("ROLLBACK TO SAVEPOINT telemetry_loss")
+            self._conn.execute("RELEASE SAVEPOINT telemetry_loss")
+            raise
+        self._cached_count -= len(rows)
+        self._cached_bytes -= sum(len(r[2]) for r in rows)
 
     def size(self) -> int:
         """Number of entries currently in the buffer.
@@ -2421,21 +2534,13 @@ class BufferStore:
         in lockstep with the underlying table without re-running SUM().
         """
         row = self._conn.execute(
-            "SELECT id, LENGTH(payload) FROM entries WHERE kind <> ? ORDER BY id ASC LIMIT 1",
+            "SELECT id, kind, payload FROM entries WHERE kind <> ? ORDER BY id ASC LIMIT 1",
             (EXTERNAL_SCHEDULE_ENTRY_KIND,),
         ).fetchone()
         if row is None:
             return False
-        oldest_id, payload_len = int(row[0]), int(row[1])
-        cursor = self._conn.execute(
-            "DELETE FROM entries WHERE id = ?",
-            (oldest_id,),
-        )
-        if cursor.rowcount > 0:
-            self._cached_count -= 1
-            self._cached_bytes -= payload_len
-            return True
-        return False
+        self._discard_entries_locked([row], reason="capacity_evicted_frames")
+        return True
 
     # ------------------------------------------------------------------
     # Shutdown

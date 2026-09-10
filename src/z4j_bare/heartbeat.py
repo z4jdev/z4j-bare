@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +28,7 @@ from z4j_core.transport.frames import (
     AgentStatusPayload,
     HeartbeatFrame,
     HeartbeatPayload,
+    TelemetryLossPayload,
     serialize_frame,
 )
 
@@ -67,12 +70,17 @@ class Heartbeat:
         interval: float = 10.0,
         health_provider: Callable[[], dict[str, str]] | None = None,
         status_provider: Callable[[], dict[str, Any]] | None = None,
+        engines: dict[str, Any] | None = None,
+        runtime_id: str | None = None,
     ) -> None:
         self.buffer = buffer
         self.stop_event = stop_event
         self.interval = interval
         self._last_flush_at: datetime | None = None
         self._dropped_events = 0
+        self._loss_lock = threading.Lock()
+        self._engines = engines or {}
+        self._runtime_id = runtime_id or uuid.uuid4().hex
         self._health_provider = health_provider
         self._status_provider = status_provider
 
@@ -91,10 +99,32 @@ class Heartbeat:
     def record_dropped(self, count: int) -> None:
         """Increment the lifetime dropped-event counter.
 
-        Called when the buffer's eviction logic drops an event. Used
-        by metrics and surfaced to the brain via heartbeat.
+        Compatibility hook for callers with additional event loss. Buffer
+        and adapter loss is collected directly, without this callback.
         """
-        self._dropped_events += count
+        if type(count) is not int or count < 0:
+            raise ValueError("count must be a non-negative integer")
+        with self._loss_lock:
+            self._dropped_events = min(self._dropped_events + count, 10_000_000)
+
+    def _loss_snapshot(self) -> TelemetryLossPayload:
+        # These optional adapter properties are in-memory counters. Do not
+        # route loss accounting through broker-dependent health providers.
+        adapters: dict[str, int] = {}
+        for name, engine in list(self._engines.items())[:32]:
+            try:
+                count = getattr(engine, "dropped_event_count", None)
+                if type(count) is int and count >= 0 and 0 < len(name) <= 64:
+                    adapters[name] = min(count, 2**53 - 1)
+            except Exception:
+                logger.exception("z4j agent: adapter loss counter unavailable (%s)", name)
+        return TelemetryLossPayload.model_validate(
+            {
+                **self.buffer.loss_snapshot(),
+                "runtime_id": self._runtime_id,
+                "adapter_events": adapters,
+            }
+        )
 
     async def run(self) -> None:
         """Run the heartbeat loop until ``stop_event`` is set.
@@ -159,13 +189,23 @@ class Heartbeat:
             # ``{"error": "shutting_down"}`` health blob.
             if adapter_health.get("error") == "shutting_down":
                 return
+        try:
+            loss = self._loss_snapshot()
+        except RuntimeError:
+            return  # Buffer closed during the provider call.
+        with self._loss_lock:
+            dropped_events = min(
+                self._dropped_events + loss.event_records + sum(loss.adapter_events.values()),
+                10_000_000,
+            )
         frame = HeartbeatFrame(
             id=self._new_id(),
             ts=datetime.now(UTC),
             payload=HeartbeatPayload(
                 buffer_size=self.buffer.size(),
                 last_flush_at=self._last_flush_at,
-                dropped_events=self._dropped_events,
+                dropped_events=dropped_events,
+                telemetry_loss=loss,
                 adapter_health=adapter_health,
             ),
         )
@@ -194,9 +234,7 @@ class Heartbeat:
             "on",
         ):
             return
-        if self.stop_event.is_set():
-            return
-        if self._status_provider is None:
+        if self.stop_event.is_set() or self._status_provider is None:
             # No supervisor wired the provider in. Don't emit a
             # half-empty frame; the brain treats absence as "agent
             # doesn't speak this protocol version yet" rather than
@@ -217,7 +255,9 @@ class Heartbeat:
         if not status:
             return
         try:
-            payload = AgentStatusPayload(**status)
+            payload = AgentStatusPayload(**{**status, "telemetry_loss": self._loss_snapshot()})
+        except RuntimeError:
+            return  # Buffer closed while the status provider was running.
         except Exception:
             logger.exception("z4j agent: status provider returned invalid shape")
             return

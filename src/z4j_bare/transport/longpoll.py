@@ -53,7 +53,7 @@ from z4j_core.version import (
     __version__ as CORE_VERSION,  # noqa: N812  conventional version constant alias
 )
 
-from z4j_bare.transport.websocket import AGENT_RUNTIME_FEATURES
+from z4j_bare.transport.websocket import AGENT_RUNTIME_FEATURES, UndeliverableFrameError
 
 logger = logging.getLogger("z4j.transport.longpoll")
 
@@ -119,6 +119,26 @@ class PayloadTooLargeError(Exception):
     NOT on the first failure (a transient/proxy 413 must not lose a
     deliverable frame). Not a:class:`ConnectionError`.
     """
+
+
+def _accepted_or_undeliverable(accepted: list[int], drop_indices: list[int]) -> list[int]:
+    """Return ``accepted``, or raise for the frames refused locally.
+
+    Called only once a batch's outcome is final (every signed frame stored,
+    or nothing left to POST), so a refused frame leaves the buffer at the same
+    point it always did. It is reported through
+    :class:`UndeliverableFrameError`, never as accepted: the runtime confirms
+    accepted indices as stored, which would hide the discard from the
+    buffer's telemetry-loss accounting.
+    """
+    if drop_indices:
+        raise UndeliverableFrameError(
+            f"{len(drop_indices)} frame(s) are undeliverable "
+            "(unparseable or not a signed frame type)",
+            accepted=accepted,
+            drop_indices=drop_indices,
+        )
+    return accepted
 
 
 class LongPollTransport:
@@ -439,16 +459,22 @@ class LongPollTransport:
     ) -> list[int]:
         """Sign + POST each buffered frame, return accepted indices.
 
-        Mirrors :meth:`WebSocketTransport.send_frames` exactly so
-        the runtime's send loop is transport-agnostic. A frame
-        that fails to parse from the buffer is logged and
-        "accepted" so the buffer purges it - re-sending bytes we
-        cannot authenticate is worse than dropping them.
+        Mirrors :meth:`WebSocketTransport.send_frames` so the runtime's
+        send loop is transport-agnostic. A frame that fails to parse
+        from the buffer, or is not a signed frame type, is logged and
+        never POSTed - re-sending bytes we cannot authenticate is worse
+        than dropping them. It is reported through
+        :class:`UndeliverableFrameError`, not as accepted, so the runtime
+        discards it as counted telemetry loss instead of confirming it as
+        if the brain had stored it.
         """
         if self._client is None or self._signer is None:
             raise ConnectionError("long-poll transport not connected")
 
         accepted: list[int] = []
+        # Frames refused locally. They are reported only once the POST outcome
+        # is final, so a failed POST keeps them for the next attempt as before.
+        drop_indices: list[int] = []
         signed: list[tuple[int, str]] = []
         for idx, raw in enumerate(frames):
             try:
@@ -457,14 +483,14 @@ class LongPollTransport:
                 logger.exception(
                     "z4j longpoll: dropping unparseable buffered frame",
                 )
-                accepted.append(idx)
+                drop_indices.append(idx)
                 continue
             if not isinstance(parsed, _SignedFrameBase):
                 logger.error(
                     "z4j longpoll: refusing to send unsigned %s frame",
                     getattr(parsed, "type", None),
                 )
-                accepted.append(idx)
+                drop_indices.append(idx)
                 continue
             try:
                 signed.append((idx, self._signer.sign_and_serialize(parsed).decode("utf-8")))
@@ -474,7 +500,7 @@ class LongPollTransport:
                 ) from exc
 
         if not signed:
-            return accepted
+            return _accepted_or_undeliverable(accepted, drop_indices)
 
         async with self._send_lock:
             try:
@@ -512,7 +538,7 @@ class LongPollTransport:
             stored = raw if isinstance(raw, int) and not isinstance(raw, bool) else -1
             if stored == len(signed):
                 accepted.extend(idx for idx, _ in signed)
-                return accepted
+                return _accepted_or_undeliverable(accepted, drop_indices)
             # Stored fewer than sent (or a malformed count): the brain
             # had a TRANSIENT problem storing some frames (a DB deadlock /
             # pool timeout / transient skip). Confirm NOTHING and re-send

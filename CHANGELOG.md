@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.11.0 (2026-09-10)
+
+* Count buffer telemetry loss durably. Capacity eviction and content
+  rejection now record what they discard (frames by reason, event records in
+  readable batches, command results, other and unclassified frames) in the
+  buffer file, in the same SQLite savepoint as the deletion, so a rolled-back
+  deletion reports no loss and a normal acknowledgement never counts as loss.
+  Content rejection covers an event batch the brain keeps rejecting, an
+  isolated control frame the brain rejects, and a frame the transport cannot
+  parse, that is not a signed frame type, or that exceeds the brain's frame
+  limit. `BufferStore.discard()` removes such undelivered entries with this
+  accounting, and `BufferStore.loss_snapshot()` returns the counters. They
+  are stored in the buffer file, and an agent creates a new buffer file, with
+  a new identity, each time it starts, so they start at zero after a restart.
+* Heartbeat and agent-status frames now carry these counters as
+  `telemetry_loss`, with the runtime identity and the in-memory event-loss
+  count of each engine adapter that exposes `dropped_event_count` (Celery and
+  RQ). Loss is still reported when the broker-health provider fails. The
+  heartbeat's `dropped_events` total now adds buffer event records and adapter
+  event loss (capped at 10,000,000); before, it counted only
+  `record_dropped()` calls, which no z4j package made, so it normally read 0.
+* `Heartbeat.record_dropped()` now raises `ValueError` for a bool, a non-int
+  or a negative count instead of adding it. `Heartbeat` also accepts optional
+  `engines` and `runtime_id` arguments.
+* Align runtime version metadata and sibling dependency floors with the coordinated 1.11.0 release.
+
+
 ## 1.10.0 (2026-08-28)
 
 * Carried with the coordinated fleet release. No behaviour changed.
