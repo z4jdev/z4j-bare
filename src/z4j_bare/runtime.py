@@ -3268,6 +3268,37 @@ def _prefer_supervisor_failure(
 _LOG_SUMMARY_EVERY = 10
 
 
+def _auth_rejection_detail(err: BaseException) -> str:
+    """What the brain said when it refused the agent, as a log suffix.
+
+    A bare "brain rejected agent token" reads as "rotate the token", which
+    is the wrong remedy for an address outside the allowlist or an archived
+    project, and the rotation then costs an outage of its own. The transports
+    carry the WebSocket close code, or the HTTP status and the brain's error
+    code, plus the brain's reason text in the error details; this renders
+    them as " (close code 4403, reason: ip denied)" so the one WARNING an
+    operator sees names the refusal. Empty when the error carries no
+    details, so the message reads as before.
+    """
+    details = getattr(err, "details", None)
+    if not isinstance(details, dict):
+        return ""
+    parts: list[str] = []
+    close_code = details.get("close_code")
+    if isinstance(close_code, int) and not isinstance(close_code, bool):
+        parts.append(f"close code {close_code}")
+    status = details.get("status")
+    if isinstance(status, int) and not isinstance(status, bool):
+        parts.append(f"HTTP {status}")
+    error = details.get("error")
+    if isinstance(error, str) and error:
+        parts.append(f"error {error}")
+    reason = details.get("reason")
+    if isinstance(reason, str) and reason:
+        parts.append(f"reason: {reason}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _log_disconnect(
     error_class: str,
     err: BaseException,
@@ -3297,11 +3328,15 @@ def _log_disconnect(
         # an explicit pointer to the per-attempt DEBUG channel for
         # operators who want the firehose.
         if error_class == "auth":
+            # The suffix names the refusal (close code or HTTP status, the
+            # brain's error code and reason) so an IP denial or an archived
+            # project is not read as a token problem.
             logger.warning(
-                "z4j agent auth rejected: %s. Will retry with backoff "
+                "z4j agent auth rejected: %s%s. Will retry with backoff "
                 "(10min cap). Subsequent identical failures suppressed; "
                 "set the z4j.agent logger to DEBUG to see every attempt.",
                 err,
+                _auth_rejection_detail(err),
             )
         elif error_class == "incompatible":
             # ERROR, not WARNING: nothing this agent does will clear it, and

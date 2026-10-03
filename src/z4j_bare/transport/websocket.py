@@ -14,6 +14,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
+from typing import Any
 from urllib.parse import urlparse
 
 import websockets
@@ -105,6 +106,75 @@ def _ws_close_code(exc: Exception) -> int | None:
         return code
     direct = getattr(exc, "code", None)
     return direct if isinstance(direct, int) else None
+
+
+def _ws_close_reason(exc: Exception) -> str:
+    """The reason text of the received Close frame, or ``""``.
+
+    Same two shapes as :func:`_ws_close_code`. The brain puts a short
+    operator-facing phrase here ("ip denied", "bad bearer"); it is carried
+    into the error details so the supervisor's one WARNING can say which
+    refusal this was.
+    """
+    rcvd = getattr(exc, "rcvd", None)
+    reason = getattr(rcvd, "reason", None)
+    if isinstance(reason, str):
+        return reason
+    direct = getattr(exc, "reason", None)
+    return direct if isinstance(direct, str) else ""
+
+
+def _handshake_rejection(exc: Exception) -> Exception | None:
+    """The non-transient verdict a close during the handshake carries, if any.
+
+    The brain accepts the HTTP upgrade and then closes: 4401 for a bad or
+    revoked token (or a project archived at connect), 4403 for a source
+    address outside the agent allowlist, and the terminal codes for a build
+    it will never accept. Which client call observes that close is a race.
+    When the close frame is processed before the hello ``send()``, the send
+    raises ``ConnectionClosed``; otherwise the ``recv()`` does. Both
+    handshake branches run this one table, so the verdict does not depend
+    on timing. It used to: only the ``recv`` branch classified, so a brain
+    that closes before reading the hello (the allowlist path does, every
+    time) landed on the fast reconnect schedule as a bare ConnectionError.
+
+    4401 and 4403 become :class:`AuthenticationError`, which the runtime
+    backs off on its auth schedule (10 s to 10 min) instead of hammering a
+    brain that will answer the same way. The terminal codes become
+    :class:`AgentIncompatibleError`: reconnecting cannot fix these, the
+    brain has judged this agent build unusable, and the supervisor gives
+    that its own long schedule, because a version mismatch is resolved by
+    upgrading something, not by reconnecting. They are handled here BEFORE
+    the brain ever sends them: a brain that started closing on version skew
+    today would be rejecting precisely the old agents that lack this
+    branch, and those agents would read the close as a transient blip and
+    reconnect-storm. Shipping the client side first is what makes
+    enforcement safe in a later release, as Celery did for the v1 to v2
+    task protocol (3.1.25 taught the old side to cope first).
+
+    Returns None for a close the normal reconnect schedule should handle
+    (a rate limit, a replaced connection, a brain-side error, a blip).
+    """
+    code = _ws_close_code(exc)
+    if code is None:
+        return None
+    details: dict[str, Any] = {"close_code": code}
+    reason = _ws_close_reason(exc)
+    if reason:
+        details["reason"] = reason
+    if code == 4401:
+        return AuthenticationError("brain rejected agent token", details=details)
+    if code == 4403:
+        # The token is fine; the address is not admitted. Saying "token"
+        # here sends the operator to rotate a credential that is not at
+        # fault.
+        return AuthenticationError("brain refused the agent", details=details)
+    if code in _TERMINAL_CLOSE_CODES:
+        return AgentIncompatibleError(
+            _TERMINAL_CLOSE_CODES[code],
+            details={"close_code": code},
+        )
+    return None
 
 
 #: RH1: runtime feature flags this z4j-bare build advertises in its handshake
@@ -279,7 +349,9 @@ class WebSocketTransport:
         """Establish the WebSocket + negotiate the ``hello`` handshake.
 
         Raises:
-            AuthenticationError: The brain rejected the token (HTTP 401).
+            AuthenticationError: The brain rejected the token (HTTP 401 on
+                the upgrade, or a 4401 close), or refused the agent's
+                address (a 4403 close), whichever handshake call saw it.
             ProtocolError: The brain refused the protocol version.
             ConnectionError: Any transport-level failure.
             ValueError: Plain-``ws://`` (non-TLS) was requested to a
@@ -406,6 +478,13 @@ class WebSocketTransport:
             await self._ws.send(serialize_frame(hello))
         except WebSocketException as exc:
             await self._close_ws()
+            # A brain that closes before it reads the hello (the allowlist
+            # check does, with 4403) is observed HERE, not on the recv
+            # below. Same close-code table on both branches, or the verdict
+            # depends on which call happened to see the close frame.
+            rejection = _handshake_rejection(exc)
+            if rejection is not None:
+                raise rejection from exc
             raise ConnectionError(f"failed to send hello frame: {exc}") from exc
 
         # Wait for hello_ack.
@@ -417,42 +496,14 @@ class WebSocketTransport:
         except WebSocketException as exc:
             await self._close_ws()
             # B23: the brain accepts the HTTP upgrade, then closes with
-            # 4401 (bad/revoked token) or 4403 (forbidden) when it
-            # validates the bearer. That surfaces here as a ConnectionClosed
-            # -- an AUTH failure, not a transient network blip. Classifying
-            # it as AuthenticationError lets the runtime apply the
-            # auth-backoff schedule (and log the real reason) instead of
-            # hammering reconnects on a token that will never work.
-            code = _ws_close_code(exc)
-            if code in (4401, 4403):
-                raise AuthenticationError(
-                    "brain rejected agent token",
-                    details={"close_code": code},
-                ) from exc
-            if code in _TERMINAL_CLOSE_CODES:
-                # Reconnecting cannot fix these: the brain has judged this
-                # agent build unusable, so surface a ProtocolError, which the
-                # runtime backs off separately from transient connection
-                # failures instead of retrying on the normal schedule.
-                #
-                # The supervisor gives this its own long schedule, because a
-                # version mismatch is resolved by upgrading something, not by
-                # reconnecting. Raising a plain ProtocolError here put it on
-                # the transient 1s..60s schedule and retried forever, which is
-                # the reconnect storm this branch exists to prevent.
-                #
-                # Handled here BEFORE the brain ever sends them. A brain that
-                # started closing on version skew today would be rejecting
-                # precisely the old agents that lack this branch, and those
-                # agents would read the close as a transient blip and
-                # reconnect-storm. Shipping the client side first is what makes
-                # enforcement safe in a later release. Celery did the same for
-                # the v1 -> v2 task protocol: 3.1.25 taught the old side to
-                # cope, and only then did the new side change.
-                raise AgentIncompatibleError(
-                    _TERMINAL_CLOSE_CODES[code],
-                    details={"close_code": code},
-                ) from exc
+            # 4401 (bad/revoked token) or 4403 (address not admitted) when
+            # it validates the bearer, or with a terminal code for a build
+            # it refuses. That surfaces here as a ConnectionClosed, not a
+            # transient network blip; see _handshake_rejection for the
+            # schedules each verdict lands on.
+            rejection = _handshake_rejection(exc)
+            if rejection is not None:
+                raise rejection from exc
             raise ConnectionError(f"failed to receive hello_ack: {exc}") from exc
 
         ack = parse_frame(raw)

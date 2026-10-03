@@ -16,7 +16,7 @@ used indirectly by those framework adapters too.
 
 Python 3.11+. No framework or engine pinned; pair with whichever engine adapter your worker runs (`z4j-celery`, `z4j-rq`, `z4j-dramatiq`, `z4j-huey`, `z4j-arq`, `z4j-taskiq`) and that adapter carries the engine-version floor.
 
-Full per-adapter matrix at <https://z4j.dev/reference/compatibility/>.
+Full per-adapter matrix at <https://docs.z4j.com/reference/compatibility/>.
 
 ## What it ships
 
@@ -76,7 +76,7 @@ install_agent(
 
 ## Documentation
 
-Full docs at [z4j.dev/frameworks/bare/](https://z4j.dev/frameworks/bare/).
+Full docs at [docs.z4j.com/frameworks/bare/](https://docs.z4j.com/frameworks/bare/).
 
 ## License
 
@@ -85,7 +85,7 @@ Apache-2.0, see [LICENSE](LICENSE).
 ## Links
 
 - Homepage: https://z4j.com
-- Documentation: https://z4j.dev
+- Documentation: https://docs.z4j.com
 - PyPI: https://pypi.org/project/z4j-bare/
 - Issues: https://github.com/z4jdev/z4j-bare/issues
 - Changelog: [CHANGELOG.md](CHANGELOG.md)

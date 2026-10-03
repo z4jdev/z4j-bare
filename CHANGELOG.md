@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.12.0 (2026-10-03)
+
+* Dispatch the `dlq.list` command onto `adapter.list_dead_letters` and
+  serialise the returned page into the command result. The dispatcher
+  refuses the action fail-closed unless the adapter advertises the
+  `list_dead_letters` capability, and the capability gate runs before any
+  parameter is read; an adapter that advertises the capability but lacks
+  the method is refused the same way. `queue` must be a string or null,
+  `limit` a positive integer (clamped to 200, default 100), and `cursor` a
+  string or null; anything else fails the command with a named error
+  without reaching the adapter.
+* An agent the brain refuses for its standing no longer reconnects on the
+  fast schedule. The long-poll transport treats a `403` whose body says
+  `project_inactive` or `ip_denied` as an authentication failure on the
+  connect probe, the events POST and the command poll (any other `403` stays
+  transient), and the WebSocket transport classifies a close that lands on
+  the hello send with the same table as one that lands on the hello_ack
+  receive, so a brain that closes 4401, 4403 or a terminal code before
+  reading the hello no longer surfaces as a bare connection error. The
+  supervisor's auth WARNING now carries the close code or HTTP status, the
+  brain's error code and its reason text, so an address denial or an
+  archived project is not read as a token to rotate.
+
 ## 1.11.0 (2026-09-10)
 
 * Count buffer telemetry loss durably. Capacity eviction and content

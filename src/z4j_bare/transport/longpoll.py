@@ -32,6 +32,7 @@ import asyncio
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -82,6 +83,51 @@ logger = logging.getLogger("z4j.transport.longpoll")
 #: overflow. Treating 400 as content-drop instead would re-introduce the far
 #: more common host-skew mass-loss, so retryable is the least-bad choice.
 _CONTENT_REJECT_STATUSES: frozenset[int] = frozenset({415, 422})
+
+#: ``error`` codes of a 403 body that describe the agent's standing rather
+#: than this request: the project is archived (``project_inactive``) or the
+#: source address is outside the agent allowlist (``ip_denied``). The bearer
+#: is valid in both cases, yet nothing the agent does on its own changes the
+#: answer, so retrying every 1 to 30 s is a storm against a brain that will
+#: say the same thing. These take the authentication backoff (10 s to 10
+#: min), the schedule the WebSocket path gives the 4401 and 4403 closes. A
+#: 403 with any other body (a WAF, a proxy, a mixed deploy) stays transient.
+_AUTH_REFUSAL_CODES: frozenset[str] = frozenset({"project_inactive", "ip_denied"})
+
+
+def _refusal_from_403(r: httpx.Response, *, during: str) -> AuthenticationError | None:
+    """The auth error a 403 carries, or None when it is a transient 403.
+
+    Reads the brain's error body (``error`` and ``message``). A 403 whose
+    body is not JSON, not an object, or names any other code is left for
+    the caller to raise as a transient ConnectionError. The code and the
+    brain's message are logged here and carried in the error details, so
+    the supervisor's one WARNING names the refusal instead of sending the
+    operator to rotate a token that is not at fault.
+    """
+    if r.status_code != 403:
+        return None
+    try:
+        body = r.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    code = body.get("error")
+    if not isinstance(code, str) or code not in _AUTH_REFUSAL_CODES:
+        return None
+    message = body.get("message")
+    reason = message if isinstance(message, str) else ""
+    logger.info(
+        "z4j longpoll: brain refused the agent during %s: HTTP 403 %s (%s)",
+        during,
+        code,
+        reason or "no message",
+    )
+    details: dict[str, Any] = {"status": 403, "error": code}
+    if reason:
+        details["reason"] = reason
+    return AuthenticationError("brain refused the agent", details=details)
 
 
 class UploadRetryableError(Exception):
@@ -286,8 +332,9 @@ class LongPollTransport:
 
         Raises:
             AuthenticationError: The brain rejected the bearer token
-                (HTTP 401 on a probe ping).
-            ConnectionError: Brain unreachable.
+                (HTTP 401 on a probe ping), or refused the agent with a
+                403 whose body says ``project_inactive`` or ``ip_denied``.
+            ConnectionError: Brain unreachable, or any other non-200.
             ValueError: ``http://`` (non-TLS) URL requested without
                 ``dev_mode``. The bearer token would travel in
                 cleartext on every request.
@@ -366,6 +413,10 @@ class LongPollTransport:
                 "brain rejected agent token",
                 details={"status": 401},
             )
+        refusal = _refusal_from_403(r, during="connect probe")
+        if refusal is not None:
+            await self._close_client()
+            raise refusal
         if r.status_code != 200:
             await self._close_client()
             raise ConnectionError(
@@ -519,6 +570,13 @@ class LongPollTransport:
                 "brain rejected agent token mid-session",
                 details={"status": 401},
             )
+        # An archived project or a denied address is a 403 that names the
+        # agent's standing, not this batch: the frames stay buffered and the
+        # supervisor reconnects on the auth schedule. Any other 403 falls
+        # through to the transient path below.
+        refusal = _refusal_from_403(r, during="send")
+        if refusal is not None:
+            raise refusal
         if r.status_code == 200:
             try:
                 body = r.json()
@@ -565,8 +623,9 @@ class LongPollTransport:
             )
         # Everything else -- 3xx redirects (follow disabled, so the body
         # never reached the handler), a bare 400 (request-level host
-        # validation / proxy / WAF, NOT per-frame content),
-        # 403/404/405 (routing/WAF/mixed deploy), transient 408/425/429/5xx,
+        # validation / proxy / WAF, NOT per-frame content), a 403
+        # without a project_inactive/ip_denied body and 404/405
+        # (routing/WAF/mixed deploy), transient 408/425/429/5xx,
         # and any unexpected status -- is treated as transient: keep the
         # batch unconfirmed and retry after backoff, NEVER counting
         # toward the quarantine. Honor Retry-After when present.
@@ -625,6 +684,9 @@ class LongPollTransport:
                     "brain rejected agent token mid-session",
                     details={"status": 401},
                 )
+            refusal = _refusal_from_403(r, during="poll")
+            if refusal is not None:
+                raise refusal
             if r.status_code != 200:
                 raise ConnectionError(
                     f"long-poll recv returned HTTP {r.status_code}",

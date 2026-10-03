@@ -27,7 +27,14 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from z4j_core.errors import Z4JError
-from z4j_core.models import CommandResult
+from z4j_core.models import (
+    DLQ_LIST_ACTION,
+    DLQ_LIST_DEFAULT_LIMIT,
+    DLQ_LIST_MAX_LIMIT,
+    LIST_DEAD_LETTERS_CAPABILITY,
+    CommandResult,
+    DeadLetterPage,
+)
 from z4j_core.protocols import QueueEngineAdapter, SchedulerAdapter
 from z4j_core.transport.frames import (
     CommandAckFrame,
@@ -447,6 +454,97 @@ class CommandDispatcher:
             queue=parameters.get("queue"),
         )
 
+    async def _dispatch_dlq_list(  # noqa: PLR0911  parameter validation branches
+        self,
+        adapter: QueueEngineAdapter,
+        target: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> CommandResult:
+        """Map ``dlq.list`` onto ``adapter.list_dead_letters`` and serialise the page.
+
+        Contract (see :mod:`z4j_core.models.dead_letter`): ``parameters`` carry
+        ``queue`` (optional, falls back to ``target.queue`` / ``target.id``),
+        ``limit`` (clamped to ``DLQ_LIST_MAX_LIMIT``) and ``cursor`` (opaque,
+        passed through). ``result`` is ``DeadLetterPage.model_dump(mode="json")``.
+        The capability gate runs BEFORE any parameter is read so an adapter
+        without a dead-letter store is never touched.
+        """
+        adapter_name = getattr(adapter, "name", "?")
+        if LIST_DEAD_LETTERS_CAPABILITY not in adapter.capabilities():
+            return CommandResult(
+                status="failed",
+                error=(
+                    f"adapter {adapter_name!r} does not support action {DLQ_LIST_ACTION!r}: "
+                    f"capability {LIST_DEAD_LETTERS_CAPABILITY!r} is not advertised "
+                    "(this engine has no dead-letter store z4j can list)"
+                ),
+            )
+        method = getattr(adapter, "list_dead_letters", None)
+        if method is None:
+            # Advertised but missing: a capability set edited by hand, or an
+            # adapter build older than its own capabilities module. Fail
+            # closed with an actionable message instead of an AttributeError.
+            return CommandResult(
+                status="failed",
+                error=(
+                    f"adapter {adapter_name!r} advertises {LIST_DEAD_LETTERS_CAPABILITY!r} "
+                    "but does not implement list_dead_letters; upgrade "
+                    f"z4j-{adapter_name} to a build that ships it"
+                ),
+            )
+
+        queue_raw = parameters.get("queue") or target.get("queue") or target.get("id") or None
+        if queue_raw is not None and not isinstance(queue_raw, str):
+            return CommandResult(
+                status="failed",
+                error=f"{DLQ_LIST_ACTION}: queue must be a string or null",
+            )
+        queue: str | None = queue_raw or None
+
+        limit_raw = parameters.get("limit", DLQ_LIST_DEFAULT_LIMIT)
+        if isinstance(limit_raw, bool) or not isinstance(limit_raw, int):
+            return CommandResult(
+                status="failed",
+                error=f"{DLQ_LIST_ACTION}: limit must be an integer",
+            )
+        if limit_raw <= 0:
+            return CommandResult(
+                status="failed",
+                error=f"{DLQ_LIST_ACTION}: limit must be positive",
+            )
+        limit = min(limit_raw, DLQ_LIST_MAX_LIMIT)
+
+        cursor_raw = parameters.get("cursor")
+        if cursor_raw is not None and not isinstance(cursor_raw, str):
+            return CommandResult(
+                status="failed",
+                error=f"{DLQ_LIST_ACTION}: cursor must be a string or null",
+            )
+        cursor: str | None = cursor_raw or None
+
+        try:
+            page = await method(queue, limit=limit, cursor=cursor)
+        except Z4JError as exc:
+            return CommandResult(
+                status="failed",
+                error=f"{DLQ_LIST_ACTION}: {exc.code}: {exc.message}",
+            )
+        except Exception as exc:
+            logger.exception("z4j dispatcher: %s failed on %r", DLQ_LIST_ACTION, adapter_name)
+            return CommandResult(
+                status="failed",
+                error=f"{DLQ_LIST_ACTION}: {type(exc).__name__}: {exc}",
+            )
+        if not isinstance(page, DeadLetterPage):
+            return CommandResult(
+                status="failed",
+                error=(
+                    f"{DLQ_LIST_ACTION}: adapter {adapter_name!r} returned "
+                    f"{type(page).__name__}, expected DeadLetterPage"
+                ),
+            )
+        return CommandResult(status="success", result=page.model_dump(mode="json"))
+
     async def _dispatch_engine(  # noqa: PLR0911, PLR0912, PLR0915  flat command dispatch
         self,
         action: str,
@@ -602,6 +700,12 @@ class CommandDispatcher:
                 eta=_adapter_eta(parameters),
                 priority=parameters.get("priority"),
             )
+
+        # ``dlq.list`` is gated by the ``list_dead_letters`` capability token,
+        # not by its own name (tokens name adapter methods, actions name wire
+        # commands), so it needs its own gate ahead of the generic one.
+        if action == DLQ_LIST_ACTION:
+            return await self._dispatch_dlq_list(adapter, target, parameters)
 
         if action not in adapter.capabilities():
             return CommandResult(
